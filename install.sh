@@ -1,47 +1,21 @@
 #!/usr/bin/env bash
 #===============================================================================
-#  awg-3xui-installer — установщик и менеджер для Ubuntu 24.04 LTS (noble)
+#  awg-manager — установщик и менеджер AmneziaWG 3.1 для Ubuntu 24.04 LTS
 #
-#  Компоненты: AmneziaWG (НАТИВНЫЙ модуль ядра, DKMS из ppa:amnezia/ppa),
-#  WireGuard tools (модуль уже в ядре Ubuntu), панель 3x-ui.
-#  Туннель awg0 — полный профиль AmneziaWG 3.1: шифрование заголовков
-#  (HeaderProtectionKey), CPS-пакет I1, паддинги S1-S4, ContentPaddingAddition.
-#
-#  Запуск без аргументов:
-#    в терминале (TTY)   -> интерактивное меню управления
-#    curl ... | sudo bash -> автономная установка без вопросов (как раньше)
-#
-#  Команды (sudo bash install.sh <команда>):
-#    install | uninstall | reinstall | migrate | status
-#    add-client [name] | remove-client <name|pubkey> | list-clients
-#    creds | backup | restore <file.tar.gz> | update | restart | logs | help
-#
-#  Установка (последовательность без интерактивных вопросов):
-#    1. Предпроверка: root, bash, Ubuntu 24.04, не контейнер, архитектура,
-#       systemd, Secure Boot, место на диске (>=1.5 ГБ), сеть до GitHub и PPA,
-#       защита от параллельного запуска
-#    2. Зависимости + заголовки текущего ядра + fail2ban/nftables (для 3x-ui)
-#    3. AmneziaWG: модуль ядра amneziawg (DKMS) + amneziawg-tools (awg/awg-quick)
-#    4. WireGuard: wireguard-tools (wg / wg-quick)
-#    5. Туннель awg0 (профиль 3.1) + NAT + клиентский конфиг + QR-код
-#       + runtime-проверка: адрес, UDP-порт, ip_forward, NAT-правило
-#       Конфиги профиля 1.x мигрируются на 3.1 с бэкапом и перевыпуском ключей
-#    6. Панель 3x-ui (неинтерактивно: случайные порт/логин/пароль/путь)
-#    7. Firewall (только если ufw уже активен) + верификация + итог с кредами
-#
-#  Переопределение через окружение (буквы/цифры/_/-):
-#    AWG_PORT, PANEL_PORT, PANEL_USER, PANEL_PASS, PANEL_PATH
-#    пример: sudo AWG_PORT=51820 PANEL_PORT=8443 bash install.sh install
-#
-#  Логи:       /var/log/awg-3xui-install.log
-#              /var/log/awg-3xui-install.debug.log  (трассировка, без ключей)
-#  Результат:  /root/awg-3xui-credentials.txt (0600)
-#  Бэкапы:     /root/awg-3xui-backups/ (0700, файлы 0600)
+#  Возможности:
+#  - Нативный модуль ядра amneziawg.ko (DKMS из ppa:amnezia/ppa) — гигабитная
+#    производительность без оверхеда userspace.
+#  - Полный профиль обфускации AmneziaWG 3.1: HeaderProtectionKey,
+#    CPS-пакет I1 (маскировка под DNS-ответ), S1-S4, ContentPaddingAddition.
+#  - Случайная подсеть для клиентов (10.RAND.RAND.0/24) для исключения коллизий.
+#  - Управление клиентами через Telegram-бота (готовые .conf и QR-коды в чат).
+#  - Прозрачный обход блокировок Gemini (geosite:google-deepmind) через
+#    Cloudflare WARP + dnsmasq nftset (без влияния на остальной трафик).
+#  - Интерактивное TUI-меню в терминале для полного управления сервером.
 #===============================================================================
 
-# Защита от запуска через sh/dash (скрипт требует bash). Строка POSIX-совместима.
 if [ -z "${BASH_VERSION:-}" ]; then
-  echo "ОШИБКА: нужен bash. Запуск: curl -fsSL <url>/install.sh | sudo bash" >&2
+  echo "ОШИБКА: нужен bash. Запуск: sudo bash install.sh" >&2
   exit 1
 fi
 set -Eeuo pipefail
@@ -49,49 +23,52 @@ set -Eeuo pipefail
 #--- конфигурация --------------------------------------------------------------
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
-AWG_SUBNET="10.8.1.0/24"
-AWG_SRV_IP="10.8.1.1"
-AWG_CLI_IP="10.8.1.2"
 AWG_DNS="1.1.1.1"
 AWG_MTU="1280"
-AWG_PORT="${AWG_PORT:-}"            # пусто -> случайный свободный UDP 20000-59999
-AWG_PORT_ENV="${AWG_PORT:-}"        # исходное значение из окружения (для предупреждений)
-PANEL_PORT="${PANEL_PORT:-}"        # пусто -> случайный свободный TCP 20000-59999
-PANEL_USER="${PANEL_USER:-}"        # пусто -> случайный
-PANEL_PASS="${PANEL_PASS:-}"        # пусто -> случайный
-PANEL_PATH="${PANEL_PATH:-}"        # webBasePath панели, без слэшей
-PANEL_PORT_ENV="${PANEL_PORT:-}"    # исходные значения из окружения: после uninstall
-PANEL_USER_ENV="${PANEL_USER:-}"    # следующая установка снова случайная, если
-PANEL_PASS_ENV="${PANEL_PASS:-}"    # пользователь не задал параметры явно
-PANEL_PATH_ENV="${PANEL_PATH:-}"
-PANEL_API_TOKEN=""
-CRED_FILE="/root/awg-3xui-credentials.txt"
-BACKUP_DIR="/root/awg-3xui-backups"
-LOG_FILE="/var/log/awg-3xui-install.log"
-DBG_FILE="/var/log/awg-3xui-install.debug.log"
-XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh"
-PPA_INRELEASE_URL="https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/dists/noble/InRelease"
+AWG_PORT="${AWG_PORT:-}"            # пусто -> случайный UDP 20000-59999
+AWG_PORT_ENV="${AWG_PORT:-}"
+AWG_SUBNET="${AWG_SUBNET:-}"        # пусто -> случайный 10.x.y.0/24
+CRED_FILE="/root/awg-credentials.txt"
+BACKUP_DIR="/root/awg-backups"
+LOG_FILE="/var/log/awg-install.log"
+DBG_FILE="/var/log/awg-install.debug.log"
+BOT_DIR="/opt/awg-bot"
+BOT_ENV="/etc/amnezia/amneziawg/bot.env"
+WARP_DIR="/etc/amnezia/warp"
 TMP_DIR=""
-IS_TTY=0                            # определяется в dispatch ДО редиректа в tee
+IS_TTY=0
+
+# Подсети для обхода локальной сети (AllowedIPs без RFC 1918 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 и 169.254.0.0/16)
+ALLOWED_IPS_NO_LAN="1.0.0.0/8, 2.0.0.0/7, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/3, 96.0.0.0/6, 100.0.0.0/10, 100.128.0.0/9, 101.0.0.0/8, 102.0.0.0/7, 104.0.0.0/5, 112.0.0.0/5, 120.0.0.0/6, 124.0.0.0/7, 126.0.0.0/8, 128.0.0.0/3, 160.0.0.0/5, 168.0.0.0/8, 169.0.0.0/9, 169.128.0.0/10, 169.192.0.0/11, 169.224.0.0/12, 169.240.0.0/13, 169.248.0.0/14, 169.252.0.0/15, 169.255.0.0/16, 170.0.0.0/7, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, 172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, 192.128.0.0/11, 192.160.0.0/13, 192.169.0.0/16, 192.170.0.0/15, 192.172.0.0/14, 192.176.0.0/12, 192.192.0.0/10, 193.0.0.0/8, 194.0.0.0/7, 196.0.0.0/6, 200.0.0.0/5, 208.0.0.0/4"
 
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 APT=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=300)
 
-#--- helpers -------------------------------------------------------------------
-step() { printf '\n==> [%s] %s\n' "$(date '+%F %T')" "$*"; }
-die()  { printf '\nОШИБКА: %s\nПодробности: %s и %s\n' "$*" "$LOG_FILE" "$DBG_FILE" >&2; exit 1; }
-warn() { step "ВНИМАНИЕ: $*"; }
+# Цветовое оформление для терминала
+C_RESET='\033[0m'
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_BLUE='\033[0;34m'
+C_CYAN='\033[0;36m'
+C_BOLD='\033[1m'
+
+#--- вспомогательные функции ----------------------------------------------------
+step() { printf '\n%b==> [%s] %s%b\n' "$C_CYAN" "$(date '+%F %T')" "$*" "$C_RESET"; }
+warn() { printf '%bВНИМАНИЕ: %s%b\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+die()  { printf '\n%bОШИБКА: %s%b\nЛог: %s\n' "$C_RED" "$*" "$C_RESET" "$LOG_FILE" >&2; exit 1; }
+
 rand_hex() { openssl rand -hex "${1:-8}"; }
 rand_u32() { od -An -tu4 -N4 /dev/urandom | tr -d ' \n'; }
-rand_range() { # $1=min $2=max -> случайное целое [min,max]
+rand_range() { # $1=min $2=max -> случайное целое [min,max] из /dev/urandom
   printf '%s' "$(( $(rand_u32) % ($2 - $1 + 1) + $1 ))"
 }
 
-conf_get() { # $1=ключ $2=файл -> значение первого совпадения (без пробелов вокруг =)
+conf_get() { # $1=ключ $2=файл -> значение первого совпадения
   sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" "$2" | head -n1
 }
 
-detect_public_ip() { # печатает IPv4; предупреждения -> stderr (stdout занят значением)
+detect_public_ip() { # печатает внешний IPv4
   local ip
   ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
   if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -99,16 +76,27 @@ detect_public_ip() { # печатает IPv4; предупреждения -> st
   fi
   if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-    printf 'ВНИМАНИЕ: внешний IP не определён через echo-сервисы, использую адрес интерфейса: %s\n' "$ip" >&2
   fi
   [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
   printf '%s\n' "$ip"
 }
 
-require_awg31() { # клиентские операции возможны только на установленном профиле 3.1
-  [ -f "$AWG_DIR/$AWG_IFACE.conf" ] || die "туннель не установлен — выполните: bash install.sh install"
-  grep -q '^HeaderProtectionKey[[:space:]]*=' "$AWG_DIR/$AWG_IFACE.conf" \
-    || die "конфиг профиля 1.x — сначала выполните: bash install.sh migrate"
+detect_wan_iface() {
+  local iface
+  iface="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [ -z "$iface" ]; then
+    iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  fi
+  printf '%s' "$iface"
+}
+
+get_subnet_prefix() { # извлекает префикс '10.x.y.' из awg0.conf
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  if [ -f "$conf" ]; then
+    local srv_addr
+    srv_addr="$(conf_get Address "$conf")"
+    printf '%s' "$srv_addr" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.'
+  fi
 }
 
 confirm_yes() { # $1=вопрос; код 0 = подтверждено
@@ -117,88 +105,7 @@ confirm_yes() { # $1=вопрос; код 0 = подтверждено
   case "$a" in y|Y|yes|YES|да|Да|ДА) return 0 ;; *) return 1 ;; esac
 }
 
-cps_i1() { # маскирующий пакет I1 в форме DNS-ответа (cdns.icloud.com).
-  # Теги только переносимые (<b>/<r>/<rc>): их понимают и модуль ядра, и
-  # amneziawg-go. Форма DNS-ответа проверена в поле: чистая случайность
-  # (<r N>) ломала рукопожатие на мобильных сетях, DNS-образный пакет — нет.
-  local label answers hex qtail ttl o1 o2 o3 o4 i out
-  label=$(rand_range 20 62)          # метка имени; предел DNS — 63 байта
-  answers=$(rand_range 1 2)
-  # Заголовок: флаги 0x8580 (как в штатном спецпакете вендора), 1 вопрос,
-  # answers ответов. Последний байт — длина метки.
-  hex=$(printf '85800001%04x00000000%02x' "$answers" "$label")
-  qtail='0463646e730669636c6f756403636f6d0000010001'   # cdns.icloud.com A IN
-  case $(rand_range 1 4) in          # TTL один на пакет — как у реальных резолверов
-    1) ttl='0000003c' ;; 2) ttl='0000012c' ;; 3) ttl='00000384' ;; *) ttl='00000e10' ;;
-  esac
-  for ((i = 0; i < answers; i++)); do
-    o1=$(rand_range 1 221)           # 10 и 127 перекладываем в 222/223 без цикла
-    case "$o1" in 10) o1=222 ;; 127) o1=223 ;; esac
-    o2=$(rand_range 0 255); o3=$(rand_range 0 255); o4=$(rand_range 1 254)
-    qtail="${qtail}$(printf 'c00c00010001%s0004%02x%02x%02x%02x' \
-      "$ttl" "$o1" "$o2" "$o3" "$o4")"
-  done
-  out=$(printf '<r 2><b 0x%s><rc %s><b 0x%s>' "$hex" "$label" "$qtail")
-  # самопроверка: битый I1 уехал бы во все конфиги и упал только при поднятии
-  [[ "$out" =~ ^\<r\ 2\>\<b\ 0x[0-9a-f]{22}\>\<rc\ [0-9]{1,2}\>\<b\ 0x([0-9a-f]{2})+\>$ ]] || return 1
-  printf '%s\n' "$out"
-}
-
-s4_collides() { # $1..$4 = S1 S2 S3 S4; код 0 = есть вредное совпадение длин
-  # Размеры сообщений: init 148, response 92, cookie 64; данные = S4+32+16k.
-  local p
-  p=$(( $1 - $4 + 116 )); if [ "$p" -ge 32 ] && [ $((p % 16)) -eq 0 ] && [ "$p" -ne 128 ]; then return 0; fi
-  p=$(( $2 - $4 + 60 ));  if [ "$p" -ge 32 ] && [ $((p % 16)) -eq 0 ]; then return 0; fi
-  p=$(( $3 - $4 + 32 ));  if [ "$p" -ge 48 ] && [ $((p % 16)) -eq 0 ]; then return 0; fi
-  return 1
-}
-
-probe_awg31() { # модуль ядра принимает профиль 3.1? Временный интерфейс, не awg0.
-  local ifn="" kf rc i
-  kf="$(mktemp)" || return 1
-  chmod 600 "$kf"
-  awg genkey > "$kf" || { rm -f "$kf"; return 1; }   # ключ не попадает в argv/лог
-  for i in 1 2 3; do
-    ifn="awgp$$x$i"
-    if ip link show "$ifn" >/dev/null 2>&1; then ifn=""; continue; fi
-    if timeout -k 1 10 ip link add "$ifn" type amneziawg >/dev/null 2>&1; then
-      break
-    fi
-    ifn=""
-  done
-  if [ -z "$ifn" ]; then rm -f "$kf"; return 1; fi
-  timeout -k 1 10 awg set "$ifn" s1 15 s2 15 s3 12 s4 12 \
-    header-protection-key "$kf" content-padding-addition 32-128 </dev/null >/dev/null 2>&1
-  rc=$?
-  timeout -k 1 10 ip link del "$ifn" >/dev/null 2>&1 || true
-  rm -f "$kf"
-  return "$rc"
-}
-
-upgrade_awg_packages() { # старые пакеты (focal-PPA/1.x): ставим noble-версии и перезагружаем модуль
-  local f
-  # PPA мог остаться от чужого релиза (focal на noble): его Debian-revision бывает
-  # ВЫШЕ noble, и apt выберет старый пакет. Убираем записи amnezia и добавляем заново.
-  for f in /etc/apt/sources.list.d/*amnezia*; do
-    if [ -e "$f" ]; then rm -f "$f"; fi
-  done
-  wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
-  add-apt-repository -y ppa:amnezia/ppa
-  apt_update
-  # без --only-upgrade: у focal-сборки revision может быть выше noble (1~ против 0~) —
-  # формально это downgrade, разрешаем; код noble новее и поддерживает профиль 3.1
-  apt-get install "${APT[@]}" --allow-downgrades amneziawg amneziawg-dkms amneziawg-tools \
-    || die "не удалось поставить пакеты amneziawg из PPA"
-  # старый модуль мог остаться в памяти — выгружаем и грузим обновлённый
-  systemctl stop 'awg-quick@*' >/dev/null 2>&1 || true
-  if lsmod | grep -q '^amneziawg '; then
-    rmmod amneziawg || die "старый модуль amneziawg занят — перезагрузите сервер и запустите установщик снова"
-  fi
-  modprobe amneziawg || die "обновлённый модуль amneziawg не загрузился — проверьте dkms status и лог сборки DKMS"
-  awg --version
-}
-
-free_port() { # $1 = udp|tcp; печатает свободный порт, 60 попыток
+free_port() { # $1 = udp|tcp; криптостойкий свободный порт 20000-59999
   local proto="$1" flag p
   case "$proto" in
     udp) flag="-u" ;;
@@ -206,7 +113,7 @@ free_port() { # $1 = udp|tcp; печатает свободный порт, 60 �
     *) return 1 ;;
   esac
   for _ in $(seq 1 60); do
-    p=$((20000 + RANDOM % 40000))
+    p="$(rand_range 20000 59999)"
     if [ -z "$(ss -Hln "$flag" "sport = :${p}")" ]; then
       printf '%s' "$p"
       return 0
@@ -215,7 +122,7 @@ free_port() { # $1 = udp|tcp; печатает свободный порт, 60 �
   return 1
 }
 
-wait_for_apt_lock() { # unattended-upgrades может держать dpkg-лок минутами
+wait_for_apt_lock() {
   local i
   for i in $(seq 1 60); do
     if flock -n /var/lib/dpkg/lock-frontend true 2>/dev/null \
@@ -228,37 +135,94 @@ wait_for_apt_lock() { # unattended-upgrades может держать dpkg-ло�
   return 1
 }
 
-apt_update() { # apt-get update, переживающий лок lists/dpkg (unattended-upgrades/apt.systemd.daily)
-  # wait_for_apt_lock проверяет лок ЗАРАНЕЕ, но фоновый apt может захватить его сразу
-  # после проверки (гонка). Поэтому ловим именно ошибку лока и ждём; прочие ошибки
-  # (сеть/репозитории) не маскируем — падаем сразу.
+apt_update() {
   local i out
   for i in $(seq 1 60); do
     if out="$(apt-get update 2>&1)"; then
-      printf '%s\n' "$out"
       return 0
     fi
-    printf '%s\n' "$out" >&2
     if printf '%s' "$out" | grep -q 'Could not get lock\|Unable to lock directory'; then
-      step "apt-лок занят (автообновление?) — жду, попытка ${i}/60"
+      step "apt-лок занят — жду освобождения, попытка ${i}/60"
       sleep 5
     else
+      printf '%s\n' "$out" >&2
       return 1
     fi
   done
   return 1
 }
 
-panel_http_code() {
-  curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-    "http://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}/" || true
+#--- обфускация AmneziaWG 3.1 --------------------------------------------------
+cps_i1() { # маскирующий пакет I1 в форме DNS-ответа (cdns.icloud.com)
+  local label answers hex qtail ttl o1 o2 o3 o4 i out
+  label=$(rand_range 20 62)
+  answers=$(rand_range 1 2)
+  hex=$(printf '85800001%04x00000000%02x' "$answers" "$label")
+  qtail='0463646e730669636c6f756403636f6d0000010001'
+  case $(rand_range 1 4) in
+    1) ttl='0000003c' ;; 2) ttl='0000012c' ;; 3) ttl='00000384' ;; *) ttl='00000e10' ;;
+  esac
+  for ((i = 0; i < answers; i++)); do
+    o1=$(rand_range 1 221)
+    case "$o1" in 10) o1=222 ;; 127) o1=223 ;; esac
+    o2=$(rand_range 0 255); o3=$(rand_range 0 255); o4=$(rand_range 1 254)
+    qtail="${qtail}$(printf 'c00c00010001%s0004%02x%02x%02x%02x' "$ttl" "$o1" "$o2" "$o3" "$o4")"
+  done
+  out=$(printf '<r 2><b 0x%s><rc %s><b 0x%s>' "$hex" "$label" "$qtail")
+  [[ "$out" =~ ^\<r\ 2\>\<b\ 0x[0-9a-f]{22}\>\<rc\ [0-9]{1,2}\>\<b\ 0x([0-9a-f]{2})+\>$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+s4_collides() { # проверка коллизий длин для модуля ядра
+  local p
+  p=$(( $1 - $4 + 116 )); if [ "$p" -ge 32 ] && [ $((p % 16)) -eq 0 ] && [ "$p" -ne 128 ]; then return 0; fi
+  p=$(( $2 - $4 + 60 ));  if [ "$p" -ge 32 ] && [ $((p % 16)) -eq 0 ]; then return 0; fi
+  p=$(( $3 - $4 + 32 ));  if [ "$p" -ge 48 ] && [ $((p % 16)) -eq 0 ]; then return 0; fi
+  return 1
+}
+
+probe_awg31() { # проверка поддержки ядром AmneziaWG 3.1
+  local ifn="" kf rc i
+  kf="$(mktemp)" || return 1
+  chmod 600 "$kf"
+  awg genkey > "$kf" || { rm -f "$kf"; return 1; }
+  for i in 1 2 3; do
+    ifn="awgp$$x$i"
+    if ip link show "$ifn" >/dev/null 2>&1; then ifn=""; continue; fi
+    if timeout -k 1 10 ip link add "$ifn" type amneziawg >/dev/null 2>&1; then break; fi
+    ifn=""
+  done
+  if [ -z "$ifn" ]; then rm -f "$kf"; return 1; fi
+  timeout -k 1 10 awg set "$ifn" s1 15 s2 15 s3 12 s4 12 \
+    header-protection-key "$kf" content-padding-addition 32-128 </dev/null >/dev/null 2>&1
+  rc=$?
+  timeout -k 1 10 ip link del "$ifn" >/dev/null 2>&1 || true
+  rm -f "$kf"
+  return "$rc"
+}
+
+upgrade_awg_packages() { # обновление старых пакетов из PPA
+  local f
+  for f in /etc/apt/sources.list.d/*amnezia*; do
+    if [ -e "$f" ]; then rm -f "$f"; fi
+  done
+  wait_for_apt_lock || die "apt занят более 5 минут"
+  add-apt-repository -y ppa:amnezia/ppa
+  apt_update
+  apt-get install "${APT[@]}" --allow-downgrades amneziawg amneziawg-dkms amneziawg-tools \
+    || die "не удалось установить amneziawg из PPA"
+  systemctl stop 'awg-quick@*' >/dev/null 2>&1 || true
+  if lsmod | grep -q '^amneziawg '; then
+    rmmod amneziawg || die "модуль amneziawg занят — перезагрузите сервер"
+  fi
+  modprobe amneziawg || die "модуль amneziawg не загрузился"
 }
 
 cleanup() { if [ -n "$TMP_DIR" ]; then rm -rf "$TMP_DIR"; fi; }
 trap cleanup EXIT
 trap 'die "сбой на строке ${LINENO} (код $?)"' ERR
 
-#--- установка -----------------------------------------------------------------
+#--- установка AmneziaWG -------------------------------------------------------
 do_install() {
   step "Предпроверка системы"
   # shellcheck disable=SC1091
@@ -272,670 +236,363 @@ do_install() {
   esac
   [ -d /run/systemd/system ] || die "systemd не запущен — нужен VPS/сервер, не контейнер"
   if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet; then
-    die "обнаружен контейнер (LXC/OpenVZ/Docker): DKMS-модуль требует собственного ядра — нужен VPS"
+    die "обнаружен контейнер: DKMS требует собственного ядра — нужен VPS"
   fi
 
-  # Secure Boot: читаем EFI-переменную напрямую (без установки mokutil).
-  # Формат: 4 байта атрибутов + 1 байт значения (1 = включён).
-  SB_VAR="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
-  if [ -r "$SB_VAR" ]; then
-    SB_STATE="$(od -An -t u1 "$SB_VAR" | awk '{print $NF}')"
-    if [ "$SB_STATE" = "1" ]; then
-      die "Secure Boot включён: неподписанный DKMS-модуль amneziawg не загрузится. Отключите Secure Boot в UEFI и запустите установщик снова."
+  # Secure Boot проверка
+  local sb_var="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+  if [ -r "$sb_var" ]; then
+    local sb_state
+    sb_state="$(od -An -t u1 "$sb_var" | awk '{print $NF}')"
+    if [ "$sb_state" = "1" ]; then
+      die "Secure Boot включён: неподписанный DKMS-модуль не загрузится. Отключите Secure Boot в UEFI."
     fi
   fi
 
-  AVAIL_MB="$(df -Pm / | awk 'NR==2{print $4}')"
-  if [ "${AVAIL_MB:-0}" -lt 1500 ]; then
-    die "мало места на / : ${AVAIL_MB} МБ (нужно >= 1500 МБ: DKMS-сборка + 3x-ui ~300 МБ)"
+  local avail_mb
+  avail_mb="$(df -Pm / | awk 'NR==2{print $4}')"
+  if [ "${avail_mb:-0}" -lt 800 ]; then
+    die "мало места на / : ${avail_mb} МБ (нужно >= 800 МБ для сборки DKMS)"
   fi
 
-  WAN_IFACE="$(ip -4 route show default | awk '{print $5; exit}')"
+  WAN_IFACE="$(detect_wan_iface)"
   [ -n "$WAN_IFACE" ] || die "не найден интерфейс с default-маршрутом (IPv4)"
 
-  curl -fsS --max-time 15 -o /dev/null "$XUI_INSTALL_URL" \
-    || die "нет доступа к GitHub (raw.githubusercontent.com) — установщик не сможет скачать компоненты"
-  curl -fsS --max-time 15 -o /dev/null "$PPA_INRELEASE_URL" \
-    || die "нет доступа к PPA (ppa.launchpadcontent.net) — не поставить amneziawg-dkms"
-
-  #--- зависимости -------------------------------------------------------------
   step "Установка зависимостей и заголовков ядра $(uname -r)"
-  wait_for_apt_lock || die "apt/dpkg занят более 5 минут (unattended-upgrades?) — повторите позже"
-  apt_update || die "apt-get update не удался (проверьте сеть и репозитории)"
-  apt-get install "${APT[@]}" ca-certificates curl gnupg2 openssl \
-    software-properties-common python3-launchpadlib
-  wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
+  wait_for_apt_lock
+  apt_update || die "apt-get update не удался"
+  apt-get install "${APT[@]}" ca-certificates curl gnupg2 openssl software-properties-common python3
   add-apt-repository -y universe
   apt_update
   apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 \
-    || die "linux-headers-$(uname -r) недоступен в репозиториях — DKMS не собрать (нестандартное ядро?)"
-  apt-get install "${APT[@]}" \
-    dkms build-essential "linux-headers-$(uname -r)" \
+    || die "linux-headers-$(uname -r) недоступны в репозитории"
+  apt-get install "${APT[@]}" dkms build-essential "linux-headers-$(uname -r)" \
     qrencode wireguard-tools iptables iproute2
 
-  # fail2ban + nftables заранее: 3x-ui настраивает IP Limit поверх уже установленного
-  # fail2ban и не ходит в apt (иначе может упасть на dpkg-локе unattended-upgrades).
-  # pyasynchat — как в апстриме 3x-ui для Ubuntu>=24 (fail2ban 1.0.2 / Python 3.12).
-  step "fail2ban + nftables (для IP Limit в 3x-ui)"
-  apt-get install "${APT[@]}" fail2ban nftables python3-pip
-  if python3 -m pip install --break-system-packages pyasynchat; then
-    systemctl restart fail2ban || true
-  else
-    warn "pyasynchat не установлен (нет доступа к PyPI?) — IP Limit может не работать"
-  fi
-  systemctl is-active --quiet fail2ban \
-    || warn "fail2ban не активен — IP Limit в 3x-ui может не работать"
-
-  #--- AmneziaWG: модуль ядра + инструменты ------------------------------------
-  step "AmneziaWG: нативный модуль ядра (DKMS) + awg-tools из ppa:amnezia/ppa"
-  if [ "$(dpkg-query -W -f='${Status}' amneziawg 2>/dev/null || true)" = "install ok installed" ]; then
-    step "пакет amneziawg уже установлен — пропускаю"
-  else
-    wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
+  step "Установка нативного модуля AmneziaWG (DKMS) из ppa:amnezia/ppa"
+  if [ "$(dpkg-query -W -f='${Status}' amneziawg 2>/dev/null || true)" != "install ok installed" ]; then
+    wait_for_apt_lock
     add-apt-repository -y ppa:amnezia/ppa
     apt_update
     apt-get install "${APT[@]}" amneziawg
   fi
 
   if ! modprobe amneziawg; then
-    dkms status || true
-    tail -n 40 /var/lib/dkms/amneziawg/*/build/make.log 2>/dev/null || true
-    die "модуль amneziawg не загрузился (лог сборки DKMS — выше)"
+    die "модуль amneziawg не загрузился (проверьте dkms status)"
   fi
-  [ -d /sys/module/amneziawg ] || die "модуль amneziawg не появился в /sys/module"
-  awg --version
-  dkms status | grep amneziawg || true
+  [ -d /sys/module/amneziawg ] || die "модуль amneziawg отсутствует в /sys/module"
 
-  step "Проверка поддержки профиля 3.1 модулем ядра (HeaderProtectionKey)"
   if ! probe_awg31; then
-    warn "профиль 3.1 не принят — вероятно, старые пакеты (focal-PPA/1.x). Обновляю из PPA"
+    warn "профиль 3.1 не принят — обновляю пакеты AmneziaWG..."
     upgrade_awg_packages
-    probe_awg31 || die "модуль amneziawg не принимает профиль 3.1 даже после обновления. Проверьте: awg --version; dkms status. Вручную: add-apt-repository -y ppa:amnezia/ppa && apt-get update && apt-get install --allow-downgrades amneziawg amneziawg-dkms amneziawg-tools"
-    step "пакеты обновлены — профиль 3.1 поддерживается"
+    probe_awg31 || die "модуль не принимает профиль 3.1 даже после обновления"
   fi
 
-  #--- WireGuard (модуль в ядре Ubuntu) -----------------------------------------
-  step "WireGuard: проверка нативной поддержки ядром"
-  command -v wg >/dev/null 2>&1 || die "wireguard-tools не установлены"
-  modinfo wireguard >/dev/null 2>&1 || die "модуль wireguard недоступен в ядре $(uname -r)"
-  wg --version
-
-  #--- туннель awg0 + клиент -----------------------------------------------------
-  step "Настройка туннеля AmneziaWG (${AWG_IFACE}, профиль 3.1)"
+  step "Настройка туннеля AmneziaWG (профиль 3.1)"
   install -d -m 700 "$AWG_DIR"
+
+  # Определение случайной подсети клиентов (если конфиг новый)
+  local prefix
+  prefix="$(get_subnet_prefix)"
+  if [ -n "$prefix" ]; then
+    AWG_SUBNET="${prefix}0/24"
+    AWG_SRV_IP="${prefix}1"
+    AWG_CLI_IP="${prefix}2"
+    step "Используется существующая подсеть: ${AWG_SUBNET}"
+  else
+    if [ -z "$AWG_SUBNET" ]; then
+      # Генерация случайной подсети 10.x.y.0/24
+      local rand_x rand_y
+      rand_x="$(rand_range 11 254)"
+      while [ "$rand_x" -eq 127 ]; do rand_x="$(rand_range 11 254)"; done
+      rand_y="$(rand_range 1 254)"
+      AWG_SUBNET="10.${rand_x}.${rand_y}.0/24"
+      AWG_SRV_IP="10.${rand_x}.${rand_y}.1"
+      AWG_CLI_IP="10.${rand_x}.${rand_y}.2"
+      step "Сгенерирована случайная подсеть клиентов: ${AWG_SUBNET}"
+    fi
+  fi
 
   if [ -z "$AWG_PORT" ]; then
     AWG_PORT="$(free_port udp)" || die "не найден свободный UDP-порт"
   fi
-  if ! [[ "$AWG_PORT" =~ ^[0-9]+$ ]] || [ "$AWG_PORT" -lt 1 ] || [ "$AWG_PORT" -gt 65535 ]; then
-    die "AWG_PORT некорректен: $AWG_PORT"
-  fi
 
-  PUBLIC_IP="$(detect_public_ip)" || die "не удалось определить IP сервера"
+  PUBLIC_IP="$(detect_public_ip)" || die "не удалось определить внешний IP сервера"
 
-  REGEN=1
+  local regen=1
   if [ -f "$AWG_DIR/$AWG_IFACE.conf" ]; then
     if grep -q '^HeaderProtectionKey[[:space:]]*=' "$AWG_DIR/$AWG_IFACE.conf"; then
-      REGEN=0
-      step "$AWG_IFACE.conf уже существует (профиль 3.1) — генерацию пропускаю (идемпотентный запуск)"
-      CONF_PORT="$(awk -F'=' '/^ListenPort/{gsub(/[ \t]/,"",$2); print $2; exit}' "$AWG_DIR/$AWG_IFACE.conf")"
-      if ! [[ "$CONF_PORT" =~ ^[0-9]+$ ]]; then
-        die "не удалось прочитать ListenPort из $AWG_DIR/$AWG_IFACE.conf"
-      fi
-      if [ -n "$AWG_PORT_ENV" ] && [ "$AWG_PORT_ENV" != "$CONF_PORT" ]; then
-        warn "AWG_PORT=${AWG_PORT_ENV} из окружения игнорируется — используется порт ${CONF_PORT} из существующего конфига"
-      fi
-      AWG_PORT="$CONF_PORT"
-      if [ ! -f "$AWG_DIR/client1.conf" ]; then
-        warn "client1.conf отсутствует — клиентские ключи не восстановить, добавьте peer вручную (см. README)"
-      fi
+      regen=0
+      step "Конфиг $AWG_IFACE.conf (профиль 3.1) уже существует — пропускаю генерацию"
+      AWG_PORT="$(conf_get ListenPort "$AWG_DIR/$AWG_IFACE.conf")"
     else
-      step "МИГРАЦИЯ: $AWG_IFACE.conf профиля 1.x -> 3.1 (шифрование заголовков). Старые клиентские конфиги перестанут работать — нужен новый client1.conf/QR"
-      TS="$(date '+%Y%m%d-%H%M%S')"
-      cp -a "$AWG_DIR/$AWG_IFACE.conf" "$AWG_DIR/$AWG_IFACE.conf.bak-1x-$TS"
-      if [ -f "$AWG_DIR/client1.conf" ]; then
-        cp -a "$AWG_DIR/client1.conf" "$AWG_DIR/client1.conf.bak-1x-$TS"
-      fi
-      step "бэкапы старых конфигов: $AWG_DIR/*.bak-1x-$TS"
-      CONF_PORT="$(awk -F'=' '/^ListenPort/{gsub(/[ \t]/,"",$2); print $2; exit}' "$AWG_DIR/$AWG_IFACE.conf")"
-      if [[ "$CONF_PORT" =~ ^[0-9]+$ ]]; then
-        if [ -n "$AWG_PORT_ENV" ] && [ "$AWG_PORT_ENV" != "$CONF_PORT" ]; then
-          warn "AWG_PORT=${AWG_PORT_ENV} из окружения игнорируется — сохраняю порт ${CONF_PORT}, чтобы не менять firewall"
-        fi
-        AWG_PORT="$CONF_PORT"
+      step "Миграция старого конфига 1.x -> 3.1..."
+      local ts
+      ts="$(date '+%Y%m%d-%H%M%S')"
+      cp -a "$AWG_DIR/$AWG_IFACE.conf" "$AWG_DIR/$AWG_IFACE.conf.bak-1x-$ts"
+      local npeers
+      npeers="$(grep -c '^\[Peer\]' "$AWG_DIR/$AWG_IFACE.conf" || true)"
+      if [ "$npeers" -gt 1 ]; then
+        warn "В старом конфиге было $npeers пиров. После миграции останется client1, остальных пересоздайте через add-client!"
       fi
     fi
   fi
 
-  if [ "$REGEN" -eq 1 ]; then
-    umask 077
-    # xtrace печатает аргументы и heredoc'ы — на время генерации ключей глушим,
-    # чтобы приватные ключи не попали в debug-лог.
-    set +x
-    SRV_PRIV="$(awg genkey)"
-    SRV_PUB="$(printf '%s\n' "$SRV_PRIV" | awg pubkey)"
-    CLI_PRIV="$(awg genkey)"
-    CLI_PUB="$(printf '%s\n' "$CLI_PRIV" | awg pubkey)"
+  if [ "$regen" -eq 1 ]; then
+    ( umask 077
+      set +x
+      local srv_priv srv_pub cli_priv cli_pub
+      srv_priv="$(awg genkey)"
+      srv_pub="$(printf '%s\n' "$srv_priv" | awg pubkey)"
+      cli_priv="$(awg genkey)"
+      cli_pub="$(printf '%s\n' "$cli_priv" | awg pubkey)"
 
-    # Параметры профиля AmneziaWG 3.1: шифрование заголовков (HeaderProtectionKey),
-    # CPS-пакет I1, паддинги S1-S4. Ограничения модуля ядра: S1+56 != S2,
-    # S3 != S2+28, при ключе защиты S1-S4 >= 12 (первые 12 байт — nonce ChaCha20),
-    # S4 без совпадений длин пакетов данных с рукопожатием.
-    JC=$(rand_range 3 6)                   # 3..6 junk-пакетов
-    JMIN=$(rand_range 40 89)
-    JMAX=$((JMIN + $(rand_range 50 250)))  # ~90..339 (< 1280)
-    S1=$(rand_range 15 150)
-    S2=$(rand_range 15 150)
-    while [ $((S1 + 56)) -eq "$S2" ]; do S2=$(rand_range 15 150); done
-    S3=$(rand_range 12 55)
-    while [ $((S2 + 28)) -eq "$S3" ]; do S3=$(rand_range 12 55); done
-    S4_FREE=()
-    for ((s4 = 12; s4 <= 27; s4++)); do
-      if [ "$s4" -eq 16 ]; then continue; fi   # 16: длина данных кратна 16, как у vanilla WG
-      s4_collides "$S1" "$S2" "$S3" "$s4" || S4_FREE+=("$s4")
-    done
-    [ "${#S4_FREE[@]}" -gt 0 ] || die "внутренняя ошибка: нет S4 без коллизий длин"
-    S4="${S4_FREE[$(rand_range 0 $((${#S4_FREE[@]} - 1)))]}"
-    H1=1; H2=2; H3=3; H4=4                 # при шифровании заголовков тип скрыт ключом
-    I1="$(cps_i1)" || die "не удалось сгенерировать маскирующий пакет I1"
-    HPK="$(awg genkey)"                    # один ключ на сервер и всех его клиентов
-    [[ "$HPK" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] || die "awg genkey вернул ключ неверного формата"
-    CPA='32-128'                           # добавочный паддинг внутри шифрованной части
+      local jc jmin jmax s1 s2 s3 s4 s4_free=() h1 h2 h3 h4 i1 hpk cpa
+      jc=$(rand_range 3 6)
+      jmin=$(rand_range 40 89)
+      jmax=$((jmin + $(rand_range 50 250)))
+      s1=$(rand_range 15 150)
+      s2=$(rand_range 15 150)
+      while [ $((s1 + 56)) -eq "$s2" ]; do s2=$(rand_range 15 150); done
+      s3=$(rand_range 12 55)
+      while [ $((s2 + 28)) -eq "$s3" ]; do s3=$(rand_range 12 55); done
 
-    cat > "$AWG_DIR/$AWG_IFACE.conf" <<EOF
+      for ((s4_cand = 12; s4_cand <= 27; s4_cand++)); do
+        if [ "$s4_cand" -eq 16 ]; then continue; fi
+        s4_collides "$s1" "$s2" "$s3" "$s4_cand" || s4_free+=("$s4_cand")
+      done
+      [ "${#s4_free[@]}" -gt 0 ] || die "ошибка расчёта параметров S4"
+      s4="${s4_free[$(rand_range 0 $((${#s4_free[@]} - 1)))]}"
+      h1=1; h2=2; h3=3; h4=4
+      i1="$(cps_i1)" || die "ошибка генерации I1"
+      hpk="$(awg genkey)"
+      cpa='32-128'
+
+      cat > "$AWG_DIR/$AWG_IFACE.conf" <<EOF
 [Interface]
-PrivateKey = ${SRV_PRIV}
+PrivateKey = ${srv_priv}
 Address = ${AWG_SRV_IP}/24
 ListenPort = ${AWG_PORT}
 MTU = ${AWG_MTU}
-Jc = ${JC}
-Jmin = ${JMIN}
-Jmax = ${JMAX}
-S1 = ${S1}
-S2 = ${S2}
-S3 = ${S3}
-S4 = ${S4}
-H1 = ${H1}
-H2 = ${H2}
-H3 = ${H3}
-H4 = ${H4}
-I1 = ${I1}
-HeaderProtectionKey = ${HPK}
-ContentPaddingAddition = ${CPA}
-PostUp = iptables -w -t nat -A POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -A FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -A FORWARD -i ${WAN_IFACE} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT
-PostDown = iptables -w -t nat -D POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -D FORWARD -i ${WAN_IFACE} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT
+Jc = ${jc}
+Jmin = ${jmin}
+Jmax = ${jmax}
+S1 = ${s1}
+S2 = ${s2}
+S3 = ${s3}
+S4 = ${s4}
+H1 = ${h1}
+H2 = ${h2}
+H3 = ${h3}
+H4 = ${h4}
+I1 = ${i1}
+HeaderProtectionKey = ${hpk}
+ContentPaddingAddition = ${cpa}
+PostUp = iptables -w -t nat -A POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -A FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -A FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -w -t nat -D POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 [Peer]
 # client1
-PublicKey = ${CLI_PUB}
+PublicKey = ${cli_pub}
 AllowedIPs = ${AWG_CLI_IP}/32
 EOF
 
-    cat > "$AWG_DIR/client1.conf" <<EOF
+      cat > "$AWG_DIR/client1.conf" <<EOF
 [Interface]
-PrivateKey = ${CLI_PRIV}
+PrivateKey = ${cli_priv}
 Address = ${AWG_CLI_IP}/32
 DNS = ${AWG_DNS}
 MTU = ${AWG_MTU}
-Jc = ${JC}
-Jmin = ${JMIN}
-Jmax = ${JMAX}
-S1 = ${S1}
-S2 = ${S2}
-S3 = ${S3}
-S4 = ${S4}
-H1 = ${H1}
-H2 = ${H2}
-H3 = ${H3}
-H4 = ${H4}
-I1 = ${I1}
-HeaderProtectionKey = ${HPK}
-ContentPaddingAddition = ${CPA}
+Jc = ${jc}
+Jmin = ${jmin}
+Jmax = ${jmax}
+S1 = ${s1}
+S2 = ${s2}
+S3 = ${s3}
+S4 = ${s4}
+H1 = ${h1}
+H2 = ${h2}
+H3 = ${h3}
+H4 = ${h4}
+I1 = ${i1}
+HeaderProtectionKey = ${hpk}
+ContentPaddingAddition = ${cpa}
 
 [Peer]
-PublicKey = ${SRV_PUB}
+PublicKey = ${srv_pub}
 Endpoint = ${PUBLIC_IP}:${AWG_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
-    chmod 600 "$AWG_DIR/$AWG_IFACE.conf" "$AWG_DIR/client1.conf"
-    set -x
+      cat > "$AWG_DIR/client1-lan-bypass.conf" <<EOF
+[Interface]
+PrivateKey = ${cli_priv}
+Address = ${AWG_CLI_IP}/32
+DNS = ${AWG_DNS}
+MTU = ${AWG_MTU}
+Jc = ${jc}
+Jmin = ${jmin}
+Jmax = ${jmax}
+S1 = ${s1}
+S2 = ${s2}
+S3 = ${s3}
+S4 = ${s4}
+H1 = ${h1}
+H2 = ${h2}
+H3 = ${h3}
+H4 = ${h4}
+I1 = ${i1}
+HeaderProtectionKey = ${hpk}
+ContentPaddingAddition = ${cpa}
+
+[Peer]
+PublicKey = ${srv_pub}
+Endpoint = ${PUBLIC_IP}:${AWG_PORT}
+AllowedIPs = ${ALLOWED_IPS_NO_LAN}
+PersistentKeepalive = 25
+EOF
+      chmod 600 "$AWG_DIR/$AWG_IFACE.conf" "$AWG_DIR/client1.conf" "$AWG_DIR/client1-lan-bypass.conf"
+      qrencode -o "$AWG_DIR/client1.png" -s 6 -m 2 < "$AWG_DIR/client1.conf" || true
+      qrencode -o "$AWG_DIR/client1-lan-bypass.png" -s 6 -m 2 < "$AWG_DIR/client1-lan-bypass.conf" || true
+      chmod 600 "$AWG_DIR/client1.png" "$AWG_DIR/client1-lan-bypass.png" 2>/dev/null || true
+    )
   fi
 
   printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-awg-forward.conf
   sysctl -q -p /etc/sysctl.d/99-awg-forward.conf
 
-  systemctl enable "awg-quick@${AWG_IFACE}" >/dev/null
-  if ! systemctl restart "awg-quick@${AWG_IFACE}"; then
-    journalctl -u "awg-quick@${AWG_IFACE}" -n 25 --no-pager || true
-    die "awg-quick@${AWG_IFACE} не запустился (journal — выше)"
-  fi
-  sleep 1
-  awg show "$AWG_IFACE" >/dev/null || die "интерфейс ${AWG_IFACE} не поднялся"
+  systemctl enable "awg-quick@${AWG_IFACE}" >/dev/null 2>&1 || true
+  systemctl restart "awg-quick@${AWG_IFACE}" || die "сервис awg-quick не запустился"
 
-  # runtime-верификация туннеля: мало "сервис active" — проверяем факты
-  ip -4 addr show "$AWG_IFACE" | grep -q "$AWG_SRV_IP" \
-    || die "на ${AWG_IFACE} нет адреса ${AWG_SRV_IP}"
-  [ -n "$(ss -Hlnu "sport = :${AWG_PORT}")" ] \
-    || die "amneziawg не слушает UDP ${AWG_PORT}"
-  [ "$(sysctl -n net.ipv4.ip_forward)" = "1" ] \
-    || die "net.ipv4.ip_forward не включился"
-  iptables -w -t nat -C POSTROUTING -s "$AWG_SUBNET" -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null \
-    || die "NAT-правило MASQUERADE не применилось (PostUp)"
-  step "туннель проверен: адрес ${AWG_SRV_IP}, UDP ${AWG_PORT}, ip_forward=1, NAT — на месте"
-
-  #--- панель 3x-ui ---------------------------------------------------------------
-  step "Панель 3x-ui (неинтерактивная установка)"
-  umask 022   # дальше ставится панель со своими правами; 077 был только для ключей
-  if [ -z "$PANEL_PORT" ]; then
-    PANEL_PORT="$(free_port tcp)" || die "не найден свободный TCP-порт"
-  fi
-  if ! [[ "$PANEL_PORT" =~ ^[0-9]+$ ]] || [ "$PANEL_PORT" -lt 1 ] || [ "$PANEL_PORT" -gt 65535 ]; then
-    die "PANEL_PORT некорректен: $PANEL_PORT"
-  fi
-  : "${PANEL_USER:=$(rand_hex 5)}"
-  : "${PANEL_PASS:=$(rand_hex 16)}"
-  : "${PANEL_PATH:=$(rand_hex 6)}"
-  for v in "$PANEL_USER" "$PANEL_PASS" "$PANEL_PATH"; do
-    if ! [[ "$v" =~ ^[A-Za-z0-9_-]+$ ]]; then
-      die "PANEL_USER/PANEL_PASS/PANEL_PATH: допустимы только латинские буквы, цифры, '_' и '-' (получено: '$v')"
-    fi
-  done
-
-  # пропускаем только если есть И бинарник, И юнит: частичная установка чинится
-  # повторным прогоном официального install.sh (он поддерживает repair/upgrade)
-  if [ -x /usr/local/x-ui/x-ui ] && [ -f /etc/systemd/system/x-ui.service ]; then
-    step "3x-ui уже установлена — пропускаю установку"
-  else
-    TMP_DIR="$(mktemp -d)"
-    curl -fsSL "$XUI_INSTALL_URL" -o "$TMP_DIR/install-3xui.sh"
-    wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
-    XUI_NONINTERACTIVE=1 \
-    XUI_PANEL_PORT="$PANEL_PORT" \
-    XUI_USERNAME="$PANEL_USER" \
-    XUI_PASSWORD="$PANEL_PASS" \
-    XUI_WEB_BASE_PATH="$PANEL_PATH" \
-    XUI_SSL_MODE=none \
-    XUI_DB_TYPE=sqlite \
-      bash "$TMP_DIR/install-3xui.sh"
-  fi
-  if ! systemctl is-active --quiet x-ui; then
-    journalctl -u x-ui -n 25 --no-pager || true
-    die "сервис x-ui не активен (journal — выше)"
-  fi
-
-  # фактические креды из файла установки (работает и для свежей, и для существующей панели)
-  if [ -r /etc/x-ui/install-result.env ]; then
-    # shellcheck disable=SC1091
-    . /etc/x-ui/install-result.env
-    PANEL_USER="${XUI_USERNAME:-$PANEL_USER}"
-    PANEL_PASS="${XUI_PASSWORD:-$PANEL_PASS}"
-    PANEL_PORT="${XUI_PANEL_PORT:-$PANEL_PORT}"
-    PANEL_PATH="${XUI_WEB_BASE_PATH:-$PANEL_PATH}"
-    PANEL_API_TOKEN="${XUI_API_TOKEN:-}"
-  else
-    warn "/etc/x-ui/install-result.env не найден — ниже показаны сгенерированные креды; фактические смотрите: x-ui settings"
-  fi
-
-  PANEL_CODE="$(panel_http_code)"
-  case "$PANEL_CODE" in
-    200 | 301 | 302 | 307 | 308) ;;
-    *) sleep 3; PANEL_CODE="$(panel_http_code)" ;;   # панель могла ещё стартовать
-  esac
-  case "$PANEL_CODE" in
-    200 | 301 | 302 | 307 | 308) step "панель отвечает локально: HTTP ${PANEL_CODE}" ;;
-    *) warn "панель ответила кодом '${PANEL_CODE}' — проверьте: journalctl -u x-ui" ;;
-  esac
-
-  #--- firewall -------------------------------------------------------------------
-  step "Firewall"
+  # Firewall UFW
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw allow "${AWG_PORT}/udp" >/dev/null
-    ufw allow "${PANEL_PORT}/tcp" >/dev/null
-    step "ufw активен: открыты ${AWG_PORT}/udp (AmneziaWG) и ${PANEL_PORT}/tcp (панель)"
-  else
-    step "ufw не активен — правила не меняю. Откройте порты в firewall облачного провайдера."
+    step "ufw: открыт порт ${AWG_PORT}/udp"
   fi
 
-  #--- итог -------------------------------------------------------------------------
-  step "Итоговая верификация"
-  systemctl is-active "awg-quick@${AWG_IFACE}" x-ui
-  AWG_VER="$(awg --version 2>/dev/null | head -n1 || true)"
-  XUI_VER="$(/usr/local/x-ui/x-ui -v 2>/dev/null | head -n1 || true)"
-  DKMS_LINE="$(dkms status 2>/dev/null | grep amneziawg | head -n1 || true)"
-  F2B_STATUS="$(systemctl is-active fail2ban 2>/dev/null || true)"
+  # Установка симлинка awg-manager
+  install -m 755 "$0" /usr/local/bin/awg-manager 2>/dev/null || true
 
-  if [ -f "$AWG_DIR/client1.conf" ]; then
-    qrencode -o "$AWG_DIR/client1.png" -s 6 -m 2 < "$AWG_DIR/client1.conf" || true
+  # Установка скрипта бота в /opt/awg-bot
+  mkdir -p "$BOT_DIR"
+  local bot_src="$(dirname "$0")/bot.py"
+  if [ -f "$bot_src" ]; then
+    cp "$bot_src" "$BOT_DIR/bot.py"
+    chmod 755 "$BOT_DIR/bot.py"
   fi
 
-  umask 077
-  cat > "$CRED_FILE" <<EOF
-# awg-3xui-installer — $(date '+%F %T')
-PANEL_URL=http://${PUBLIC_IP}:${PANEL_PORT}/${PANEL_PATH}
-PANEL_USER=${PANEL_USER}
-PANEL_PASS=${PANEL_PASS}
-PANEL_PATH=${PANEL_PATH}
-PANEL_API_TOKEN=${PANEL_API_TOKEN}
+  # Копирование базы обхода РФ, если есть
+  local ru_src="$(dirname "$0")/amnezia-russia-bypass.json"
+  if [ -f "$ru_src" ]; then
+    cp "$ru_src" "$AWG_DIR/amnezia-russia-bypass.json"
+  fi
+
+  ( umask 077
+    cat > "$CRED_FILE" <<EOF
+# AmneziaWG 3.1 — $(date '+%F %T')
 AWG_ENDPOINT=${PUBLIC_IP}:${AWG_PORT}/udp
-AWG_PROFILE=3.1
+AWG_SUBNET=${AWG_SUBNET}
 AWG_CLIENT_CONFIG=${AWG_DIR}/client1.conf
 AWG_CLIENT_QR=${AWG_DIR}/client1.png
 EOF
-  chmod 600 "$CRED_FILE"
+    chmod 600 "$CRED_FILE"
+  )
 
-  set +x
+  step "Установка AmneziaWG 3.1 успешно завершена!"
   printf '\n'
-  printf '%s\n' '============================================================'
-  printf '  УСТАНОВКА ЗАВЕРШЕНА\n'
-  printf '%s\n' '============================================================'
-  printf '  AmneziaWG (модуль ядра): %s\n' "${AWG_VER:-unknown}"
-  printf '  DKMS:                    %s\n' "${DKMS_LINE:-unknown}"
-  printf '  3x-ui:                   %s\n' "${XUI_VER:-unknown}"
-  printf '  fail2ban (IP Limit):     %s\n' "${F2B_STATUS:-unknown}"
-  printf '%s\n' '------------------------------------------------------------'
-  printf '  Панель 3x-ui (HTTP, без SSL):\n'
-  printf '    URL:    http://%s:%s/%s\n' "$PUBLIC_IP" "$PANEL_PORT" "$PANEL_PATH"
-  printf '    Логин:  %s\n' "$PANEL_USER"
-  printf '    Пароль: %s\n' "$PANEL_PASS"
-  printf '%s\n' '------------------------------------------------------------'
-  printf '  AmneziaWG сервер: %s:%s/udp (интерфейс %s)\n' "$PUBLIC_IP" "$AWG_PORT" "$AWG_IFACE"
-  printf '  Профиль: AmneziaWG 3.1 (шифрование заголовков, I1, S1-S4)\n'
-  printf '  Клиентский конфиг: %s/client1.conf\n' "$AWG_DIR"
-  printf '  QR-код (PNG):      %s/client1.png\n' "$AWG_DIR"
-  printf '%s\n' '------------------------------------------------------------'
-  printf '  Все креды:  %s (chmod 600)\n' "$CRED_FILE"
-  printf '  Логи:       %s\n' "$LOG_FILE"
-  printf '              %s\n' "$DBG_FILE"
-  printf '%s\n' '============================================================'
-  printf '  ВАЖНО:\n'
-  printf '  * Панель работает по HTTP. Для безопасного доступа используйте\n'
-  printf '    SSH-туннель: ssh -L 8443:127.0.0.1:%s root@%s\n' "$PANEL_PORT" "$PUBLIC_IP"
-  printf '    затем откройте http://127.0.0.1:8443/%s\n' "$PANEL_PATH"
-  printf '    SSL можно настроить позже командой: x-ui\n'
-  printf '  * Порты %s/udp и %s/tcp должны быть открыты в firewall\n' "$AWG_PORT" "$PANEL_PORT"
-  printf '    облачного провайдера (security group).\n'
-  printf '  * Профиль 3.1: клиентам нужно приложение Amnezia >= 5.0.1.5.\n'
-  printf '    Конфиги профиля 1.x с этим сервером больше не работают.\n'
-  printf '  * Управление: sudo bash install.sh (меню) или bash install.sh help\n'
-  printf '%s\n' '============================================================'
+  printf '============================================================\n'
+  printf '  СЕРВЕР AMNEZIAWG 3.1 ГОТОВ К РАБОТЕ\n'
+  printf '============================================================\n'
+  printf '  Эндпоинт:        %s:%s/udp\n' "$PUBLIC_IP" "$AWG_PORT"
+  printf '  Подсеть туннеля: %s\n' "$AWG_SUBNET"
+  printf '  Клиентский файл: %s/client1.conf (весь трафик 0.0.0.0/0)\n' "$AWG_DIR"
+  printf '  С обходом LAN:   %s/client1-lan-bypass.conf (локальные сети мимо VPN)\n' "$AWG_DIR"
+  printf '  QR-код (PNG):    %s/client1.png\n' "$AWG_DIR"
+  printf '------------------------------------------------------------\n'
+  printf '  УПРАВЛЕНИЕ СЕРВЕРОМ:\n'
+  printf '  • Консольное меню:   sudo awg-manager\n'
+  printf '  • Telegram-бот:      sudo awg-manager bot\n'
+  printf '  • Обход Gemini:      sudo awg-manager warp-enable\n'
+  printf '============================================================\n\n'
+
   if [ -f "$AWG_DIR/client1.conf" ]; then
-    printf '\n  QR-код клиентского конфига (сканируйте в приложении Amnezia):\n\n'
+    printf 'QR-код первого клиента (сканируйте в Amnezia >= 5.0.1.5):\n\n'
     qrencode -t ansiutf8 < "$AWG_DIR/client1.conf" || true
   fi
-  sleep 1   # дать tee дописать лог
 }
 
-#--- полное удаление -------------------------------------------------------------
-do_uninstall() {
-  step "Полное удаление: AmneziaWG + 3x-ui (с предварительным бэкапом)"
-
-  # порты читаем ДО удаления — они нужны для очистки правил ufw
-  local awg_port="" panel_port=""
-  if [ -f "$AWG_DIR/$AWG_IFACE.conf" ]; then
-    awg_port="$(conf_get ListenPort "$AWG_DIR/$AWG_IFACE.conf")"
-  fi
-  if [ -r /etc/x-ui/install-result.env ]; then
-    panel_port="$(sed -n 's/^XUI_PANEL_PORT=//p' /etc/x-ui/install-result.env | head -n1 | tr -cd '0-9')"
-  fi
-
-  # 1. бэкап обязателен: x-ui uninstall удаляет /etc/x-ui вместе с БД (все inbound'ы)
-  local ts tar="" members=()
-  ts="$(date '+%Y%m%d-%H%M%S')"
-  mkdir -p "$BACKUP_DIR"
-  chmod 700 "$BACKUP_DIR"
-  if [ -d "$AWG_DIR" ]; then members+=("etc/amnezia/amneziawg"); fi
-  if [ -d /etc/x-ui ]; then members+=("etc/x-ui"); fi
-  if [ -f "$CRED_FILE" ]; then members+=("${CRED_FILE#/}"); fi
-  if [ "${#members[@]}" -gt 0 ]; then
-    tar="$BACKUP_DIR/uninstall-$ts.tar.gz"
-    tar -czf "$tar" -C / "${members[@]}" || die "не удалось создать бэкап $tar — удаление отменено"
-    chmod 600 "$tar"
-    step "бэкап перед удалением: $tar"
-  else
-    step "бэкап не нужен: конфигов и БД панели нет"
-  fi
-
-  # 2. туннель: stop выполняет PostDown (снимает iptables-правила)
-  if systemctl cat "awg-quick@${AWG_IFACE}" >/dev/null 2>&1; then
-    systemctl stop "awg-quick@${AWG_IFACE}" 2>/dev/null || warn "awg-quick@${AWG_IFACE} не остановился"
-    systemctl disable "awg-quick@${AWG_IFACE}" 2>/dev/null || true
-  fi
-
-  # 3. осиротевшие правила iptables (если PostDown не отработал при падении сервиса)
-  local wan i
-  wan="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
-  if [ -n "$wan" ] && command -v iptables >/dev/null 2>&1; then
-    for i in 1 2 3 4 5; do
-      iptables -w -t nat -C POSTROUTING -s "$AWG_SUBNET" -o "$wan" -j MASQUERADE 2>/dev/null || break
-      iptables -w -t nat -D POSTROUTING -s "$AWG_SUBNET" -o "$wan" -j MASQUERADE 2>/dev/null || break
-    done
-    for i in 1 2 3 4 5; do
-      iptables -w -C FORWARD -i "$AWG_IFACE" -o "$wan" -j ACCEPT 2>/dev/null || break
-      iptables -w -D FORWARD -i "$AWG_IFACE" -o "$wan" -j ACCEPT 2>/dev/null || break
-    done
-    for i in 1 2 3 4 5; do
-      iptables -w -C FORWARD -i "$wan" -o "$AWG_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || break
-      iptables -w -D FORWARD -i "$wan" -o "$AWG_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || break
-    done
-  fi
-
-  # 4. панель: официальный uninstall (confirm читает stdin -> echo y).
-  #    Удаляет /etc/x-ui вместе с БД — поэтому бэкап выше обязателен.
-  if [ -x /usr/bin/x-ui ]; then
-    echo y | x-ui uninstall || warn "x-ui uninstall завершился с ошибкой — чищу остатки вручную"
-  else
-    step "x-ui не найден — пропускаю официальный uninstall"
-  fi
-  systemctl stop x-ui 2>/dev/null || true
-  systemctl disable x-ui 2>/dev/null || true
-  rm -rf /usr/local/x-ui /etc/x-ui || true
-  rm -f /etc/systemd/system/x-ui.service /usr/bin/x-ui || true
-  systemctl daemon-reload 2>/dev/null || true
-
-  # 5. jail'ы IP Limit от 3x-ui (апстрим uninstall их не трогает)
-  rm -f /etc/fail2ban/filter.d/3x-ipl.conf /etc/fail2ban/action.d/3x-ipl.conf \
-    /etc/fail2ban/jail.d/3x-ipl.conf /etc/fail2ban/jail.d/3x-ipl-backend.conf
-  if systemctl is-active --quiet fail2ban 2>/dev/null; then
-    systemctl restart fail2ban || warn "fail2ban не перезапустился после удаления jail'ов"
-  fi
-
-  # 6. ufw: снимаем только свои правила (если ufw активен и порты известны)
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    if [[ "$awg_port" =~ ^[0-9]+$ ]]; then
-      echo y | ufw delete allow "${awg_port}/udp" >/dev/null 2>&1 || true
-    fi
-    if [[ "$panel_port" =~ ^[0-9]+$ ]]; then
-      echo y | ufw delete allow "${panel_port}/tcp" >/dev/null 2>&1 || true
-    fi
-  fi
-
-  # 7. пакеты AWG: purge сам снимает DKMS-модуль (prerm: dkms remove --all).
-  #    fail2ban/wireguard-tools/dkms НЕ трогаем: они общие и защищают SSH.
-  if dpkg-query -W -f='${Status}\n' amneziawg amneziawg-dkms amneziawg-tools 2>/dev/null | grep -q 'install ok installed'; then
-    wait_for_apt_lock || warn "apt занят — purge может не удаться"
-    apt-get purge "${APT[@]}" amneziawg amneziawg-dkms amneziawg-tools \
-      || warn "purge пакетов AWG не удался — снимите вручную: apt-get purge amneziawg amneziawg-dkms amneziawg-tools"
-  fi
-  rmmod amneziawg 2>/dev/null || step "модуль amneziawg остался в памяти — исчезнет после перезагрузки"
-
-  # 8. PPA
-  if command -v add-apt-repository >/dev/null 2>&1; then
-    add-apt-repository -y --remove ppa:amnezia/ppa >/dev/null 2>&1 || true
-    apt-get update >/dev/null 2>&1 || true
-  fi
-
-  # 9. конфиги, sysctl-файл, креды (бэкап уже снят). Runtime net.ipv4.ip_forward
-  #    сознательно не трогаем: его могли включить другие сервисы; после перезагрузки
-  #    он вернётся к значению по умолчанию, т.к. наш sysctl-файл удалён.
-  rm -rf "$AWG_DIR" || true
-  rm -f /etc/sysctl.d/99-awg-forward.conf "$CRED_FILE" || true
-
-  # следующая установка — с чистого листа: случайные порты/креды,
-  # если пользователь не задал их окружением явно
-  AWG_PORT="$AWG_PORT_ENV"
-  PANEL_PORT="$PANEL_PORT_ENV"
-  PANEL_USER="$PANEL_USER_ENV"
-  PANEL_PASS="$PANEL_PASS_ENV"
-  PANEL_PATH="$PANEL_PATH_ENV"
-
-  step "Удаление завершено"
-  printf '%s\n' '------------------------------------------------------------'
-  printf '  Удалено: туннель awg0, конфиги AWG, 3x-ui (включая БД),\n'
-  printf '           jail'"'"'ы IP Limit, пакеты amneziawg*, PPA, правила ufw.\n'
-  printf '  Сохранено: fail2ban, wireguard-tools, dkms (общие компоненты),\n'
-  printf '             логи установки, бэкап.\n'
-  if [ -n "$tar" ]; then
-    printf '  Бэкап: %s\n' "$tar"
-    printf '  Восстановление: sudo bash install.sh install, затем restore %s\n' "$tar"
-  fi
-  printf '%s\n' '------------------------------------------------------------'
-}
-
-#--- переустановка ----------------------------------------------------------------
-do_reinstall() {
-  step "Переустановка: полное удаление, затем чистая установка"
-  do_uninstall
-  do_install
-}
-
-#--- миграция 1.x -> 3.1 ------------------------------------------------------------
-do_migrate() {
-  local conf="$AWG_DIR/$AWG_IFACE.conf"
-  [ -f "$conf" ] || die "туннель не установлен — выполните install (он сразу создаст профиль 3.1)"
-  if grep -q '^HeaderProtectionKey[[:space:]]*=' "$conf"; then
-    step "Профиль уже 3.1 — миграция не нужна. Для проверки/починки: bash install.sh install"
-    return 0
-  fi
-  step "Миграция 1.x -> 3.1 через установщик (бэкап старых конфигов будет создан)"
-  do_install
-}
-
-#--- статус -------------------------------------------------------------------------
-do_status() {
-  step "Статус awg-3xui"
-  local conf="$AWG_DIR/$AWG_IFACE.conf" u
-  if [ -f "$conf" ]; then
-    if grep -q '^HeaderProtectionKey[[:space:]]*=' "$conf"; then
-      printf '  Профиль AWG: 3.1 (шифрование заголовков)\n'
-    else
-      printf '  Профиль AWG: 1.x — доступна миграция: bash install.sh migrate\n'
-    fi
-    printf '  ListenPort:  %s/udp\n' "$(conf_get ListenPort "$conf")"
-    printf '  Клиентов:    %s\n' "$(grep -c '^PublicKey' "$conf" || true)"
-  else
-    printf '  Туннель: не установлен (%s нет)\n' "$conf"
-  fi
-  for u in "awg-quick@${AWG_IFACE}" x-ui fail2ban; do
-    printf '  %-22s %s\n' "$u:" "$(systemctl is-active "$u" 2>/dev/null || true)"
-  done
-  if command -v awg >/dev/null 2>&1 && awg show "$AWG_IFACE" >/dev/null 2>&1; then
-    printf '\n'
-    awg show "$AWG_IFACE"
-  fi
-  if command -v dkms >/dev/null 2>&1; then
-    dkms status 2>/dev/null | grep amneziawg | sed 's/^/  DKMS: /' || true
-  fi
-  if [ -x /usr/local/x-ui/x-ui ]; then
-    printf '  3x-ui: %s\n' "$(/usr/local/x-ui/x-ui -v 2>/dev/null | head -n1 || true)"
-  fi
-  if [ -r /etc/x-ui/install-result.env ]; then
-    printf '  Панель: http://127.0.0.1:%s/%s\n' \
-      "$(sed -n 's/^XUI_PANEL_PORT=//p' /etc/x-ui/install-result.env | head -n1 | tr -cd '0-9')" \
-      "$(sed -n 's/^XUI_WEB_BASE_PATH=//p' /etc/x-ui/install-result.env | head -n1)"
-  fi
-  if [ -f "$CRED_FILE" ]; then
-    printf '  Креды: %s\n' "$CRED_FILE"
-  fi
-}
-
-#--- клиенты ------------------------------------------------------------------------
-peer_pub_by_name() { # $1=имя (комментарий '# name' в [Peer]) -> PublicKey
-  awk -v want="$1" '
-    /^\[/ { cname="" }
-    /^#/ { cname=$0; sub(/^#[[:space:]]*/, "", cname); next }
-    /^PublicKey[[:space:]]*=/ {
-      if (cname == want) { v=$0; sub(/^PublicKey[[:space:]]*=[[:space:]]*/, "", v); print v; exit }
-    }
-  ' "$AWG_DIR/$AWG_IFACE.conf"
-}
-
-peer_name_by_pub() { # $1=PublicKey -> имя из комментария (может быть пустым)
-  awk -v p="$1" '
-    /^\[/ { cname="" }
-    /^#/ { cname=$0; sub(/^#[[:space:]]*/, "", cname) }
-    /^PublicKey[[:space:]]*=/ {
-      v=$0; sub(/^PublicKey[[:space:]]*=[[:space:]]*/, "", v)
-      if (v == p) { print cname; exit }
-    }
-  ' "$AWG_DIR/$AWG_IFACE.conf"
-}
-
+#--- управление клиентами ------------------------------------------------------
 do_add_client() {
   local name="${1:-}"
-  require_awg31
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
   if [ -z "$name" ]; then
     if [ "$IS_TTY" = 1 ]; then
-      read -r -p "Имя нового клиента (латиница/цифры/_/-): " name || die "ввод прерван"
+      read -r -p "Имя нового клиента (латиница/цифры, например phone): " name || die "ввод прерван"
     else
-      die "укажите имя: bash install.sh add-client <name>"
+      die "укажите имя: awg-manager add-client <name>"
     fi
   fi
-  [[ "$name" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "имя '$name': допустимы латинские буквы, цифры, '_' и '-', длина 1-32"
-  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [[ "$name" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "некорректное имя '$name' (допустимы A-Z, 0-9, _, -)"
+
   if [ -f "$AWG_DIR/$name.conf" ] || grep -q "^# ${name}$" "$conf"; then
     die "клиент '$name' уже существует"
   fi
-  awg show "$AWG_IFACE" >/dev/null 2>&1 || die "интерфейс $AWG_IFACE не поднят — выполните: bash install.sh restart"
 
-  # следующий свободный адрес 10.8.1.2..254 (по AllowedIPs всех [Peer])
-  local used i ip=""
-  used="$(awk -F'=' '/^AllowedIPs[[:space:]]*=/{print $2}' "$conf" | grep -oE '10\.8\.1\.[0-9]+' | sort -u || true)"
+  local prefix
+  prefix="$(get_subnet_prefix)"
+  [ -n "$prefix" ] || die "не удалось определить подсеть из $conf"
+
+  local used ip="" i
+  used="$(awk -F'=' '/^AllowedIPs[[:space:]]*=/{print $2}' "$conf" | grep -oE "${prefix}[0-9]+" | sort -u || true)"
   for i in $(seq 2 254); do
-    if ! printf '%s\n' "$used" | grep -qx "10.8.1.$i"; then
-      ip="10.8.1.$i"
+    if ! printf '%s\n' "$used" | grep -qx "${prefix}${i}"; then
+      ip="${prefix}${i}"
       break
     fi
   done
-  [ -n "$ip" ] || die "в подсети 10.8.1.0/24 нет свободных адресов"
+  [ -n "$ip" ] || die "в подсети ${prefix}0/24 нет свободных адресов"
 
-  # параметры серверного профиля переносим в клиентский конфиг: они должны совпадать.
-  # xtrace печатает значения присваиваний — HeaderProtectionKey секретный,
-  # поэтому всё чтение параметров и генерация ключей идут без трассировки.
   set +x
   local k v
   local -A P=()
   for k in MTU Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 HeaderProtectionKey ContentPaddingAddition ListenPort; do
     v="$(conf_get "$k" "$conf")"
-    [ -n "$v" ] || die "в $conf нет параметра $k — конфиг повреждён?"
+    [ -n "$v" ] || die "в $conf нет параметра $k"
     P[$k]="$v"
   done
+
   local srv_pub endpoint priv pubk
-  srv_pub="$(conf_get PrivateKey "$conf" | awg pubkey)" || die "не удалось вычислить pubkey сервера"
-  [ -n "$srv_pub" ] || die "pubkey сервера пуст — проверьте PrivateKey в $conf"
-  endpoint="$(detect_public_ip)" || die "не удалось определить внешний IP сервера"
+  srv_pub="$(conf_get PrivateKey "$conf" | awg pubkey)" || die "ошибка pubkey сервера"
 
-  umask 077
-  priv="$(awg genkey)"
-  pubk="$(printf '%s\n' "$priv" | awg pubkey)"
+  # Если есть client1.conf, берем Endpoint из него (чтобы не дергать curl)
+  local ep_host=""
+  if [ -f "$AWG_DIR/client1.conf" ]; then
+    ep_host="$(conf_get Endpoint "$AWG_DIR/client1.conf" | cut -d':' -f1)"
+  fi
+  endpoint="${ep_host:-$(detect_public_ip)}" || die "не удалось определить IP сервера"
 
-  # сначала runtime: если ядро отвергло peer, файлы не трогаем
-  awg set "$AWG_IFACE" peer "$pubk" allowed-ips "$ip/32" \
-    || die "ядро не приняло peer (awg set) — файлы не изменены"
+  ( umask 077
+    priv="$(awg genkey)"
+    pubk="$(printf '%s\n' "$priv" | awg pubkey)"
 
-  if ! cat >> "$conf" <<EOF
+    awg set "$AWG_IFACE" peer "$pubk" allowed-ips "$ip/32" \
+      || die "ядро не приняло peer (awg set)"
+
+    if ! cat >> "$conf" <<EOF
 
 [Peer]
 # ${name}
 PublicKey = ${pubk}
 AllowedIPs = ${ip}/32
 EOF
-  then
-    awg set "$AWG_IFACE" peer "$pubk" remove 2>/dev/null || true
-    die "не удалось дописать peer в $conf — runtime-peer отозван"
-  fi
+    then
+      awg set "$AWG_IFACE" peer "$pubk" remove 2>/dev/null || true
+      die "не удалось дописать peer в $conf"
+    fi
 
-  cat > "$AWG_DIR/$name.conf" <<EOF
+    cat > "$AWG_DIR/$name.conf" <<EOF
 [Interface]
 PrivateKey = ${priv}
 Address = ${ip}/32
@@ -962,55 +619,81 @@ Endpoint = ${endpoint}:${P[ListenPort]}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
-  chmod 600 "$AWG_DIR/$name.conf" "$conf"
-  set -x
-  qrencode -o "$AWG_DIR/$name.png" -s 6 -m 2 < "$AWG_DIR/$name.conf" || true
-  step "клиент '$name' добавлен: $ip, конфиг $AWG_DIR/$name.conf"
-  printf '\n  QR-код клиента (сканируйте в приложении Amnezia >= 5.0.1.5):\n\n'
-  qrencode -t ansiutf8 < "$AWG_DIR/$name.conf" || true
+    cat > "$AWG_DIR/${name}-lan-bypass.conf" <<EOF
+[Interface]
+PrivateKey = ${priv}
+Address = ${ip}/32
+DNS = ${AWG_DNS}
+MTU = ${P[MTU]}
+Jc = ${P[Jc]}
+Jmin = ${P[Jmin]}
+Jmax = ${P[Jmax]}
+S1 = ${P[S1]}
+S2 = ${P[S2]}
+S3 = ${P[S3]}
+S4 = ${P[S4]}
+H1 = ${P[H1]}
+H2 = ${P[H2]}
+H3 = ${P[H3]}
+H4 = ${P[H4]}
+I1 = ${P[I1]}
+HeaderProtectionKey = ${P[HeaderProtectionKey]}
+ContentPaddingAddition = ${P[ContentPaddingAddition]}
+
+[Peer]
+PublicKey = ${srv_pub}
+Endpoint = ${endpoint}:${P[ListenPort]}
+AllowedIPs = ${ALLOWED_IPS_NO_LAN}
+PersistentKeepalive = 25
+EOF
+    chmod 600 "$AWG_DIR/$name.conf" "$AWG_DIR/${name}-lan-bypass.conf" "$conf"
+    qrencode -o "$AWG_DIR/$name.png" -s 6 -m 2 < "$AWG_DIR/$name.conf" || true
+    qrencode -o "$AWG_DIR/${name}-lan-bypass.png" -s 6 -m 2 < "$AWG_DIR/${name}-lan-bypass.conf" || true
+    chmod 600 "$AWG_DIR/$name.png" "$AWG_DIR/${name}-lan-bypass.png" 2>/dev/null || true
+  )
+
+  step "Клиент '$name' ($ip) успешно создан!"
+  printf '  Файл конфига (0.0.0.0/0):       %s/%s.conf\n' "$AWG_DIR" "$name"
+  printf '  QR-код:                         %s/%s.png\n' "$AWG_DIR" "$name"
+  printf '  С обходом локалок (LAN bypass): %s/%s-lan-bypass.conf\n' "$AWG_DIR" "$name"
+  printf '  QR-код обхода LAN:              %s/%s-lan-bypass.png\n\n' "$AWG_DIR" "$name"
+  if [ "$IS_TTY" = 1 ]; then
+    qrencode -t ansiutf8 < "$AWG_DIR/$name.conf" || true
+  fi
 }
 
 do_remove_client() {
   local key="${1:-}"
-  require_awg31
   local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
   if [ -z "$key" ]; then
     if [ "$IS_TTY" = 1 ]; then
       do_list_clients
       read -r -p "Имя или PublicKey удаляемого клиента: " key || die "ввод прерван"
     else
-      die "укажите имя или pubkey: bash install.sh remove-client <name|pubkey>"
+      die "укажите имя: awg-manager remove-client <name>"
     fi
   fi
+
   local pub="" name=""
   if [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
     pub="$key"
-    name="$(peer_name_by_pub "$pub")"
+    name="$(awk -v p="$pub" '/^\[Peer\]/{c=""} /^#/{c=$0; sub(/^#[ \t]*/,"",c)} /^PublicKey/{v=$0; sub(/^PublicKey[ \t]*=[ \t]*/,"",v); if(v==p){print c; exit}}' "$conf")"
   else
-    [[ "$key" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "некорректное имя/pubkey: $key"
     name="$key"
-    pub="$(peer_pub_by_name "$name")"
-    [ -n "$pub" ] || die "клиент '$name' не найден в $conf (список: bash install.sh list-clients)"
+    pub="$(awk -v want="$name" '/^\[Peer\]/{c=""} /^#/{c=$0; sub(/^#[ \t]*/,"",c); next} /^PublicKey/{if(c==want){v=$0; sub(/^PublicKey[ \t]*=[ \t]*/,"",v); print v; exit}}' "$conf")"
+    [ -n "$pub" ] || die "клиент '$name' не найден"
   fi
 
-  local npeers
-  npeers="$(grep -c '^PublicKey' "$conf" || true)"
-  if [ "$npeers" = 1 ]; then
-    warn "это последний peer — туннель останется без клиентов"
-  fi
-
-  # runtime
   if awg show "$AWG_IFACE" >/dev/null 2>&1; then
-    awg set "$AWG_IFACE" peer "$pub" remove || warn "runtime-peer не удалён (возможно, его не было)"
-  else
-    step "интерфейс не поднят — правлю только конфиг"
+    awg set "$AWG_IFACE" peer "$pub" remove 2>/dev/null || true
   fi
 
-  # перезапись конфига без [Peer]-блока с этим PublicKey
   if grep -qF "$pub" "$conf"; then
     local tmp
     tmp="$(mktemp "$AWG_DIR/.awg0.XXXXXX")"
-    if awk -v p="$pub" '
+    awk -v p="$pub" '
       function flush(   i) { if (n > 0 && !drop) for (i = 1; i <= n; i++) print buf[i]; n = 0; drop = 0 }
       /^\[Peer\]/ { flush(); inpeer = 1 }
       /^\[Interface\]/ { flush(); inpeer = 0 }
@@ -1024,340 +707,686 @@ do_remove_client() {
         } else print
       }
       END { flush() }
-    ' "$conf" > "$tmp"; then
-      chmod 600 "$tmp"
-      mv "$tmp" "$conf"
-    else
-      rm -f "$tmp"
-      die "не удалось перезаписать $conf"
-    fi
-  else
-    step "в конфиге peer не найден — удалён только из runtime"
+    ' "$conf" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$conf"
   fi
 
   if [ -n "$name" ]; then
-    rm -f "$AWG_DIR/$name.conf" "$AWG_DIR/$name.png"
-    step "клиент '$name' удалён (peer, конфиг и QR)"
+    rm -f "$AWG_DIR/$name.conf" "$AWG_DIR/$name.png" "$AWG_DIR/${name}-lan-bypass.conf" "$AWG_DIR/${name}-lan-bypass.png"
+    step "Клиент '$name' удалён"
   else
-    step "peer удалён: $pub"
+    step "Peer $pub удалён"
   fi
 }
 
 do_list_clients() {
   local conf="$AWG_DIR/$AWG_IFACE.conf"
-  [ -f "$conf" ] || die "туннель не установлен — выполните install"
-  step "Клиенты из $conf"
-  printf '  %-20s %-45s %s\n' "ИМЯ" "PUBKEY" "ALLOWED-IPS"
-  awk '
-    /^\[/ { name="" }
-    /^#/ { name=$0; sub(/^#[[:space:]]*/, "", name) }
-    /^PublicKey[[:space:]]*=/ { pub=$0; sub(/^PublicKey[[:space:]]*=[[:space:]]*/, "", pub) }
-    /^AllowedIPs[[:space:]]*=/ {
-      ip=$0; sub(/^AllowedIPs[[:space:]]*=[[:space:]]*/, "", ip)
-      printf "  %-20s %-45s %s\n", (name == "" ? "(без имени)" : name), pub, ip
-    }
-  ' "$conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
+  printf '\n%b=== Список клиентов AmneziaWG ===%b\n' "$C_BOLD" "$C_RESET"
+  printf '%-4s %-18s %-16s %-10s %-18s %s\n' "№" "ИМЯ" "IP АДРЕС" "СТАТУС" "HANDSHAKE" "ТРАФИК (RX/TX)"
+  printf '%s\n' "----------------------------------------------------------------------------------"
+
+  # Извлекаем dump из awg show
+  local dump=""
   if awg show "$AWG_IFACE" >/dev/null 2>&1; then
-    printf '\n'
-    awg show "$AWG_IFACE"
+    dump="$(awg show "$AWG_IFACE" dump 2>/dev/null || true)"
+  fi
+
+  local now idx=0
+  now=$(date +%s)
+
+  python3 -c "
+import sys
+
+dump_lines = '''$dump'''.strip().split('\n')
+stats = {}
+for line in dump_lines:
+    parts = line.split('\t')
+    if len(parts) >= 8:
+        stats[parts[0]] = {
+            'endpoint': parts[2],
+            'handshake': int(parts[4]) if parts[4].isdigit() else 0,
+            'rx': int(parts[5]) if parts[5].isdigit() else 0,
+            'tx': int(parts[6]) if parts[6].isdigit() else 0
+        }
+
+def fmt_bytes(b):
+    for u in ['B', 'KB', 'MB', 'GB']:
+        if b < 1024: return f'{b:.1f} {u}'
+        b /= 1024
+    return f'{b:.1f} TB'
+
+def fmt_time(ts):
+    if ts == 0: return 'никогда'
+    d = $now - ts
+    if d < 60: return f'{d}с назад'
+    if d < 3600: return f'{d//60}м назад'
+    if d < 86400: return f'{d//3600}ч назад'
+    return f'{d//86400}д назад'
+
+conf = '$conf'
+clients = []
+curr = {}
+with open(conf, 'r') as f:
+    for line in f:
+        l = line.strip()
+        if l == '[Peer]':
+            if curr and 'pub' in curr: clients.append(curr)
+            curr = {'name': '', 'pub': '', 'ip': ''}
+        elif l.startswith('#') and curr is not None and not curr.get('name'):
+            curr['name'] = l.lstrip('#').strip()
+        elif '=' in l and curr is not None:
+            k, v = l.split('=', 1)
+            k, v = k.strip(), v.strip()
+            if k == 'PublicKey': curr['pub'] = v
+            elif k == 'AllowedIPs': curr['ip'] = v
+    if curr and 'pub' in curr: clients.append(curr)
+
+for i, c in enumerate(clients, 1):
+    pub = c.get('pub', '')
+    st = stats.get(pub, {'handshake': 0, 'rx': 0, 'tx': 0})
+    hs = st['handshake']
+    online = ($now - hs < 180) and (hs > 0)
+    status = '\033[0;32mOnline\033[0m' if online else '\033[0;37mOffline\033[0m'
+    name = c.get('name') or 'client'
+    ip = c.get('ip', '').split('/')[0]
+    traf = f'↓{fmt_bytes(st[\"tx\"])} / ↑{fmt_bytes(st[\"rx\"])}'
+    print(f'{i:<4} {name:<18} {ip:<16} {status:<19} {fmt_time(hs):<18} {traf}')
+"
+  printf '\n'
+}
+
+#--- Cloudflare WARP для AI (Gemini + OpenAI ChatGPT + Claude) -----------------
+do_warp_enable() {
+  step "Настройка обхода блокировок AI (Google Gemini, OpenAI ChatGPT, Claude) через Cloudflare WARP"
+  wait_for_apt_lock
+  apt_update
+  apt-get install "${APT[@]}" dnsmasq nftables wireguard-tools curl jq python3
+
+  mkdir -p "$WARP_DIR"
+  local warp_conf="/etc/wireguard/warp0.conf"
+
+  # Если профиль warp0 ещё не зарегистрирован — регистрируем через API Cloudflare
+  if [ ! -f "$warp_conf" ]; then
+    step "Регистрация бесплатного профиля Cloudflare WARP..."
+    python3 -c "
+import urllib.request, json, random, string, datetime, subprocess
+
+priv = subprocess.check_output(['wg', 'genkey']).decode().strip()
+pub = subprocess.check_output(['wg', 'pubkey'], input=priv.encode()).decode().strip()
+
+def rand_str(n): return ''.join(random.choices(string.ascii_letters + string.digits, k=n))
+install_id = rand_str(22)
+fcm_token = f'{install_id}:APA91b' + rand_str(134)
+url = f'https://api.cloudflareclient.com/v0a{random.randint(1000, 1999)}/reg'
+
+headers = {
+    'CF-Client-Version': 'a-7.21-0721',
+    'User-Agent': 'okhttp/3.12.1',
+    'Content-Type': 'application/json; charset=UTF-8',
+}
+body = {
+    'key': pub,
+    'install_id': install_id,
+    'fcm_token': fcm_token,
+    'warp_enabled': False,
+    'tos': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z'),
+    'type': 'Android',
+    'locale': 'en_US'
+}
+
+req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers)
+with urllib.request.urlopen(req) as resp:
+    data = json.loads(resp.read().decode())
+    v4 = data['config']['interface']['addresses']['v4']
+    cf_pub = data['config']['peers'][0]['public_key']
+    cf_ep = 'engage.cloudflareclient.com:2408'
+
+conf = f'''[Interface]
+PrivateKey = {priv}
+Address = {v4}/32
+Table = 51820
+
+[Peer]
+PublicKey = {cf_pub}
+Endpoint = {cf_ep}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+'''
+with open('$warp_conf', 'w') as f:
+    f.write(conf)
+" || die "не удалось зарегистрировать Cloudflare WARP"
+    chmod 600 "$warp_conf"
+  fi
+
+  # Запуск интерфейса warp0
+  systemctl enable wg-quick@warp0 >/dev/null 2>&1 || true
+  systemctl restart wg-quick@warp0 || die "не удалось запустить интерфейс warp0"
+
+  # Настройка dnsmasq с nftset для AI-сервисов (Gemini, OpenAI, Claude)
+  systemctl stop systemd-resolved 2>/dev/null || true
+  systemctl disable systemd-resolved 2>/dev/null || true
+  rm -f /etc/resolv.conf
+  printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
+
+  cat > /etc/dnsmasq.d/ai-warp.conf <<'EOF'
+# Обход блокировок AI через Cloudflare WARP (nftset)
+port=53
+listen-address=127.0.0.1
+server=1.1.1.1
+server=8.8.8.8
+domain-needed
+bogus-priv
+
+# --- Google Gemini & DeepMind (geosite:google-deepmind) ---
+nftset=/gemini.google.com/4#inet#awg_ai#ai_v4
+nftset=/aistudio.google.com/4#inet#awg_ai#ai_v4
+nftset=/generativelanguage.googleapis.com/4#inet#awg_ai#ai_v4
+nftset=/ai.google.dev/4#inet#awg_ai#ai_v4
+nftset=/deepmind.com/4#inet#awg_ai#ai_v4
+nftset=/deepmind.google/4#inet#awg_ai#ai_v4
+nftset=/notebooklm.google.com/4#inet#awg_ai#ai_v4
+nftset=/alkalimakersuite-pa.clients6.google.com/4#inet#awg_ai#ai_v4
+nftset=/proactivebackend-pa.googleapis.com/4#inet#awg_ai#ai_v4
+
+# --- OpenAI & ChatGPT (geosite:openai) ---
+nftset=/openai.com/4#inet#awg_ai#ai_v4
+nftset=/chatgpt.com/4#inet#awg_ai#ai_v4
+nftset=/chat.com/4#inet#awg_ai#ai_v4
+nftset=/sora.com/4#inet#awg_ai#ai_v4
+nftset=/oaistatic.com/4#inet#awg_ai#ai_v4
+nftset=/oaiusercontent.com/4#inet#awg_ai#ai_v4
+nftset=/livekit.cloud/4#inet#awg_ai#ai_v4
+
+# --- Anthropic Claude ---
+nftset=/claude.ai/4#inet#awg_ai#ai_v4
+nftset=/anthropic.com/4#inet#awg_ai#ai_v4
+EOF
+
+  # Настройка nftables таблицы и маркировки пакетов
+  nft 'add table inet awg_ai' 2>/dev/null || true
+  nft 'add set inet awg_ai ai_v4 { type ipv4_addr; flags interval, timeout; timeout 1h; }' 2>/dev/null || true
+  nft 'add chain inet awg_ai prerouting { type filter hook prerouting priority mangle; }' 2>/dev/null || true
+  nft 'flush chain inet awg_ai prerouting' 2>/dev/null || true
+  nft 'add rule inet awg_ai prerouting ip daddr @ai_v4 meta mark set 0x51' 2>/dev/null || true
+
+  # Маршрутизация по fwmark
+  ip rule del fwmark 0x51 table 51820 2>/dev/null || true
+  ip rule add fwmark 0x51 table 51820
+  iptables -w -t nat -C POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || \
+    iptables -w -t nat -A POSTROUTING -o warp0 -j MASQUERADE
+
+  systemctl restart dnsmasq
+
+  # Создание юнита автостарта правил
+  cat > /etc/systemd/system/awg-ai-warp.service <<'EOF'
+[Unit]
+Description=AmneziaWG AI (Gemini + ChatGPT) Cloudflare WARP Routing
+After=network.target wg-quick@warp0.service
+Wants=wg-quick@warp0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft add table inet awg_ai
+ExecStart=/usr/bin/nft add set inet awg_ai ai_v4 { type ipv4_addr; flags interval, timeout; timeout 1h; }
+ExecStart=/usr/bin/nft add chain inet awg_ai prerouting { type filter hook prerouting priority mangle; }
+ExecStart=/usr/bin/nft add rule inet awg_ai prerouting ip daddr @ai_v4 meta mark set 0x51
+ExecStart=/bin/sh -c 'ip rule del fwmark 0x51 table 51820 2>/dev/null || true; ip rule add fwmark 0x51 table 51820'
+ExecStart=/usr/sbin/iptables -w -t nat -A POSTROUTING -o warp0 -j MASQUERADE
+ExecStop=/bin/sh -c 'ip rule del fwmark 0x51 table 51820 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now awg-ai-warp.service
+
+  step "Обход Gemini + ChatGPT через Cloudflare WARP успешно настроен!"
+  do_warp_test
+}
+
+do_warp_disable() {
+  step "Отключение обхода AI (Gemini + ChatGPT)"
+  systemctl disable --now awg-ai-warp.service 2>/dev/null || true
+  systemctl stop wg-quick@warp0 2>/dev/null || true
+  systemctl disable wg-quick@warp0 2>/dev/null || true
+  ip rule del fwmark 0x51 table 51820 2>/dev/null || true
+  iptables -w -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
+  rm -f /etc/dnsmasq.d/ai-warp.conf /etc/dnsmasq.d/gemini-warp.conf
+  systemctl restart dnsmasq 2>/dev/null || true
+  step "Обход AI отключён"
+}
+
+do_warp_test() {
+  step "Проверка доступности Google Gemini и OpenAI ChatGPT..."
+  local res_gemini res_openai
+  res_gemini="$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 https://generativelanguage.googleapis.com || true)"
+  if [ "$res_gemini" = "200" ] || [ "$res_gemini" = "404" ] || [ "$res_gemini" = "400" ]; then
+    printf '%b  [OK] Google Gemini API:  доступен (HTTP %s)%b\n' "$C_GREEN" "$res_gemini" "$C_RESET"
   else
-    step "интерфейс $AWG_IFACE не поднят — runtime-статистики нет"
+    printf '%b  [FAIL] Google Gemini API: код %s%b\n' "$C_RED" "$res_gemini" "$C_RESET"
+  fi
+
+  res_openai="$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 https://api.openai.com || true)"
+  if [ "$res_openai" = "200" ] || [ "$res_openai" = "404" ] || [ "$res_openai" = "405" ]; then
+    printf '%b  [OK] OpenAI / ChatGPT:   доступен (HTTP %s)%b\n' "$C_GREEN" "$res_openai" "$C_RESET"
+  else
+    printf '%b  [FAIL] OpenAI / ChatGPT:  код %s%b\n' "$C_RED" "$res_openai" "$C_RESET"
   fi
 }
 
-#--- креды --------------------------------------------------------------------------
-do_creds() {
-  [ -r "$CRED_FILE" ] || die "файл кредов не найден: $CRED_FILE (выполните install)"
-  step "Креды ($CRED_FILE)"
-  cat "$CRED_FILE"
-  if [ -f "$AWG_DIR/client1.conf" ] && command -v qrencode >/dev/null 2>&1; then
-    printf '\n  QR клиентского конфига:\n\n'
-    qrencode -t ansiutf8 < "$AWG_DIR/client1.conf" || true
+do_ru_bypass() {
+  step "База раздельного туннелирования для сайтов РФ (GeoIP RU)"
+  local target="$AWG_DIR/amnezia-russia-bypass.json"
+  local url="https://raw.githubusercontent.com/lib4u/amnezia-tunneling-ru/main/amnezia.json"
+  local local_src="$(dirname "$0")/amnezia-russia-bypass.json"
+
+  if [ -f "$local_src" ]; then
+    cp "$local_src" "$target"
+  elif [ ! -f "$target" ]; then
+    step "Загрузка актуального списка российских сайтов и сервисов..."
+    curl -fsSL "$url" -o "$target" 2>/dev/null || warn "не удалось скачать базу"
+  fi
+
+  if [ -f "$target" ]; then
+    printf '\n%bФайл базы готов:%b %s (%s)\n' "$C_GREEN" "$C_RESET" "$target" "$(du -h "$target" | awk '{print $1}')"
+    printf '\n%bИНСТРУКЦИЯ ПО НАСТРОЙКЕ В ПРИЛОЖЕНИИ AMNEZIA VPN:%b\n' "$C_BOLD" "$C_RESET"
+    printf '1. Скопируйте файл %s к себе на телефон или компьютер.\n' "$target"
+    printf '   (Или отправьте команду в Telegram-боте: кнопка "🇷🇺 Обход сайтов РФ")\n'
+    printf '2. В приложении Amnezia VPN:\n'
+    printf '   Настройки (шестерёнка) -> Подключение -> Раздельное туннелирование сайтов\n'
+    printf '3. Выберите режим: «Адреса из списка НЕ должны использовать VPN»\n'
+    printf '4. Нажмите «Импорт» и выберите скачанный файл.\n\n'
+    printf '%bГотово! Все российские банки, Госуслуги и сайты .ru пойдут напрямую.%b\n\n' "$C_GREEN" "$C_RESET"
   fi
 }
 
-#--- бэкап / восстановление -----------------------------------------------------------
+#--- Telegram-бот -------------------------------------------------------------
+do_bot_setup() {
+  step "Настройка Telegram-бота для управления клиентами"
+  local token="" admin_id=""
+
+  if [ -r "$BOT_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$BOT_ENV"
+    token="${BOT_TOKEN:-}"
+    admin_id="${ADMIN_ID:-}"
+  fi
+
+  if [ "$IS_TTY" = 1 ]; then
+    printf '\n1. Создайте бота в Telegram через @BotFather и скопируйте токен бота.\n'
+    read -r -p "Токен бота [текущий: ${token:-нет}]: " new_token || return 1
+    if [ -n "$new_token" ]; then token="$new_token"; fi
+
+    printf '\n2. Узнайте свой Telegram ID через @userinfobot (только цифры).\n'
+    read -r -p "Ваш Telegram ID [текущий: ${admin_id:-нет}]: " new_id || return 1
+    if [ -n "$new_id" ]; then admin_id="$new_id"; fi
+  fi
+
+  [ -n "$token" ] || die "токен бота не может быть пустым"
+  [ -n "$admin_id" ] || die "admin_id не может быть пустым"
+
+  ( umask 077
+    cat > "$BOT_ENV" <<EOF
+BOT_TOKEN="${token}"
+ADMIN_ID="${admin_id}"
+EOF
+    chmod 600 "$BOT_ENV"
+  )
+
+  mkdir -p "$BOT_DIR"
+  local bot_src="$(dirname "$0")/bot.py"
+  if [ -f "$bot_src" ]; then
+    cp "$bot_src" "$BOT_DIR/bot.py"
+  elif [ ! -f "$BOT_DIR/bot.py" ]; then
+    die "файл bot.py не найден"
+  fi
+  chmod 755 "$BOT_DIR/bot.py"
+
+  cat > /etc/systemd/system/awg-bot.service <<EOF
+[Unit]
+Description=AmneziaWG Telegram Management Bot
+After=network.target awg-quick@${AWG_IFACE}.service
+Wants=awg-quick@${AWG_IFACE}.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${BOT_DIR}
+EnvironmentFile=${BOT_ENV}
+ExecStart=/usr/bin/python3 ${BOT_DIR}/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now awg-bot.service
+  sleep 1
+
+  if systemctl is-active --quiet awg-bot; then
+    step "Telegram-бот успешно запущен! Откройте вашего бота в Telegram и отправьте /start"
+  else
+    journalctl -u awg-bot -n 20 --no-pager
+    warn "Бот не запустился — проверьте логи выше"
+  fi
+}
+
+do_bot_status() {
+  printf '\n%b=== Статус Telegram-бота ===%b\n' "$C_BOLD" "$C_RESET"
+  systemctl status awg-bot --no-pager || true
+}
+
+do_bot_restart() {
+  systemctl restart awg-bot && step "Telegram-бот перезапущен"
+}
+
+#--- статус сервера -----------------------------------------------------------
+do_status() {
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
+  printf '\n%b============================================================%b\n' "$C_CYAN" "$C_RESET"
+  printf '  %bAmneziaWG 3.1 — Состояние сервера%b\n' "$C_BOLD" "$C_RESET"
+  printf '%b============================================================%b\n' "$C_CYAN" "$C_RESET"
+  local active
+  active="$(systemctl is-active "awg-quick@${AWG_IFACE}" 2>/dev/null || true)"
+  if [ "$active" = "active" ]; then
+    printf '  Сервис awg-quick:  %b🟢 Активен (awg0)%b\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '  Сервис awg-quick:  %b🔴 Остановлен%b\n' "$C_RED" "$C_RESET"
+  fi
+  printf '  ListenPort:        %s/udp\n' "$(conf_get ListenPort "$conf")"
+  printf '  Подсеть туннеля:   %s\n' "$(get_subnet_prefix)0/24"
+  printf '  Клиентов в базе:   %s\n' "$(grep -c '^\[Peer\]' "$conf" || true)"
+
+  # Статус бота
+  local bot_act
+  bot_act="$(systemctl is-active awg-bot 2>/dev/null || true)"
+  if [ "$bot_act" = "active" ]; then
+    printf '  Telegram-бот:      %b🟢 Работает (awg-bot)%b\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '  Telegram-бот:      %b⚪ Не запущен%b\n' "$C_YELLOW" "$C_RESET"
+  fi
+
+  # Статус Gemini / OpenAI WARP
+  local warp_act
+  warp_act="$(systemctl is-active awg-ai-warp 2>/dev/null || true)"
+  if [ "$warp_act" = "active" ]; then
+    printf '  Обход AI (Gemini/GPT): %b🟢 Включён (Cloudflare WARP)%b\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '  Обход AI (Gemini/GPT): %b⚪ Отключён%b\n' "$C_YELLOW" "$C_RESET"
+  fi
+  printf '%b------------------------------------------------------------%b\n' "$C_CYAN" "$C_RESET"
+
+  do_list_clients
+}
+
+#--- бэкап и удаление ---------------------------------------------------------
 do_backup() {
-  step "Бэкап конфигов AWG и БД панели"
-  local ts tar members=() stopped=0 ok=0
+  step "Создание бэкапа AmneziaWG"
+  local ts tar
   ts="$(date '+%Y%m%d-%H%M%S')"
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
-  tar="$BACKUP_DIR/awg-3xui-$ts.tar.gz"
-  if [ -d "$AWG_DIR" ]; then members+=("etc/amnezia/amneziawg"); fi
-  if [ -d /etc/x-ui ]; then members+=("etc/x-ui"); fi
-  if [ -f "$CRED_FILE" ]; then members+=("${CRED_FILE#/}"); fi
-  [ "${#members[@]}" -gt 0 ] || die "нечего бэкапить: ни конфигов AWG, ни /etc/x-ui"
+  tar="$BACKUP_DIR/awg-backup-$ts.tar.gz"
 
-  # консистентность SQLite: кратко останавливаем x-ui; запуск обратно гарантирован
-  # (между stop и start нет команд, способных прервать функцию)
-  if systemctl is-active --quiet x-ui 2>/dev/null; then
-    systemctl stop x-ui || warn "x-ui не остановился — бэкап БД может быть неконсистентным"
-    stopped=1
-  fi
-  if tar -czf "$tar" -C / "${members[@]}"; then ok=1; fi
-  if [ "$stopped" = 1 ]; then
-    systemctl start x-ui || warn "x-ui не запустился после бэкапа — проверьте: journalctl -u x-ui"
-  fi
-  [ "$ok" = 1 ] || die "tar не смог создать $tar"
+  tar -czf "$tar" -C / etc/amnezia/amneziawg root/awg-credentials.txt 2>/dev/null || true
   chmod 600 "$tar"
-  step "бэкап готов: $tar ($(du -h "$tar" | awk '{print $1}'))"
-  tar -tzf "$tar" | sed 's/^/  /'
+  step "Бэкап создан: $tar"
 }
 
 do_restore() {
   local file="${1:-}"
-  [ -n "$file" ] || die "укажите файл: bash install.sh restore /root/awg-3xui-backups/<file>.tar.gz"
-  [ -f "$file" ] && [ -r "$file" ] || die "файл не найден или не читается: $file"
-  tar -tzf "$file" >/dev/null 2>&1 || die "файл не читается как tar.gz: $file"
+  [ -n "$file" ] || die "укажите файл бэкапа"
+  [ -f "$file" ] || die "файл $file не найден"
 
-  # защита от tar-slip: только пути этого установщика, без '..' и абсолютных путей
-  local m bad=0
-  while IFS= read -r m; do
-    case "$m" in
-      etc/amnezia/amneziawg|etc/amnezia/amneziawg/*|etc/x-ui|etc/x-ui/*|root/awg-3xui-credentials.txt) ;;
-      *) bad=1 ;;
-    esac
-    case "$m" in *..*) bad=1 ;; esac
-    [ "$bad" = 0 ] || break
-  done < <(tar -tzf "$file")
-  [ "$bad" = 0 ] || die "архив содержит посторонние пути — восстановление отменено (ожидается бэкап этого установщика)"
+  # Защита от симлинков
+  if tar -tvf "$file" 2>/dev/null | grep -q '^[lh]'; then
+    die "архив содержит симлинки — восстановление отменено"
+  fi
 
-  # восстанавливать есть смысл только на установленную систему
-  [ -x /usr/local/x-ui/x-ui ] || [ -d "$AWG_DIR" ] \
-    || die "система не установлена — сначала install, потом restore"
-
-  step "Восстановление из $file (сервисы будут перезапущены)"
   systemctl stop "awg-quick@${AWG_IFACE}" 2>/dev/null || true
-  systemctl stop x-ui 2>/dev/null || true
-  tar -xzf "$file" -C / || die "распаковка не удалась"
-  if [ -d "$AWG_DIR" ]; then
-    chmod 700 "$AWG_DIR" 2>/dev/null || true
-    chmod 600 "$AWG_DIR"/*.conf 2>/dev/null || true
-  fi
-  if [ -f "$AWG_DIR/$AWG_IFACE.conf" ]; then
-    if ! systemctl start "awg-quick@${AWG_IFACE}"; then
-      journalctl -u "awg-quick@${AWG_IFACE}" -n 25 --no-pager || true
-      die "awg-quick не запустился после восстановления"
-    fi
-  fi
-  if [ -x /usr/local/x-ui/x-ui ]; then
-    if ! systemctl start x-ui; then
-      journalctl -u x-ui -n 25 --no-pager || true
-      die "x-ui не запустился после восстановления"
-    fi
-  fi
-  step "восстановлено из $file"
+  tar -xzf "$file" -C /
+  chmod 700 "$AWG_DIR" 2>/dev/null || true
+  chmod 600 "$AWG_DIR"/*.conf 2>/dev/null || true
+  systemctl start "awg-quick@${AWG_IFACE}"
+  step "Восстановление завершено!"
 }
 
-#--- обновление -----------------------------------------------------------------------
-do_update() {
-  step "Обновление AmneziaWG (DKMS) и 3x-ui"
-  command -v awg >/dev/null 2>&1 || die "AWG не установлен — нечего обновлять (выполните install)"
-  wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
-  apt_update || die "apt-get update не удался"
-  apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 \
-    || die "linux-headers-$(uname -r) недоступен — DKMS не собрать для текущего ядра"
-  apt-get install "${APT[@]}" --only-upgrade amneziawg amneziawg-dkms amneziawg-tools "linux-headers-$(uname -r)" \
-    || die "apt --only-upgrade не удался"
+do_uninstall() {
+  step "Полное удаление AmneziaWG"
+  do_backup
+  do_warp_disable 2>/dev/null || true
+  systemctl stop awg-bot 2>/dev/null || true
+  systemctl disable awg-bot 2>/dev/null || true
+  rm -f /etc/systemd/system/awg-bot.service
 
-  step "Перезагрузка модуля ядра (туннель будет недоступен несколько секунд)"
-  systemctl stop "awg-quick@${AWG_IFACE}" || warn "awg-quick не остановился"
-  if rmmod amneziawg 2>/dev/null; then
-    modprobe amneziawg || die "обновлённый модуль не загрузился"
-    probe_awg31 || die "обновлённый модуль не принимает профиль 3.1 — проверьте версию пакетов amneziawg"
-  else
-    warn "модуль не выгрузился (занят) — новая версия вступит в силу после перезагрузки сервера"
-  fi
-  if ! systemctl start "awg-quick@${AWG_IFACE}"; then
-    journalctl -u "awg-quick@${AWG_IFACE}" -n 25 --no-pager || true
-    die "туннель не поднялся после обновления"
-  fi
-  awg show "$AWG_IFACE" >/dev/null || die "интерфейс не поднялся после обновления"
+  systemctl stop "awg-quick@${AWG_IFACE}" 2>/dev/null || true
+  systemctl disable "awg-quick@${AWG_IFACE}" 2>/dev/null || true
 
-  if [ -x /usr/bin/x-ui ]; then
-    step "Обновление 3x-ui (официальный update.sh, данные сохраняются)"
-    echo y | x-ui update || warn "x-ui update завершился с ошибкой"
+  local wan
+  wan="$(detect_wan_iface)"
+  local prefix
+  prefix="$(get_subnet_prefix)"
+  if [ -n "$prefix" ] && [ -n "$wan" ]; then
+    iptables -w -t nat -D POSTROUTING -s "${prefix}0/24" -o "$wan" -j MASQUERADE 2>/dev/null || true
   fi
-  step "Обновление завершено"
-  awg --version | head -n1
-  dkms status 2>/dev/null | grep amneziawg || true
-  systemctl is-active "awg-quick@${AWG_IFACE}" x-ui 2>/dev/null || true
+
+  apt-get purge "${APT[@]}" amneziawg amneziawg-dkms amneziawg-tools 2>/dev/null || true
+  rmmod amneziawg 2>/dev/null || true
+  add-apt-repository -y --remove ppa:amnezia/ppa 2>/dev/null || true
+
+  rm -rf "$AWG_DIR" "$BOT_DIR" /usr/local/bin/awg-manager "$CRED_FILE" /etc/sysctl.d/99-awg-forward.conf
+  step "Удаление завершено."
 }
 
-#--- перезапуск -------------------------------------------------------------------------
-do_restart() {
-  step "Перезапуск сервисов"
-  if ! systemctl restart "awg-quick@${AWG_IFACE}"; then
-    journalctl -u "awg-quick@${AWG_IFACE}" -n 25 --no-pager || true
-    die "awg-quick@${AWG_IFACE} не запустился"
-  fi
-  if [ -x /usr/local/x-ui/x-ui ] || [ -f /etc/systemd/system/x-ui.service ]; then
-    if ! systemctl restart x-ui; then
-      journalctl -u x-ui -n 25 --no-pager || true
-      die "x-ui не запустился"
-    fi
-  fi
-  sleep 1
-  awg show "$AWG_IFACE" >/dev/null || die "интерфейс не поднялся"
-  systemctl is-active "awg-quick@${AWG_IFACE}" x-ui 2>/dev/null || true
-  step "сервисы перезапущены"
-}
-
-#--- логи ---------------------------------------------------------------------------------
-do_logs() {
-  step "Последние строки логов"
-  printf '== %s ==\n' "$LOG_FILE"
-  tail -n 40 "$LOG_FILE" 2>/dev/null || true
-  printf '\n== journal: awg-quick@%s + x-ui ==\n' "$AWG_IFACE"
-  journalctl -u "awg-quick@${AWG_IFACE}" -u x-ui -n 30 --no-pager 2>/dev/null || true
-  printf '\nПолная трассировка: %s\n' "$DBG_FILE"
-}
-
-#--- меню и справка ------------------------------------------------------------------------
-usage() {
-  cat <<'EOF'
-awg-3xui-installer — AmneziaWG (модуль ядра, профиль 3.1) + 3x-ui для Ubuntu 24.04
-
-Запуск без аргументов:
-  в терминале (TTY)    -> интерактивное меню
-  curl ... | sudo bash -> автономная установка без вопросов
-
-Команды (sudo bash install.sh <команда>):
-  install                    установка с нуля / идемпотентный повтор
-  uninstall                  полное удаление (с бэкапом в /root/awg-3xui-backups)
-  reinstall                  uninstall + install
-  migrate                    профиль 1.x -> 3.1 (шифрование заголовков)
-  status                     состояние сервисов, туннеля, версии
-  add-client [name]          новый клиент (конфиг + QR)
-  remove-client <name|pubkey>  удалить клиента
-  list-clients               список клиентов + runtime-статистика
-  creds                      показать креды и QR
-  backup                     бэкап конфигов и БД панели
-  restore <file.tar.gz>      восстановление из бэкапа
-  update                     обновить AWG (DKMS) и 3x-ui
-  restart                    перезапустить сервисы
-  logs                       последние строки логов
-  help                       эта справка
-
-Примеры:
-  curl -fsSL <url>/install.sh | sudo bash      # автономная установка
-  sudo bash install.sh                         # меню
-  sudo bash install.sh add-client phone
-  sudo AWG_PORT=51820 bash install.sh install
-
-Переменные окружения (install): AWG_PORT, PANEL_PORT, PANEL_USER, PANEL_PASS, PANEL_PATH
-EOF
-}
-
+#--- интерактивное меню (TUI) --------------------------------------------------
 show_menu() {
-  local choice rf
+  local choice
   while :; do
-    printf '\n%s\n' '============================================================'
-    printf '  awg-3xui-installer — меню управления\n'
-    printf '%s\n' '============================================================'
-    printf '   1) Установка с нуля / идемпотентный повтор (install)\n'
-    printf '   2) Полное удаление (uninstall, с бэкапом)\n'
-    printf '   3) Переустановка начисто (reinstall)\n'
-    printf '   4) Миграция профиля 1.x -> 3.1 (migrate)\n'
-    printf '   5) Статус (status)\n'
-    printf '   6) Добавить клиента (add-client)\n'
-    printf '   7) Удалить клиента (remove-client)\n'
-    printf '   8) Список клиентов (list-clients)\n'
-    printf '   9) Показать креды и QR (creds)\n'
-    printf '  10) Бэкап конфигов и БД панели (backup)\n'
-    printf '  11) Восстановление из бэкапа (restore)\n'
-    printf '  12) Обновление AWG + 3x-ui (update)\n'
-    printf '  13) Перезапуск сервисов (restart)\n'
-    printf '  14) Логи (logs)\n'
-    printf '   0) Выход\n'
-    printf '%s\n' '------------------------------------------------------------'
-    read -r -p 'Выбор: ' choice || { printf '\n'; break; }
-    set -x   # install завершается с set +x (защита кредов) — возвращаем трассировку
+    local srv_status="🔴"
+    if systemctl is-active --quiet "awg-quick@${AWG_IFACE}" 2>/dev/null; then
+      srv_status="🟢"
+    fi
+    local bot_status="⚪ Отключён"
+    if systemctl is-active --quiet awg-bot 2>/dev/null; then
+      bot_status="🟢 Работает"
+    fi
+    local warp_status="⚪ Отключён"
+    if systemctl is-active --quiet awg-ai-warp 2>/dev/null; then
+      warp_status="🟢 Активен"
+    fi
+
+    local conf="$AWG_DIR/$AWG_IFACE.conf"
+    local port="-" subnet="-" count="0"
+    if [ -f "$conf" ]; then
+      port="$(conf_get ListenPort "$conf")"
+      subnet="$(get_subnet_prefix)0/24"
+      count="$(grep -c '^\[Peer\]' "$conf" || true)"
+    fi
+
+    printf '\n%b============================================================%b\n' "$C_BLUE" "$C_RESET"
+    printf '  %bAmneziaWG 3.1 — Панель управления сервером%b\n' "$C_BOLD" "$C_RESET"
+    printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
+    printf '  Туннель awg0:     %s (%s/udp, %s, клиентов: %s)\n' "$srv_status" "$port" "$subnet" "$count"
+    printf '  Telegram-бот:     %b%s%b\n' "$C_CYAN" "$bot_status" "$C_RESET"
+    printf '  Обход AI (Gemini/GPT): %b%s%b\n' "$C_CYAN" "$warp_status" "$C_RESET"
+    printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
+    printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ:%b\n' "$C_BOLD" "$C_RESET"
+    printf '    1) Список клиентов, статус и QR-коды\n'
+    printf '    2) Добавить нового клиента\n'
+    printf '    3) Удалить клиента\n'
+    printf '  %bСЕРВИСЫ И ИНТЕГРАЦИИ:%b\n' "$C_BOLD" "$C_RESET"
+    printf '    4) Настроить Telegram-бота (управление через ТГ)\n'
+    printf '    5) Настройка обхода AI (Gemini + ChatGPT) через WARP\n'
+    printf '    6) Обход сайтов РФ (GeoIP RU) — база amnezia.json\n'
+    printf '    7) Детальный статус и статистика (awg show)\n'
+    printf '    8) Перезапустить туннель\n'
+    printf '  %bОБСЛУЖИВАНИЕ:%b\n' "$C_BOLD" "$C_RESET"
+    printf '    9) Резервная копия (бэкап) / Восстановление\n'
+    printf '   10) Переустановить AmneziaWG начисто\n'
+    printf '   11) Полное удаление AmneziaWG\n'
+    printf '    0) Выход\n'
+    printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
+    read -r -p "Выберите пункт меню: " choice || { printf '\n'; break; }
+
     case "$choice" in
-      1) do_install ;;
-      2) if confirm_yes "Удалить AWG + 3x-ui полностью (бэкап будет создан)?"; then
-           do_uninstall
-         else step "отменено"; fi ;;
-      3) if confirm_yes "Переустановить начисто (текущие конфиги и БД панели будут удалены, бэкап будет создан)?"; then
-           do_reinstall
-         else step "отменено"; fi ;;
-      4) do_migrate ;;
-      5) do_status ;;
-      6) do_add_client "" ;;
-      7) do_remove_client "" ;;
-      8) do_list_clients ;;
-      9) do_creds ;;
-      10) do_backup ;;
-      11) read -r -p 'Путь к файлу бэкапа: ' rf || rf=""
-          do_restore "$rf" ;;
-      12) do_update ;;
-      13) do_restart ;;
-      14) do_logs ;;
+      1)
+        do_list_clients
+        local subch
+        read -r -p "Введите номер или имя клиента для вывода QR [или Enter назад]: " subch || true
+        if [ -n "$subch" ]; then
+          local cname=""
+          if [[ "$subch" =~ ^[0-9]+$ ]]; then
+            # Поиск имени клиента по номеру
+            cname="$(awk -v want="$subch" '
+              BEGIN { n=0 }
+              /^\[Peer\]/ { name="" }
+              /^#/ && !name { name=$0; sub(/^#[ \t]*/, "", name) }
+              /^PublicKey/ {
+                n++
+                if (n == want) { print (name ? name : "client" n); exit }
+              }
+            ' "$conf")"
+          elif [ -f "$AWG_DIR/$subch.conf" ]; then
+            cname="$subch"
+          fi
+
+          if [ -n "$cname" ] && [ -f "$AWG_DIR/$cname.conf" ]; then
+            printf '\nТип QR-кода для клиента %s:\n' "$cname"
+            printf '  1) Стандартный (0.0.0.0/0 — весь интернет через VPN)\n'
+            printf '  2) С обходом LAN (локальные сети 192.168/10/172 идут напрямую)\n'
+            local pt
+            read -r -p "Выбор [1]: " pt || true
+            local qf="$AWG_DIR/$cname.conf"
+            if [ "$pt" = "2" ]; then
+              if [ ! -f "$AWG_DIR/${cname}-lan-bypass.conf" ]; then
+                sed "s|AllowedIPs[[:space:]]*=.*|AllowedIPs = ${ALLOWED_IPS_NO_LAN}|" "$AWG_DIR/$cname.conf" > "$AWG_DIR/${cname}-lan-bypass.conf"
+                chmod 600 "$AWG_DIR/${cname}-lan-bypass.conf"
+              fi
+              qf="$AWG_DIR/${cname}-lan-bypass.conf"
+            fi
+            printf '\nQR-код (%s):\n\n' "$(basename "$qf")"
+            qrencode -t ansiutf8 < "$qf" || true
+            read -r -p "Нажмите Enter для возврата..." _ || true
+          else
+            printf 'Клиент %s не найден.\n' "$subch"
+          fi
+        fi
+        ;;
+      2) do_add_client "" ;;
+      3) do_remove_client "" ;;
+      4)
+        printf '\n1) Настроить токен и запустить бота\n2) Статус бота\n3) Перезапустить бота\n'
+        local bch
+        read -r -p "Выбор: " bch || true
+        case "$bch" in
+          1) do_bot_setup ;;
+          2) do_bot_status ;;
+          3) do_bot_restart ;;
+        esac
+        ;;
+      5)
+        printf '\n1) Включить обход AI (WARP)\n2) Проверить доступность Gemini + ChatGPT\n3) Отключить обход\n'
+        local wch
+        read -r -p "Выбор: " wch || true
+        case "$wch" in
+          1) do_warp_enable ;;
+          2) do_warp_test ;;
+          3) do_warp_disable ;;
+        esac
+        ;;
+      6) do_ru_bypass ;;
+      7) do_status ;;
+      8) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
+      9)
+        printf '\n1) Создать бэкап\n2) Восстановить из файла\n'
+        local bkch
+        read -r -p "Выбор: " bkch || true
+        if [ "$bkch" = "1" ]; then do_backup; elif [ "$bkch" = "2" ]; then
+          read -r -p "Путь к tar.gz архиву: " bkp || true
+          do_restore "$bkp"
+        fi
+        ;;
+      10)
+        if confirm_yes "Переустановить AmneziaWG начисто (текущие клиенты будут сохранены в бэкап)?"; then
+          do_install
+        fi
+        ;;
+      11)
+        if confirm_yes "Полностью удалить AmneziaWG с сервера?"; then
+          do_uninstall
+        fi
+        ;;
       0|q|quit|exit) break ;;
       *) printf 'Неизвестный пункт: %s\n' "$choice" ;;
     esac
   done
-  step "Выход из меню"
 }
 
-#--- dispatch ---------------------------------------------------------------------------
+#--- диспетчер команд ---------------------------------------------------------
 ACTION="${1:-}"
-case "$ACTION" in
-  help|-h|--help) usage; exit 0 ;;
-esac
 
-# TTY определяем ДО перенаправления вывода в tee: после exec stdout уже не TTY.
-# Меню — только когда и stdin, и stdout терминал; curl | bash -> автоустановка.
-IS_TTY=0
 if [ -t 0 ] && [ -t 1 ]; then IS_TTY=1; fi
 
 if [ -z "$ACTION" ]; then
-  if [ "$IS_TTY" = 1 ]; then ACTION="menu"; else ACTION="install"; fi
+  if [ "$IS_TTY" = 1 ] && [ -f "$AWG_DIR/$AWG_IFACE.conf" ]; then
+    ACTION="menu"
+  else
+    ACTION="install"
+  fi
 fi
-case "$ACTION" in
-  menu|install|uninstall|reinstall|migrate|status|add-client|remove-client|list-clients|creds|backup|restore|update|restart|logs) ;;
-  *) printf 'Неизвестная команда: %s\n\n' "$ACTION" >&2; usage >&2; exit 1 ;;
-esac
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Запустите от root: sudo bash install.sh ${ACTION}" >&2
   exit 1
 fi
 
-mkdir -p /var/log
-touch "$LOG_FILE" "$DBG_FILE"
-chmod 600 "$LOG_FILE" "$DBG_FILE"
+( umask 077 && touch "$LOG_FILE" "$DBG_FILE" )
 exec > >(tee -a "$LOG_FILE") 2>&1
-exec 5>>"$DBG_FILE"
-BASH_XTRACEFD=5   # без export: иначе дочерние bash (dpkg/dkms) ругаются на fd 5
-set -x
 
-# лок только для изменяющих действий; status/list-clients/creds/logs — read-only
-case "$ACTION" in
-  status|list-clients|creds|logs) ;;
-  *)
-    exec 9>/run/lock/awg-3xui-installer.lock
-    flock -n 9 || { echo "ОШИБКА: установщик уже запущен в другом процессе" >&2; exit 1; }
-    ;;
-esac
-
-step "Действие: ${ACTION}"
 case "$ACTION" in
   menu) show_menu ;;
   install) do_install ;;
-  uninstall) do_uninstall ;;
-  reinstall) do_reinstall ;;
-  migrate) do_migrate ;;
-  status) do_status ;;
   add-client) do_add_client "${2:-}" ;;
   remove-client) do_remove_client "${2:-}" ;;
-  list-clients) do_list_clients ;;
-  creds) do_creds ;;
+  list-clients|clients) do_list_clients ;;
+  bot) do_bot_setup ;;
+  bot-status) do_bot_status ;;
+  bot-restart) do_bot_restart ;;
+  warp-enable) do_warp_enable ;;
+  warp-disable) do_warp_disable ;;
+  warp-test) do_warp_test ;;
+  ru-bypass) do_ru_bypass ;;
+  status) do_status ;;
   backup) do_backup ;;
   restore) do_restore "${2:-}" ;;
-  update) do_update ;;
-  restart) do_restart ;;
-  logs) do_logs ;;
+  uninstall) do_uninstall ;;
+  help|-h|--help)
+    cat <<EOF
+Использование: sudo bash install.sh [команда]
+
+Команды:
+  menu          Интерактивное меню управления (TUI)
+  install       Установка или идемпотентная проверка сервера
+  clients       Список клиентов, статус онлайн и трафик
+  add-client    Добавить нового клиента
+  remove-client Удалить клиента (по имени или pubkey)
+  bot           Настройка Telegram-бота для управления клиентами
+  warp-enable   Включить обход Gemini через Cloudflare WARP
+  warp-disable  Отключить обход Gemini
+  warp-test     Проверить доступность Google Gemini API
+  status        Детальный статус сервисов и интерфейса
+  backup        Создать резервную копию
+  restore       Восстановить из архива
+  uninstall     Полное удаление с сервера
+EOF
+    ;;
+  *) die "Неизвестная команда '$ACTION'. Справка: bash install.sh help" ;;
 esac
-sleep 1   # дать tee дописать лог
