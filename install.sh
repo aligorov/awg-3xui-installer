@@ -184,7 +184,7 @@ upgrade_awg_packages() { # старые пакеты (focal-PPA/1.x): стави
   done
   wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
   add-apt-repository -y ppa:amnezia/ppa
-  apt-get update || { sleep 5; apt-get update; }
+  apt_update
   # без --only-upgrade: у focal-сборки revision может быть выше noble (1~ против 0~) —
   # формально это downgrade, разрешаем; код noble новее и поддерживает профиль 3.1
   apt-get install "${APT[@]}" --allow-downgrades amneziawg amneziawg-dkms amneziawg-tools \
@@ -224,6 +224,27 @@ wait_for_apt_lock() { # unattended-upgrades может держать dpkg-ло�
     fi
     step "apt/dpkg занят (unattended-upgrades?) — жду, попытка ${i}/60"
     sleep 5
+  done
+  return 1
+}
+
+apt_update() { # apt-get update, переживающий лок lists/dpkg (unattended-upgrades/apt.systemd.daily)
+  # wait_for_apt_lock проверяет лок ЗАРАНЕЕ, но фоновый apt может захватить его сразу
+  # после проверки (гонка). Поэтому ловим именно ошибку лока и ждём; прочие ошибки
+  # (сеть/репозитории) не маскируем — падаем сразу.
+  local i out
+  for i in $(seq 1 60); do
+    if out="$(apt-get update 2>&1)"; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    printf '%s\n' "$out" >&2
+    if printf '%s' "$out" | grep -q 'Could not get lock\|Unable to lock directory'; then
+      step "apt-лок занят (автообновление?) — жду, попытка ${i}/60"
+      sleep 5
+    else
+      return 1
+    fi
   done
   return 1
 }
@@ -280,12 +301,12 @@ do_install() {
   #--- зависимости -------------------------------------------------------------
   step "Установка зависимостей и заголовков ядра $(uname -r)"
   wait_for_apt_lock || die "apt/dpkg занят более 5 минут (unattended-upgrades?) — повторите позже"
-  apt-get update || { sleep 5; apt-get update; }
+  apt_update || die "apt-get update не удался (проверьте сеть и репозитории)"
   apt-get install "${APT[@]}" ca-certificates curl gnupg2 openssl \
     software-properties-common python3-launchpadlib
   wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
   add-apt-repository -y universe
-  apt-get update
+  apt_update
   apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 \
     || die "linux-headers-$(uname -r) недоступен в репозиториях — DKMS не собрать (нестандартное ядро?)"
   apt-get install "${APT[@]}" \
@@ -312,7 +333,7 @@ do_install() {
   else
     wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
     add-apt-repository -y ppa:amnezia/ppa
-    apt-get update
+    apt_update
     apt-get install "${APT[@]}" amneziawg
   fi
 
@@ -1134,7 +1155,7 @@ do_update() {
   step "Обновление AmneziaWG (DKMS) и 3x-ui"
   command -v awg >/dev/null 2>&1 || die "AWG не установлен — нечего обновлять (выполните install)"
   wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
-  apt-get update || { sleep 5; apt-get update; }
+  apt_update || die "apt-get update не удался"
   apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1 \
     || die "linux-headers-$(uname -r) недоступен — DKMS не собрать для текущего ядра"
   apt-get install "${APT[@]}" --only-upgrade amneziawg amneziawg-dkms amneziawg-tools "linux-headers-$(uname -r)" \
