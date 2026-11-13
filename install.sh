@@ -35,6 +35,7 @@ DBG_FILE="/var/log/awg-install.debug.log"
 BOT_DIR="/opt/awg-bot"
 BOT_ENV="/etc/amnezia/amneziawg/bot.env"
 WARP_DIR="/etc/amnezia/warp"
+RAW_BASE_URL="https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main"
 TMP_DIR=""
 IS_TTY=0
 
@@ -470,21 +471,31 @@ EOF
     step "ufw: открыт порт ${AWG_PORT}/udp"
   fi
 
-  # Установка симлинка awg-manager
-  install -m 755 "$0" /usr/local/bin/awg-manager 2>/dev/null || true
+  # 1. Установка утилиты управления /usr/local/bin/awg-manager
+  step "Установка утилиты управления awg-manager в /usr/local/bin/"
+  if [ -f "$0" ] && [ "$(basename "$0")" != "bash" ] && [ "$(basename "$0")" != "sh" ]; then
+    install -m 755 "$0" /usr/local/bin/awg-manager
+  else
+    curl -fsSL "${RAW_BASE_URL}/install.sh" -o /usr/local/bin/awg-manager
+    chmod 755 /usr/local/bin/awg-manager
+  fi
 
-  # Установка скрипта бота в /opt/awg-bot
+  # 2. Установка скрипта бота в /opt/awg-bot/bot.py
   mkdir -p "$BOT_DIR"
   local bot_src="$(dirname "$0")/bot.py"
   if [ -f "$bot_src" ]; then
     cp "$bot_src" "$BOT_DIR/bot.py"
-    chmod 755 "$BOT_DIR/bot.py"
+  else
+    curl -fsSL "${RAW_BASE_URL}/bot.py" -o "$BOT_DIR/bot.py" 2>/dev/null || true
   fi
+  chmod 755 "$BOT_DIR/bot.py" 2>/dev/null || true
 
-  # Копирование базы обхода РФ, если есть
+  # 3. Копирование базы обхода РФ и локальных сетей
   local ru_src="$(dirname "$0")/amnezia-russia-bypass.json"
   if [ -f "$ru_src" ]; then
     cp "$ru_src" "$AWG_DIR/amnezia-russia-bypass.json"
+  elif [ ! -f "$AWG_DIR/amnezia-russia-bypass.json" ]; then
+    curl -fsSL "${RAW_BASE_URL}/amnezia-russia-bypass.json" -o "$AWG_DIR/amnezia-russia-bypass.json" 2>/dev/null || true
   fi
 
   ( umask 077
@@ -1059,7 +1070,7 @@ EOF
   if [ -f "$bot_src" ]; then
     cp "$bot_src" "$BOT_DIR/bot.py"
   elif [ ! -f "$BOT_DIR/bot.py" ]; then
-    die "файл bot.py не найден"
+    curl -fsSL "${RAW_BASE_URL}/bot.py" -o "$BOT_DIR/bot.py" || die "файл bot.py не найден и не удалось скачать"
   fi
   chmod 755 "$BOT_DIR/bot.py"
 
