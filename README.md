@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main/in
 
 1. предпроверка (root, bash, Ubuntu 24.04, архитектура, systemd, не контейнер, Secure Boot, место на диске, сеть до GitHub и PPA, защита от параллельного запуска);
 2. зависимости + заголовки ядра + `fail2ban`/`nftables` (для IP Limit в 3x-ui); скрипт ждёт освобождения dpkg-лока, если его держит `unattended-upgrades` (до 5 минут);
-3. `ppa:amnezia/ppa` → `amneziawg` (DKMS-модуль + tools), `modprobe amneziawg`, проверка `/sys/module/amneziawg`;
+3. `ppa:amnezia/ppa` → `amneziawg` (DKMS-модуль + tools), `modprobe amneziawg`, проверка `/sys/module/amneziawg`; если модуль не принимает профиль 3.1 (старые пакеты, например из focal-PPA), установщик сам обновляет их из noble-PPA (`--allow-downgrades`, чистит чужие PPA-записи) и перезагружает модуль;
 4. проверка нативного `wireguard` в ядре + `wireguard-tools`;
 5. генерация ключей и полного профиля **AmneziaWG 3.1** (`Jc/Jmin/Jmax`, `S1–S4`, `H1–H4`, маскирующий CPS-пакет `I1` в форме DNS-ответа, `HeaderProtectionKey` — шифрование заголовков, `ContentPaddingAddition`), конфиг `awg0`, NAT, `ip_forward`, запуск `awg-quick@awg0`, клиентский конфиг + QR; после запуска проверяются факты: адрес `10.8.1.1` на интерфейсе, UDP-порт слушается, `ip_forward=1`, NAT-правило на месте;
 6. 3x-ui в неинтерактивном режиме (`XUI_NONINTERACTIVE=1`, случайные порт/логин/пароль/webBasePath, SQLite, без SSL); fail2ban уже установлен, поэтому настройка IP Limit не обращается к apt;

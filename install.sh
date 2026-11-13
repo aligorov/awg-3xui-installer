@@ -175,6 +175,29 @@ probe_awg31() { # модуль ядра принимает профиль 3.1? �
   return "$rc"
 }
 
+upgrade_awg_packages() { # старые пакеты (focal-PPA/1.x): ставим noble-версии и перезагружаем модуль
+  local f
+  # PPA мог остаться от чужого релиза (focal на noble): его Debian-revision бывает
+  # ВЫШЕ noble, и apt выберет старый пакет. Убираем записи amnezia и добавляем заново.
+  for f in /etc/apt/sources.list.d/*amnezia*; do
+    if [ -e "$f" ]; then rm -f "$f"; fi
+  done
+  wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
+  add-apt-repository -y ppa:amnezia/ppa
+  apt-get update || { sleep 5; apt-get update; }
+  # без --only-upgrade: у focal-сборки revision может быть выше noble (1~ против 0~) —
+  # формально это downgrade, разрешаем; код noble новее и поддерживает профиль 3.1
+  apt-get install "${APT[@]}" --allow-downgrades amneziawg amneziawg-dkms amneziawg-tools \
+    || die "не удалось поставить пакеты amneziawg из PPA"
+  # старый модуль мог остаться в памяти — выгружаем и грузим обновлённый
+  systemctl stop 'awg-quick@*' >/dev/null 2>&1 || true
+  if lsmod | grep -q '^amneziawg '; then
+    rmmod amneziawg || die "старый модуль amneziawg занят — перезагрузите сервер и запустите установщик снова"
+  fi
+  modprobe amneziawg || die "обновлённый модуль amneziawg не загрузился — проверьте dkms status и лог сборки DKMS"
+  awg --version
+}
+
 free_port() { # $1 = udp|tcp; печатает свободный порт, 60 попыток
   local proto="$1" flag p
   case "$proto" in
@@ -303,7 +326,12 @@ do_install() {
   dkms status | grep amneziawg || true
 
   step "Проверка поддержки профиля 3.1 модулем ядра (HeaderProtectionKey)"
-  probe_awg31 || die "модуль amneziawg не принимает профиль 3.1. Обновите пакеты: apt-get update && apt-get install --only-upgrade amneziawg-dkms amneziawg-tools — и запустите установщик снова"
+  if ! probe_awg31; then
+    warn "профиль 3.1 не принят — вероятно, старые пакеты (focal-PPA/1.x). Обновляю из PPA"
+    upgrade_awg_packages
+    probe_awg31 || die "модуль amneziawg не принимает профиль 3.1 даже после обновления. Проверьте: awg --version; dkms status. Вручную: add-apt-repository -y ppa:amnezia/ppa && apt-get update && apt-get install --allow-downgrades amneziawg amneziawg-dkms amneziawg-tools"
+    step "пакеты обновлены — профиль 3.1 поддерживается"
+  fi
 
   #--- WireGuard (модуль в ядре Ubuntu) -----------------------------------------
   step "WireGuard: проверка нативной поддержки ядром"
