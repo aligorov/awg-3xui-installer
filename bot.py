@@ -46,22 +46,49 @@ def load_env():
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip().strip("'\"")
-    for k in ("BOT_TOKEN", "ADMIN_ID"):
+    for k in ("BOT_TOKEN", "ADMIN_ID", "GROUP_ID", "TOPIC_ID"):
         if k in os.environ:
             env[k] = os.environ[k]
     return env
 
 ENV = load_env()
 BOT_TOKEN = ENV.get("BOT_TOKEN", "")
-ADMIN_ID = str(ENV.get("ADMIN_ID", "")).strip()
+ADMIN_IDS = [x.strip() for x in str(ENV.get("ADMIN_ID", "")).split(",") if x.strip()]
+ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else ""
+GROUP_ID = str(ENV.get("GROUP_ID", "")).strip()
+TOPIC_ID = str(ENV.get("TOPIC_ID", "")).strip()
 
-if not BOT_TOKEN or not ADMIN_ID:
+if not BOT_TOKEN or not ADMIN_IDS:
     print(f"ОШИБКА: Задайте BOT_TOKEN и ADMIN_ID в {ENV_FILE} или переменных окружения", file=sys.stderr)
 
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Хранилище временного состояния пользователей {chat_id: state}
+# Хранилище временного состояния пользователей {"{chat_id}_{user_id}": state}
 USER_STATE = {}
+
+def is_admin(user_id):
+    if not ADMIN_IDS:
+        return True
+    return str(user_id) in ADMIN_IDS
+
+def check_access(chat_id, user_id, thread_id=None):
+    chat_id = str(chat_id)
+    user_id = str(user_id)
+    th_id = str(thread_id or "")
+
+    # Проверка прав: пользователь должен быть в списке администраторов
+    if not is_admin(user_id):
+        return False, "⛔ Доступ запрещён. Управлять VPN могут только назначенные администраторы."
+
+    # Если задан GROUP_ID, доступ разрешён в этой группе или в ЛС с админом
+    if GROUP_ID:
+        if chat_id != user_id and chat_id != GROUP_ID:
+            return False, "⛔ Бот настроен на работу только в назначенной группе/топике."
+        # Если задан TOPIC_ID и сообщение из группы — проверяем топик
+        if chat_id == GROUP_ID and TOPIC_ID and th_id and th_id != TOPIC_ID:
+            return False, f"⛔ Команды VPN принимаются только в топике #{TOPIC_ID}."
+
+    return True, ""
 
 def api_call(method, payload=None, files=None):
     url = f"{BASE_URL}/{method}"
@@ -95,32 +122,50 @@ def api_call(method, payload=None, files=None):
         print(f"API Request Exception: {e}", file=sys.stderr)
         return {"ok": False, "description": str(e)}
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, message_thread_id=None):
     payload = {
-        "chat_id": chat_id,
+        "chat_id": str(chat_id),
         "text": text,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    th = message_thread_id or (TOPIC_ID if str(chat_id).startswith("-") else None)
+    if th and str(chat_id).startswith("-"):
+        try:
+            payload["message_thread_id"] = int(th)
+        except Exception:
+            pass
     return api_call("sendMessage", payload)
 
-def send_photo(chat_id, photo_bytes, caption=None, reply_markup=None):
+def send_photo(chat_id, photo_bytes, caption=None, reply_markup=None, message_thread_id=None):
     payload = {"chat_id": str(chat_id), "parse_mode": "Markdown"}
     if caption:
         payload["caption"] = caption
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    th = message_thread_id or (TOPIC_ID if str(chat_id).startswith("-") else None)
+    if th and str(chat_id).startswith("-"):
+        try:
+            payload["message_thread_id"] = int(th)
+        except Exception:
+            pass
     files = {"photo": ("qr.png", photo_bytes, "image/png")}
     return api_call("sendPhoto", payload, files=files)
 
-def send_document(chat_id, doc_bytes, filename, caption=None, reply_markup=None):
+def send_document(chat_id, doc_bytes, filename, caption=None, reply_markup=None, message_thread_id=None):
     payload = {"chat_id": str(chat_id), "parse_mode": "Markdown"}
     if caption:
         payload["caption"] = caption
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    th = message_thread_id or (TOPIC_ID if str(chat_id).startswith("-") else None)
+    if th and str(chat_id).startswith("-"):
+        try:
+            payload["message_thread_id"] = int(th)
+        except Exception:
+            pass
     files = {"document": (filename, doc_bytes, "application/octet-stream")}
     return api_call("sendDocument", payload, files=files)
 
@@ -266,8 +311,9 @@ def run_manager_cmd(action, arg=""):
     except Exception as e:
         return False, str(e)
 
-def handle_start(chat_id):
-    USER_STATE.pop(chat_id, None)
+def handle_start(chat_id, from_id=None, thread_id=None):
+    if from_id:
+        USER_STATE.pop(f"{chat_id}_{from_id}", None)
     text = (
         "🛡 *AmneziaWG 3.1 — Управление туннелем*\n\n"
         "Нативный модуль ядра (DKMS) с полным профилем обфускации 3.1.\n"
@@ -281,14 +327,14 @@ def handle_start(chat_id):
             [{"text": "🇷🇺 Обход РФ и локальных сетей (LAN)", "callback_data": "menu_ru_bypass"}]
         ]
     }
-    send_message(chat_id, text, markup)
+    send_message(chat_id, text, markup, message_thread_id=thread_id)
 
-def handle_list_clients(chat_id):
+def handle_list_clients(chat_id, thread_id=None):
     clients = parse_awg_clients()
     if not clients:
         text = "👥 *Клиентов нет.*\nНажмите кнопку ниже, чтобы создать первого клиента:"
         markup = {"inline_keyboard": [[{"text": "➕ Добавить клиента", "callback_data": "menu_add"}]]}
-        send_message(chat_id, text, markup)
+        send_message(chat_id, text, markup, message_thread_id=thread_id)
         return
 
     text = f"👥 *Клиенты AmneziaWG ({len(clients)}):*\n\n"
@@ -310,7 +356,7 @@ def handle_list_clients(chat_id):
     keyboard.append([{"text": "➕ Добавить нового", "callback_data": "menu_add"}, {"text": "🔄 Обновить", "callback_data": "menu_list"}])
     keyboard.append([{"text": "« Главное меню", "callback_data": "menu_main"}])
 
-    send_message(chat_id, text, {"inline_keyboard": keyboard})
+    send_message(chat_id, text, {"inline_keyboard": keyboard}, message_thread_id=thread_id)
 
 def ensure_lan_bypass_config(name):
     """Генерирует {name}-lan-bypass.conf и {name}-lan-bypass.png, если их ещё нет."""
@@ -352,12 +398,12 @@ def ensure_lan_bypass_config(name):
 
     return True
 
-def handle_qr(chat_id, name):
+def handle_qr(chat_id, name, thread_id=None):
     conf_path = f"{AWG_DIR}/{name}.conf"
     png_path = f"{AWG_DIR}/{name}.png"
 
     if not os.path.exists(conf_path):
-        send_message(chat_id, f"❌ Конфиг клиента `{name}` не найден.")
+        send_message(chat_id, f"❌ Конфиг клиента `{name}` не найден.", message_thread_id=thread_id)
         return
 
     # Если PNG отсутствует, сгенерируем на лету
@@ -387,14 +433,15 @@ def handle_qr(chat_id, name):
 
     if os.path.exists(png_path):
         with open(png_path, "rb") as f:
-            send_photo(chat_id, f.read(), caption=caption, reply_markup=markup)
+            send_photo(chat_id, f.read(), caption=caption, reply_markup=markup, message_thread_id=thread_id)
     
     with open(conf_path, "rb") as f:
         send_document(
             chat_id,
             f.read(),
             filename=f"{name}.conf",
-            caption=f"📄 *{name}.conf* — Полный туннель (`AllowedIPs = 0.0.0.0/0`)"
+            caption=f"📄 *{name}.conf* — Полный туннель (`AllowedIPs = 0.0.0.0/0`)",
+            message_thread_id=thread_id
         )
 
     if os.path.exists(lan_conf_path):
@@ -406,16 +453,17 @@ def handle_qr(chat_id, name):
                 caption=(
                     f"🏠 *{name}-lan-bypass.conf* — Конфиг с обходом локальных сетей!\n"
                     f"Домашний роутер (`192.168.x.x`), сетевые принтеры и NAS работают напрямую мимо VPN."
-                )
+                ),
+                message_thread_id=thread_id
             )
 
-def handle_qr_lan(chat_id, name):
+def handle_qr_lan(chat_id, name, thread_id=None):
     ensure_lan_bypass_config(name)
     lan_conf_path = f"{AWG_DIR}/{name}-lan-bypass.conf"
     lan_png_path = f"{AWG_DIR}/{name}-lan-bypass.png"
 
     if not os.path.exists(lan_conf_path):
-        send_message(chat_id, f"❌ Конфиг `{name}-lan-bypass.conf` не найден.")
+        send_message(chat_id, f"❌ Конфиг `{name}-lan-bypass.conf` не найден.", message_thread_id=thread_id)
         return
 
     caption = (
@@ -435,10 +483,10 @@ def handle_qr_lan(chat_id, name):
 
     if os.path.exists(lan_png_path):
         with open(lan_png_path, "rb") as f:
-            send_photo(chat_id, f.read(), caption=caption, reply_markup=markup)
+            send_photo(chat_id, f.read(), caption=caption, reply_markup=markup, message_thread_id=thread_id)
 
-def handle_add_prompt(chat_id):
-    USER_STATE[chat_id] = "waiting_client_name"
+def handle_add_prompt(chat_id, from_id, thread_id=None):
+    USER_STATE[f"{chat_id}_{from_id}"] = "waiting_client_name"
     text = (
         "➕ *Добавление нового клиента*\n\n"
         "Отправьте имя клиента сообщением в чат.\n"
@@ -446,25 +494,25 @@ def handle_add_prompt(chat_id):
         "Или нажмите кнопку для отмены:"
     )
     markup = {"inline_keyboard": [[{"text": "« Отмена", "callback_data": "menu_main"}]]}
-    send_message(chat_id, text, markup)
+    send_message(chat_id, text, markup, message_thread_id=thread_id)
 
-def handle_create_client(chat_id, name):
-    USER_STATE.pop(chat_id, None)
+def handle_create_client(chat_id, from_id, name, thread_id=None):
+    USER_STATE.pop(f"{chat_id}_{from_id}", None)
     name = name.strip()
     import re
     if not re.match(r"^[A-Za-z0-9_-]{1,32}$", name):
-        send_message(chat_id, "❌ Некорректное имя! Допустимы буквы A-Z, цифры, `_` и `-` (длина 1-32). Попробуйте снова.")
+        send_message(chat_id, "❌ Некорректное имя! Допустимы буквы A-Z, цифры, `_` и `-` (длина 1-32). Попробуйте снова.", message_thread_id=thread_id)
         return
 
-    send_message(chat_id, f"⏳ Создаю клиента `{name}`...")
+    send_message(chat_id, f"⏳ Создаю клиента `{name}`...", message_thread_id=thread_id)
     ok, out = run_manager_cmd("add-client", name)
     if ok:
-        send_message(chat_id, f"✅ Клиент `{name}` успешно добавлен!")
-        handle_qr(chat_id, name)
+        send_message(chat_id, f"✅ Клиент `{name}` успешно добавлен!", message_thread_id=thread_id)
+        handle_qr(chat_id, name, thread_id=thread_id)
     else:
-        send_message(chat_id, f"❌ Ошибка добавления клиента `{name}`:\n```\n{out[-400:]}\n```")
+        send_message(chat_id, f"❌ Ошибка добавления клиента `{name}`:\n```\n{out[-400:]}\n```", message_thread_id=thread_id)
 
-def handle_delete_confirm(chat_id, name):
+def handle_delete_confirm(chat_id, name, thread_id=None):
     text = f"⚠️ *Вы действительно хотите удалить клиента `{name}`?*\nПосле удаления доступ через этот ключ будет немедленно отозван."
     markup = {
         "inline_keyboard": [
@@ -472,21 +520,23 @@ def handle_delete_confirm(chat_id, name):
             [{"text": "« Отмена", "callback_data": "menu_list"}]
         ]
     }
-    send_message(chat_id, text, markup)
+    send_message(chat_id, text, markup, message_thread_id=thread_id)
 
-def handle_delete_exec(chat_id, name):
-    send_message(chat_id, f"⏳ Удаляю клиента `{name}`...")
+def handle_delete_exec(chat_id, name, thread_id=None):
+    send_message(chat_id, f"⏳ Удаляю клиента `{name}`...", message_thread_id=thread_id)
     ok, out = run_manager_cmd("remove-client", name)
     if ok:
-        send_message(chat_id, f"✅ Клиент `{name}` удалён.")
-        handle_list_clients(chat_id)
+        send_message(chat_id, f"✅ Клиент `{name}` удалён.", message_thread_id=thread_id)
+        handle_list_clients(chat_id, thread_id=thread_id)
     else:
-        send_message(chat_id, f"❌ Ошибка удаления `{name}`:\n```\n{out[-400:]}\n```")
+        send_message(chat_id, f"❌ Ошибка удаления `{name}`:\n```\n{out[-400:]}\n```", message_thread_id=thread_id)
 
-def handle_gemini_info(chat_id):
+def handle_gemini_info(chat_id, thread_id=None):
     active = False
     try:
-        active = subprocess.run(["systemctl", "is-active", "awg-gemini-warp"], capture_output=True, text=True).stdout.strip() == "active"
+        active = subprocess.run(["systemctl", "is-active", "awg-ai-warp"], capture_output=True, text=True).stdout.strip() == "active"
+        if not active:
+            active = subprocess.run(["systemctl", "is-active", "awg-gemini-warp"], capture_output=True, text=True).stdout.strip() == "active"
     except Exception:
         pass
 
@@ -495,7 +545,7 @@ def handle_gemini_info(chat_id):
         f"🌐 *Обход блокировок AI (Gemini + ChatGPT + Claude)*\n\n"
         f"• Текущий статус: {status_str}\n\n"
         f"При включении запросы к сервисам:\n"
-        f"• *Google Gemini & AI Studio* (`geosite:google-deepmind`)\n"
+        f"• *Google Gemini & AI Studio* (`geosite:google-deepmind`, NotebookLM)\n"
         f"• *OpenAI & ChatGPT* (`geosite:openai`, Sora, DALL-E)\n"
         f"• *Anthropic Claude*\n\n"
         f"автоматически маршрутизируются через Cloudflare WARP с чистым резидентским Anycast IP. "
@@ -509,10 +559,10 @@ def handle_gemini_info(chat_id):
         kb.append([{"text": "🟢 Включить обход AI (WARP)", "callback_data": "gemini_enable"}])
 
     kb.append([{"text": "« Главное меню", "callback_data": "menu_main"}])
-    send_message(chat_id, text, {"inline_keyboard": kb})
+    send_message(chat_id, text, {"inline_keyboard": kb}, message_thread_id=thread_id)
 
-def handle_ru_bypass(chat_id):
-    send_message(chat_id, "⏳ Подготавливаю файл обхода российских сайтов (GeoIP RU)...")
+def handle_ru_bypass(chat_id, thread_id=None):
+    send_message(chat_id, "⏳ Подготавливаю файл обхода российских сайтов (GeoIP RU)...", message_thread_id=thread_id)
     content = None
     if os.path.exists(RU_BYPASS_FILE):
         try:
@@ -532,7 +582,7 @@ def handle_ru_bypass(chat_id):
                 except Exception:
                     pass
         except Exception as e:
-            send_message(chat_id, f"❌ Не удалось загрузить базу обхода РФ: {e}")
+            send_message(chat_id, f"❌ Не удалось загрузить базу обхода РФ: {e}", message_thread_id=thread_id)
             return
 
     caption = (
@@ -547,10 +597,11 @@ def handle_ru_bypass(chat_id):
         "4. Нажмите *Импорт* и выберите скачанный файл.\n\n"
         "✅ Готово! Все российские сайты, банки и локальные устройства пойдут напрямую, а блокировки и AI — через AmneziaWG."
     )
-    send_document(chat_id, content, filename="amnezia.json", caption=caption)
+    send_document(chat_id, content, filename="amnezia.json", caption=caption, message_thread_id=thread_id)
 
 def main_loop():
-    print(f"AmneziaWG Telegram Bot запущен. ADMIN_ID: {ADMIN_ID}")
+    admin_str = ", ".join(ADMIN_IDS) if ADMIN_IDS else "Все"
+    print(f"AmneziaWG Telegram Bot запущен. ADMIN_IDS: {admin_str}, GROUP_ID: {GROUP_ID or 'Все'}, TOPIC_ID: {TOPIC_ID or 'Все'}")
     offset = 0
     while True:
         try:
@@ -567,81 +618,117 @@ def main_loop():
                     msg = u["message"]
                     chat_id = str(msg.get("chat", {}).get("id", ""))
                     from_id = str(msg.get("from", {}).get("id", ""))
+                    thread_id = msg.get("message_thread_id")
                     text = msg.get("text", "").strip()
 
-                    # Проверка прав доступа: строго один администратор
-                    if from_id != ADMIN_ID:
-                        send_message(chat_id, "⛔ Доступ запрещён. Этот бот управляет персональным VPN-сервером.")
+                    # Сервисная команда /id, /topic, /chatid - работает везде для помощи в настройке
+                    if text.lower().startswith(("/id", "/topic", "/chatid", "/thread")):
+                        title = msg.get("chat", {}).get("title", "Личные сообщения")
+                        chat_type = msg.get("chat", {}).get("type", "private")
+                        t_id_str = str(thread_id) if thread_id else "Нет (General / ЛС)"
+                        send_message(
+                            chat_id,
+                            f"ℹ️ *Информация о чате и топике:*\n\n"
+                            f"• *Чат:* `{title}`\n"
+                            f"• *Тип чата:* `{chat_type}`\n"
+                            f"• *GROUP_ID (chat_id):* `{chat_id}`\n"
+                            f"• *TOPIC_ID (thread_id):* `{t_id_str}`\n"
+                            f"• *Ваш User ID:* `{from_id}`\n\n"
+                            f"Для привязки бота к этой группе/топику добавьте в `/etc/amnezia/amneziawg/bot.env`:\n"
+                            f"```env\nGROUP_ID=\"{chat_id}\"\nTOPIC_ID=\"{thread_id or ''}\"\n```",
+                            message_thread_id=thread_id
+                        )
                         continue
 
-                    state = USER_STATE.get(chat_id)
+                    # Проверка прав доступа к боту
+                    ok, err = check_access(chat_id, from_id, thread_id)
+                    if not ok:
+                        if chat_id == from_id or text.startswith("/"):
+                            send_message(chat_id, err, message_thread_id=thread_id)
+                        continue
+
+                    user_key = f"{chat_id}_{from_id}"
+                    state = USER_STATE.get(user_key)
                     if state == "waiting_client_name" and text and not text.startswith("/"):
-                        handle_create_client(chat_id, text)
+                        handle_create_client(chat_id, from_id, text, thread_id=thread_id)
                         continue
 
-                    if text in ("/start", "/menu"):
-                        handle_start(chat_id)
-                    elif text in ("/clients", "/list"):
-                        handle_list_clients(chat_id)
-                    elif text in ("/status",):
-                        send_message(chat_id, get_server_stats())
-                    elif text in ("/add",):
-                        handle_add_prompt(chat_id)
+                    cmd = text.split("@")[0].lower() if "@" in text else text.lower()
+                    if cmd in ("/start", "/menu"):
+                        handle_start(chat_id, from_id=from_id, thread_id=thread_id)
+                    elif cmd in ("/clients", "/list"):
+                        handle_list_clients(chat_id, thread_id=thread_id)
+                    elif cmd in ("/status",):
+                        send_message(chat_id, get_server_stats(), message_thread_id=thread_id)
+                    elif cmd in ("/add",):
+                        handle_add_prompt(chat_id, from_id=from_id, thread_id=thread_id)
+                    elif cmd in ("/gemini", "/ai", "/openai", "/gpt"):
+                        handle_gemini_info(chat_id, thread_id=thread_id)
+                    elif cmd in ("/ru", "/bypass"):
+                        handle_ru_bypass(chat_id, thread_id=thread_id)
                     else:
-                        handle_start(chat_id)
+                        if chat_id == from_id or text.startswith("/"):
+                            handle_start(chat_id, from_id=from_id, thread_id=thread_id)
 
                 # Обработка инлайн-кнопок
                 elif "callback_query" in u:
                     cb = u["callback_query"]
                     cb_id = cb["id"]
                     from_id = str(cb.get("from", {}).get("id", ""))
-                    chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                    msg = cb.get("message", {})
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    thread_id = msg.get("message_thread_id")
                     data = cb.get("data", "")
 
-                    if from_id != ADMIN_ID:
-                        answer_callback(cb_id, "⛔ Доступ запрещён", alert=True)
+                    ok, err = check_access(chat_id, from_id, thread_id)
+                    if not ok:
+                        answer_callback(cb_id, err or "⛔ Доступ запрещён", alert=True)
                         continue
 
                     answer_callback(cb_id)
 
                     if data == "menu_main":
-                        handle_start(chat_id)
+                        handle_start(chat_id, from_id=from_id, thread_id=thread_id)
                     elif data == "menu_list":
-                        handle_list_clients(chat_id)
+                        handle_list_clients(chat_id, thread_id=thread_id)
                     elif data == "menu_add":
-                        handle_add_prompt(chat_id)
+                        handle_add_prompt(chat_id, from_id=from_id, thread_id=thread_id)
                     elif data == "menu_status":
-                        send_message(chat_id, get_server_stats())
+                        send_message(chat_id, get_server_stats(), message_thread_id=thread_id)
                     elif data == "menu_gemini":
-                        handle_gemini_info(chat_id)
+                        handle_gemini_info(chat_id, thread_id=thread_id)
                     elif data == "menu_ru_bypass":
-                        handle_ru_bypass(chat_id)
+                        handle_ru_bypass(chat_id, thread_id=thread_id)
                     elif data.startswith("qr_lan_"):
                         name = data[7:]
-                        handle_qr_lan(chat_id, name)
+                        handle_qr_lan(chat_id, name, thread_id=thread_id)
                     elif data.startswith("qr_"):
                         name = data[3:]
-                        handle_qr(chat_id, name)
+                        handle_qr(chat_id, name, thread_id=thread_id)
                     elif data.startswith("del_"):
                         name = data[4:]
-                        handle_delete_confirm(chat_id, name)
+                        handle_delete_confirm(chat_id, name, thread_id=thread_id)
                     elif data.startswith("confirm_del_"):
                         name = data[12:]
-                        handle_delete_exec(chat_id, name)
+                        handle_delete_exec(chat_id, name, thread_id=thread_id)
                     elif data == "gemini_enable":
-                        send_message(chat_id, "⏳ Настраиваю обход Gemini через Cloudflare WARP...")
+                        send_message(chat_id, "⏳ Настраиваю обход AI (Gemini + ChatGPT) через Cloudflare WARP...", message_thread_id=thread_id)
                         ok, out = run_manager_cmd("warp-enable")
-                        send_message(chat_id, "✅ Обход Gemini включён!" if ok else f"❌ Ошибка:\n{out[-300:]}")
-                        handle_gemini_info(chat_id)
+                        send_message(chat_id, "✅ Обход AI (Gemini + ChatGPT) включён!" if ok else f"❌ Ошибка:\n{out[-300:]}", message_thread_id=thread_id)
+                        handle_gemini_info(chat_id, thread_id=thread_id)
                     elif data == "gemini_disable":
-                        send_message(chat_id, "⏳ Отключаю обход Gemini...")
+                        send_message(chat_id, "⏳ Отключаю обход AI...", message_thread_id=thread_id)
                         ok, out = run_manager_cmd("warp-disable")
-                        send_message(chat_id, "⚪ Обход Gemini выключен." if ok else f"❌ Ошибка:\n{out[-300:]}")
-                        handle_gemini_info(chat_id)
+                        send_message(chat_id, "⚪ Обход AI выключен." if ok else f"❌ Ошибка:\n{out[-300:]}", message_thread_id=thread_id)
+                        handle_gemini_info(chat_id, thread_id=thread_id)
                     elif data == "gemini_test":
-                        send_message(chat_id, "⏳ Тестирую доступ к Google Gemini API через туннель...")
+                        send_message(chat_id, "⏳ Тестирую доступ к Google Gemini и OpenAI через туннель...", message_thread_id=thread_id)
                         ok, out = run_manager_cmd("warp-test")
-                        send_message(chat_id, out)
+                        send_message(chat_id, out, message_thread_id=thread_id)
+
+        except Exception as e:
+            print(f"Ошибка в цикле polling: {e}", file=sys.stderr)
+            time.sleep(3)
 
         except Exception as e:
             print(f"Ошибка в цикле polling: {e}", file=sys.stderr)

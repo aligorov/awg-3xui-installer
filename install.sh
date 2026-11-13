@@ -508,7 +508,7 @@ EOF
   printf '  Клиентский файл: %s/client1.conf (весь трафик 0.0.0.0/0)\n' "$AWG_DIR"
   printf '  С обходом LAN:   %s/client1-lan-bypass.conf (локальные сети мимо VPN)\n' "$AWG_DIR"
   printf '  QR-код (PNG):    %s/client1.png\n' "$AWG_DIR"
-  printf '------------------------------------------------------------\n'
+  printf '%s\n' '------------------------------------------------------------'
   printf '  УПРАВЛЕНИЕ СЕРВЕРОМ:\n'
   printf '  • Консольное меню:   sudo awg-manager\n'
   printf '  • Telegram-бот:      sudo awg-manager bot\n'
@@ -887,7 +887,9 @@ nftset=/generativelanguage.googleapis.com/4#inet#awg_ai#ai_v4
 nftset=/ai.google.dev/4#inet#awg_ai#ai_v4
 nftset=/deepmind.com/4#inet#awg_ai#ai_v4
 nftset=/deepmind.google/4#inet#awg_ai#ai_v4
+nftset=/notebooklm.google/4#inet#awg_ai#ai_v4
 nftset=/notebooklm.google.com/4#inet#awg_ai#ai_v4
+nftset=/makersuite.google.com/4#inet#awg_ai#ai_v4
 nftset=/alkalimakersuite-pa.clients6.google.com/4#inet#awg_ai#ai_v4
 nftset=/proactivebackend-pa.googleapis.com/4#inet#awg_ai#ai_v4
 
@@ -899,6 +901,8 @@ nftset=/sora.com/4#inet#awg_ai#ai_v4
 nftset=/oaistatic.com/4#inet#awg_ai#ai_v4
 nftset=/oaiusercontent.com/4#inet#awg_ai#ai_v4
 nftset=/livekit.cloud/4#inet#awg_ai#ai_v4
+nftset=/auth0.openai.com/4#inet#awg_ai#ai_v4
+nftset=/openaiapi-site.azureedge.net/4#inet#awg_ai#ai_v4
 
 # --- Anthropic Claude ---
 nftset=/claude.ai/4#inet#awg_ai#ai_v4
@@ -1007,13 +1011,15 @@ do_ru_bypass() {
 #--- Telegram-бот -------------------------------------------------------------
 do_bot_setup() {
   step "Настройка Telegram-бота для управления клиентами"
-  local token="" admin_id=""
+  local token="" admin_id="" group_id="" topic_id=""
 
   if [ -r "$BOT_ENV" ]; then
     # shellcheck disable=SC1090
     . "$BOT_ENV"
     token="${BOT_TOKEN:-}"
     admin_id="${ADMIN_ID:-}"
+    group_id="${GROUP_ID:-}"
+    topic_id="${TOPIC_ID:-}"
   fi
 
   if [ "$IS_TTY" = 1 ]; then
@@ -1021,9 +1027,18 @@ do_bot_setup() {
     read -r -p "Токен бота [текущий: ${token:-нет}]: " new_token || return 1
     if [ -n "$new_token" ]; then token="$new_token"; fi
 
-    printf '\n2. Узнайте свой Telegram ID через @userinfobot (только цифры).\n'
+    printf '\n2. Узнайте свой Telegram ID через @userinfobot (цифры, можно несколько через запятую).\n'
     read -r -p "Ваш Telegram ID [текущий: ${admin_id:-нет}]: " new_id || return 1
     if [ -n "$new_id" ]; then admin_id="$new_id"; fi
+
+    printf '\n3. (Опционально) ID группы, если бот будет в группе/супергруппе (например, -1001234567890, или Enter пропустить):\n'
+    printf '   Подсказка: отправьте команду /id боту в группе, чтобы узнать ID.\n'
+    read -r -p "GROUP_ID [текущий: ${group_id:-нет}]: " new_gid || true
+    if [ -n "$new_gid" ]; then group_id="$new_gid"; fi
+
+    printf '\n4. (Опционально) ID топика / темы форума (thread_id, например 42, или Enter для General/любого):\n'
+    read -r -p "TOPIC_ID [текущий: ${topic_id:-нет}]: " new_tid || true
+    if [ -n "$new_tid" ]; then topic_id="$new_tid"; fi
   fi
 
   [ -n "$token" ] || die "токен бота не может быть пустым"
@@ -1033,6 +1048,8 @@ do_bot_setup() {
     cat > "$BOT_ENV" <<EOF
 BOT_TOKEN="${token}"
 ADMIN_ID="${admin_id}"
+GROUP_ID="${group_id}"
+TOPIC_ID="${topic_id}"
 EOF
     chmod 600 "$BOT_ENV"
   )
