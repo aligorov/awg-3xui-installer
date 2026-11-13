@@ -28,11 +28,11 @@ curl -fsSL https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main/in
 Последовательность внутри скрипта:
 
 1. предпроверка (root, Ubuntu 24.04, архитектура, systemd, Secure Boot, сеть);
-2. зависимости + заголовки ядра;
+2. зависимости + заголовки ядра + `fail2ban`/`nftables` (для IP Limit в 3x-ui); скрипт ждёт освобождения dpkg-лока, если его держит `unattended-upgrades` (до 5 минут);
 3. `ppa:amnezia/ppa` → `amneziawg` (DKMS-модуль + tools), `modprobe amneziawg`, проверка `/sys/module/amneziawg`;
 4. проверка нативного `wireguard` в ядре + `wireguard-tools`;
 5. генерация ключей и параметров обфускации (`Jc/Jmin/Jmax/S1/S2/H1–H4`), конфиг `awg0`, NAT, `ip_forward`, запуск `awg-quick@awg0`, клиентский конфиг + QR;
-6. 3x-ui в неинтерактивном режиме (`XUI_NONINTERACTIVE=1`, случайные порт/логин/пароль/webBasePath, SQLite, без SSL);
+6. 3x-ui в неинтерактивном режиме (`XUI_NONINTERACTIVE=1`, случайные порт/логин/пароль/webBasePath, SQLite, без SSL); fail2ban уже установлен, поэтому настройка IP Limit не обращается к apt;
 7. правила ufw (только если ufw уже активен), верификация сервисов, итоговый блок с кредами и QR-кодом.
 
 Повторный запуск идемпотентен: существующие конфиги и установленные компоненты не перегенерируются.

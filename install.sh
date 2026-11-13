@@ -51,13 +51,31 @@ rand_hex() { openssl rand -hex "${1:-8}"; }
 rand_u32() { od -An -tu4 -N4 /dev/urandom | tr -d ' \n'; }
 
 free_port() { # $1 = udp|tcp; печатает свободный порт, 60 попыток
-  local proto="$1" p
+  local proto="$1" flag p
+  case "$proto" in
+    udp) flag="-u" ;;
+    tcp) flag="-t" ;;
+    *) return 1 ;;
+  esac
   for _ in $(seq 1 60); do
     p=$((20000 + RANDOM % 40000))
-    if [ -z "$(ss -Hln"${proto}" "sport = :${p}")" ]; then
+    if [ -z "$(ss -Hln "$flag" "sport = :${p}")" ]; then
       printf '%s' "$p"
       return 0
     fi
+  done
+  return 1
+}
+
+wait_for_apt_lock() { # unattended-upgrades может держать dpkg-лок минутами
+  local i
+  for i in $(seq 1 60); do
+    if flock -n /var/lib/dpkg/lock-frontend true 2>/dev/null \
+      && flock -n /var/lib/apt/lists/lock true 2>/dev/null; then
+      return 0
+    fi
+    step "apt/dpkg занят (unattended-upgrades?) — жду, попытка ${i}/60"
+    sleep 5
   done
   return 1
 }
@@ -77,7 +95,7 @@ touch "$LOG_FILE" "$DBG_FILE"
 chmod 600 "$LOG_FILE" "$DBG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 exec 5>>"$DBG_FILE"
-export BASH_XTRACEFD=5
+BASH_XTRACEFD=5   # без export: иначе дочерние bash (dpkg/dkms) ругаются на fd 5
 set -x
 
 step "Предпроверка системы"
@@ -101,8 +119,9 @@ curl -fsSI --max-time 15 -o /dev/null "$XUI_INSTALL_URL" \
 #--- 2. зависимости ------------------------------------------------------------
 step "Установка зависимостей и заголовков ядра $(uname -r)"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-APT=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+APT=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=300)
 
+wait_for_apt_lock || die "apt/dpkg занят более 5 минут (unattended-upgrades?) — повторите позже"
 apt-get update
 apt-get install "${APT[@]}" ca-certificates curl gnupg2 openssl \
   software-properties-common python3-launchpadlib
@@ -111,6 +130,19 @@ apt-get update
 apt-get install "${APT[@]}" \
   dkms build-essential "linux-headers-$(uname -r)" mokutil \
   qrencode wireguard-tools iptables iproute2
+
+# fail2ban + nftables заранее: 3x-ui настраивает IP Limit поверх уже установленного
+# fail2ban и не ходит в apt (иначе может упасть на dpkg-локе unattended-upgrades).
+# pyasynchat — как в апстриме 3x-ui для Ubuntu>=24 (fail2ban 1.0.2 / Python 3.12).
+step "fail2ban + nftables (для IP Limit в 3x-ui)"
+apt-get install "${APT[@]}" fail2ban nftables python3-pip
+if python3 -m pip install --break-system-packages pyasynchat; then
+  systemctl restart fail2ban || true
+else
+  step "ВНИМАНИЕ: pyasynchat не установлен (нет доступа к PyPI?) — IP Limit может не работать"
+fi
+systemctl is-active --quiet fail2ban \
+  || step "ВНИМАНИЕ: fail2ban не активен — IP Limit в 3x-ui может не работать"
 
 if mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; then
   die "Secure Boot включён: неподписанный DKMS-модуль amneziawg не загрузится. Отключите Secure Boot в UEFI и запустите установщик снова."
@@ -121,6 +153,7 @@ step "AmneziaWG: нативный модуль ядра (DKMS) + awg-tools из 
 if dpkg -s amneziawg >/dev/null 2>&1; then
   step "пакет amneziawg уже установлен — пропускаю"
 else
+  wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
   add-apt-repository -y ppa:amnezia/ppa
   apt-get update
   apt-get install "${APT[@]}" amneziawg
@@ -172,7 +205,7 @@ else
   CLI_PRIV="$(awg genkey)"
   CLI_PUB="$(printf '%s\n' "$CLI_PRIV" | awg pubkey)"
 
-  # Параметры обфускации AmneziaWG (совместимы с клиентами AWG 1.x/2.x)
+  # Параметры обфускации AmneziaWG (проверено на tools v3.1: совместимы с AWG 1.x–3.x)
   JC=$((3 + RANDOM % 6))                 # 3..8 junk-пакетов
   JMIN=$((20 + RANDOM % 30))             # 20..49
   JMAX=$((JMIN + 30 + RANDOM % 40))      # JMIN+30..JMIN+69 (< 1280)
@@ -274,6 +307,7 @@ if [ -x /usr/local/x-ui/x-ui ]; then
 else
   TMP_DIR="$(mktemp -d)"
   curl -fsSL "$XUI_INSTALL_URL" -o "$TMP_DIR/install-3xui.sh"
+  wait_for_apt_lock || die "apt/dpkg занят более 5 минут — повторите позже"
   XUI_NONINTERACTIVE=1 \
   XUI_PANEL_PORT="$PANEL_PORT" \
   XUI_USERNAME="$PANEL_USER" \
@@ -333,16 +367,16 @@ printf '============================================================\n'
 printf '  AmneziaWG (модуль ядра): %s\n' "${AWG_VER:-unknown}"
 printf '  DKMS:                    %s\n' "${DKMS_LINE:-unknown}"
 printf '  3x-ui:                   %s\n' "${XUI_VER:-unknown}"
-printf '------------------------------------------------------------\n'
+printf '%s\n' '------------------------------------------------------------'
 printf '  Панель 3x-ui (HTTP, без SSL):\n'
 printf '    URL:    http://%s:%s/%s\n' "$PUBLIC_IP" "$PANEL_PORT" "$PANEL_PATH"
 printf '    Логин:  %s\n' "$PANEL_USER"
 printf '    Пароль: %s\n' "$PANEL_PASS"
-printf '------------------------------------------------------------\n'
+printf '%s\n' '------------------------------------------------------------'
 printf '  AmneziaWG сервер: %s:%s/udp (интерфейс %s)\n' "$PUBLIC_IP" "$AWG_PORT" "$AWG_IFACE"
 printf '  Клиентский конфиг: %s/client1.conf\n' "$AWG_DIR"
 printf '  QR-код (PNG):      %s/client1.png\n' "$AWG_DIR"
-printf '------------------------------------------------------------\n'
+printf '%s\n' '------------------------------------------------------------'
 printf '  Все креды:  %s (chmod 600)\n' "$CRED_FILE"
 printf '  Логи:       %s\n' "$LOG_FILE"
 printf '              %s\n' "$DBG_FILE"
