@@ -880,7 +880,9 @@ with open('$warp_conf', 'w') as f:
   systemctl stop systemd-resolved 2>/dev/null || true
   systemctl disable systemd-resolved 2>/dev/null || true
   rm -f /etc/resolv.conf
-  printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
+  # DNS хоста — через локальный dnsmasq: только так запросы к AI-доменам попадают
+  # в nftset @ai_v4 и маркируются для WARP (иначе warp-test идёт мимо туннеля).
+  printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
 
   cat > /etc/dnsmasq.d/ai-warp.conf <<'EOF'
 # Обход блокировок AI через Cloudflare WARP (nftset)
@@ -945,19 +947,26 @@ Wants=wg-quick@warp0.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Идемпотентность: таблица уже создана inline выше — без удаления повторный
+# `nft add table` падает с "already exists" и валит весь oneshot-юнит.
+ExecStartPre=-/usr/bin/nft delete table inet awg_ai
 ExecStart=/usr/bin/nft add table inet awg_ai
 ExecStart=/usr/bin/nft add set inet awg_ai ai_v4 { type ipv4_addr; flags interval, timeout; timeout 1h; }
 ExecStart=/usr/bin/nft add chain inet awg_ai prerouting { type filter hook prerouting priority mangle; }
 ExecStart=/usr/bin/nft add rule inet awg_ai prerouting ip daddr @ai_v4 meta mark set 0x51
 ExecStart=/bin/sh -c 'ip rule del fwmark 0x51 table 51820 2>/dev/null || true; ip rule add fwmark 0x51 table 51820'
-ExecStart=/usr/sbin/iptables -w -t nat -A POSTROUTING -o warp0 -j MASQUERADE
+ExecStart=/bin/sh -c 'iptables -w -t nat -C POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -o warp0 -j MASQUERADE'
 ExecStop=/bin/sh -c 'ip rule del fwmark 0x51 table 51820 2>/dev/null || true'
+ExecStop=-/usr/bin/nft delete table inet awg_ai
 
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now awg-ai-warp.service
+  if ! systemctl enable --now awg-ai-warp.service; then
+    journalctl -u awg-ai-warp.service -n 25 --no-pager || true
+    die "не удалось запустить awg-ai-warp.service (лог выше)"
+  fi
 
   step "Обход Gemini + ChatGPT через Cloudflare WARP успешно настроен!"
   do_warp_test
