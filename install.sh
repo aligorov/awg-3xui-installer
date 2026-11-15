@@ -1164,6 +1164,212 @@ do_status() {
   do_list_clients
 }
 
+#--- самодиагностика ----------------------------------------------------------
+DIAG_FAILS=0
+DIAG_WARNS=0
+d_ok()   { printf '  %b[OK]%b   %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+d_fail() { printf '  %b[FAIL]%b %s\n' "$C_RED" "$C_RESET" "$*"; DIAG_FAILS=$((DIAG_FAILS + 1)); }
+d_warn() { printf '  %b[WARN]%b %s\n' "$C_YELLOW" "$C_RESET" "$*"; DIAG_WARNS=$((DIAG_WARNS + 1)); }
+d_info() { printf '  %b[..]%b   %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+
+diag_live_capture() { # 15-секундный перехват входящих UDP: доходят ли пакеты вообще
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || { warn "туннель не установлен"; return 1; }
+  if ! command -v tcpdump >/dev/null 2>&1; then
+    warn "tcpdump не установлен: sudo apt-get install -y tcpdump"; return 1
+  fi
+  local port wan; port="$(conf_get ListenPort "$conf")"; wan="$(detect_wan_iface)"
+  step "Перехват входящих UDP на ${wan:-any}:${port} — 15 секунд"
+  printf 'Включите VPN на клиенте СЕЙЧАС. Слушаю эфир...\n'
+  local cap cnt
+  cap="$(mktemp /tmp/awg-diag-XXXXXX.pcap)"
+  timeout 15 tcpdump -ni "${wan:-any}" -w "$cap" "udp port ${port}" >/dev/null 2>&1 || true
+  cnt="$(tcpdump -nr "$cap" 2>/dev/null | wc -l | tr -d ' ')"
+  rm -f "$cap"
+  if [ "${cnt:-0}" -gt 0 ]; then
+    d_ok "За 15с получено ${cnt} пакетов на ${port}/udp — входящий трафик ДОХОДИТ до сервера"
+    printf 'Если handshake при этом не появляется — дело в профиле/ключах или клиентском конфиге, а не в блокировке порта.\n'
+  else
+    d_fail "0 пакетов на ${port}/udp за 15с — трафик блокируется ВЫШЕ сервера (облачный firewall или провайдер/оператор)"
+    printf 'Откройте %s/udp в облачном firewall; если не помогло — смените порт (например 443/udp) или уточните у оператора.\n' "$port"
+  fi
+}
+
+do_diagnose() {
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  DIAG_FAILS=0; DIAG_WARNS=0
+  local block_suspect=0
+
+  printf '\n%b============================================================%b\n' "$C_CYAN" "$C_RESET"
+  printf '  %bAmneziaWG 3.1 — Самодиагностика сервера%b\n' "$C_BOLD" "$C_RESET"
+  printf '%b============================================================%b\n' "$C_CYAN" "$C_RESET"
+
+  if [ ! -f "$conf" ]; then
+    d_fail "Конфиг $conf не найден — AmneziaWG не установлен."
+    printf '\nЗапустите установку: %bsudo awg-manager install%b\n' "$C_BOLD" "$C_RESET"
+    return 0
+  fi
+
+  local port subnet wan
+  port="$(conf_get ListenPort "$conf")"
+  subnet="$(get_subnet_prefix)0/24"
+  wan="$(detect_wan_iface)"
+  d_info "Интерфейс: ${AWG_IFACE}, порт: ${port:-?}/udp, подсеть: ${subnet}, WAN: ${wan:-?}"
+
+  step "1/8 Модуль ядра и профиль обфускации"
+  if lsmod 2>/dev/null | grep -q '^amneziawg '; then
+    d_ok "Модуль amneziawg загружен"
+  else
+    d_fail "Модуль amneziawg не загружен. Проверьте: dkms status; sudo modprobe amneziawg"
+  fi
+  local ver; ver="$(awg --version 2>/dev/null | head -n1 || true)"
+  d_info "awg-tools: ${ver:-версия не определена}"
+  if grep -q '^HeaderProtectionKey' "$conf" && grep -q '^I1' "$conf"; then
+    d_ok "Профиль 3.1 на месте (HeaderProtectionKey + CPS I1)"
+  else
+    d_warn "Нет признаков профиля 3.1 — возможно, старый профиль 1.x (хуже обходит DPI)"
+  fi
+
+  step "2/8 Сервис и интерфейс"
+  if systemctl is-active --quiet "awg-quick@${AWG_IFACE}" 2>/dev/null; then
+    d_ok "Сервис awg-quick@${AWG_IFACE} активен"
+  else
+    d_fail "Сервис не активен. sudo systemctl restart awg-quick@${AWG_IFACE}; journalctl -u awg-quick@${AWG_IFACE} -n 30 --no-pager"
+  fi
+  if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
+    local addr; addr="$(ip -4 -o addr show "$AWG_IFACE" 2>/dev/null | awk '{print $4}' | head -n1)"
+    if [ -n "$addr" ]; then d_ok "Интерфейс ${AWG_IFACE} поднят, адрес ${addr}"; else d_fail "Интерфейс ${AWG_IFACE} без IPv4-адреса"; fi
+  else
+    d_fail "Интерфейс ${AWG_IFACE} отсутствует"
+  fi
+
+  step "3/8 UDP-порт"
+  if [ -n "$port" ] && [ -n "$(ss -Hlnu "sport = :${port}" 2>/dev/null)" ]; then
+    d_ok "Порт ${port}/udp слушается"
+  else
+    d_fail "Никто не слушает ${port:-?}/udp — сокет не поднят или порт занят другим процессом"
+  fi
+
+  step "4/8 Форвардинг и NAT"
+  local fwd; fwd="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+  if [ "$fwd" = "1" ]; then d_ok "net.ipv4.ip_forward = 1"; else d_fail "ip_forward=${fwd:-?}, нужно 1: sudo sysctl -w net.ipv4.ip_forward=1"; fi
+  if [ -n "$wan" ]; then
+    if iptables -w -t nat -C POSTROUTING -s "$subnet" -o "$wan" -j MASQUERADE 2>/dev/null; then
+      d_ok "NAT MASQUERADE ${subnet} -> ${wan}"
+    else
+      d_fail "Нет MASQUERADE ${subnet} -> ${wan}. Перезапустите туннель (правило ставит PostUp)"
+    fi
+    if iptables -w -C FORWARD -i "$AWG_IFACE" -o "$wan" -j ACCEPT 2>/dev/null; then
+      d_ok "FORWARD ${AWG_IFACE} -> ${wan} разрешён"
+    else
+      d_warn "Нет FORWARD ${AWG_IFACE} -> ${wan} — трафик клиентов может не проходить"
+    fi
+  else
+    d_warn "WAN-интерфейс не определён (нет default route?)"
+  fi
+
+  step "5/8 Межсетевой экран"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    if ufw status 2>/dev/null | grep -Eq "${port}/udp[[:space:]]+ALLOW"; then
+      d_ok "ufw: ${port}/udp разрешён"
+    else
+      d_fail "ufw активен, ${port}/udp закрыт: sudo ufw allow ${port}/udp"
+    fi
+  else
+    d_info "ufw не активен"
+  fi
+  local inpol; inpol="$(iptables -w -S INPUT 2>/dev/null | awk '/^-P INPUT/{print $3}')"
+  if [ "$inpol" = "DROP" ] || [ "$inpol" = "REJECT" ]; then
+    if iptables -w -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; then
+      d_ok "INPUT policy ${inpol}, ${port}/udp явно разрешён"
+    else
+      d_warn "INPUT policy ${inpol}, явного ACCEPT для ${port}/udp нет — возможен блок входящих"
+    fi
+  else
+    d_info "iptables INPUT policy: ${inpol:-ACCEPT}"
+  fi
+  d_info "Облачный firewall (Hetzner/Oracle/AWS/GCP) изнутри не виден — проверьте ${port}/udp в панели провайдера"
+
+  step "6/8 Внешняя связность"
+  local pub; pub="$(detect_public_ip || true)"
+  if [ -n "$pub" ]; then
+    d_ok "Внешний IP: ${pub} (DNS и HTTPS с сервера работают)"
+  else
+    d_warn "Внешний IP не определён — у сервера нет egress или не работает DNS"
+  fi
+
+  step "7/8 Endpoint в конфигах клиентов"
+  if [ -n "$pub" ]; then
+    local checked=0 mism=0 f ep eip
+    for f in "$AWG_DIR"/*.conf; do
+      [ -f "$f" ] || continue
+      [ "$(basename "$f")" = "${AWG_IFACE}.conf" ] && continue
+      ep="$(conf_get Endpoint "$f")"; [ -n "$ep" ] || continue
+      checked=$((checked + 1)); eip="${ep%%:*}"
+      [ "$eip" = "$pub" ] || mism=$((mism + 1))
+    done
+    if [ "$checked" -eq 0 ]; then d_info "Клиентских конфигов с Endpoint нет"
+    elif [ "$mism" -eq 0 ]; then d_ok "Endpoint во всех ${checked} конфигах = ${pub}"
+    else d_warn "${mism}/${checked} конфигов указывают на другой IP. Если IP сервера менялся — пересоздайте клиентов"; fi
+  else
+    d_info "Пропущено (внешний IP не определён)"
+  fi
+
+  step "8/8 Подключения клиентов (handshake / трафик)"
+  local npeer; npeer="$(grep -c '^\[Peer\]' "$conf" || true)"
+  local dump=""
+  if awg show "$AWG_IFACE" >/dev/null 2>&1; then dump="$(awg show "$AWG_IFACE" dump 2>/dev/null || true)"; fi
+  if [ "${npeer:-0}" -eq 0 ]; then
+    d_info "Клиенты не настроены — добавьте клиента (меню пункт 2), затем повторите диагностику"
+  elif [ -z "$dump" ]; then
+    d_warn "awg show dump пуст — интерфейс не поднят"
+  else
+    local now; now="$(date +%s)"
+    local stats n ever online totrx
+    stats="$(printf '%s\n' "$dump" | awk -v now="$now" 'NF>=8{n++; if($5>0)ever++; if($5>0 && now-$5<180)online++; rx+=$6} END{printf "%d %d %d %d", n+0, ever+0, online+0, rx+0}')"
+    read -r n ever online totrx <<< "$stats"
+    d_info "Пиров: ${n}, подключались хоть раз: ${ever}, онлайн (<180с): ${online}, RX всего: ${totrx} Б"
+    if [ "$n" -eq 0 ]; then
+      d_warn "В интерфейсе нет пиров — конфиг не применён, перезапустите туннель"
+    elif [ "$ever" -eq 0 ]; then
+      d_fail "Ни один клиент ни разу не подключился (handshake=0, RX=0) — входящие пакеты не доходят"
+      block_suspect=1
+    elif [ "$online" -eq 0 ]; then
+      d_warn "Подключались ранее (${ever}), но сейчас активных нет — клиент offline или блокировка появилась недавно"
+    else
+      d_ok "${online} клиент(ов) онлайн — туннель работает"
+    fi
+  fi
+
+  printf '\n%b============================================================%b\n' "$C_CYAN" "$C_RESET"
+  printf '  %bВЕРДИКТ%b\n' "$C_BOLD" "$C_RESET"
+  printf '%b============================================================%b\n' "$C_CYAN" "$C_RESET"
+  if [ "$block_suspect" -eq 1 ] && [ "$DIAG_FAILS" -eq 1 ]; then
+    printf '%bСервер исправен и слушает %s/udp, но пакеты от клиентов НЕ доходят.%b\n' "$C_YELLOW" "$port" "$C_RESET"
+    printf 'Это блокировка ВНЕ сервера. По частоте причин:\n'
+    printf '  1. Облачный firewall/security group: откройте %s/udp в панели провайдера\n' "$port"
+    printf '     (Hetzner Cloud Firewall, Oracle Security List, AWS SG, GCP VPC firewall).\n'
+    printf '  2. Провайдер/мобильный оператор режет UDP или WireGuard-DPI.\n'
+    printf '     Обфускация 3.1 уже включена; если не помогает — смените порт на 443/udp\n'
+    printf '     (ListenPort в %s + перезапуск + пересоздание клиентов).\n' "$conf"
+    printf '  3. Клиент использует неверный Endpoint (IP:порт) — см. пункт 7 выше.\n'
+    printf 'Точный тест блокировки: %bsudo awg-manager diagnose-live%b (перехват пакетов).\n' "$C_BOLD" "$C_RESET"
+    if [ "$IS_TTY" = "1" ] && command -v tcpdump >/dev/null 2>&1; then
+      if confirm_yes "Запустить 15-секундный перехват входящих пакетов сейчас?"; then
+        diag_live_capture
+      fi
+    fi
+  elif [ "$DIAG_FAILS" -eq 0 ]; then
+    printf '%bКритических ошибок нет (WARN: %s).%b\n' "$C_GREEN" "$DIAG_WARNS" "$C_RESET"
+    printf 'Если конкретный клиент не подключается — проблема на его стороне: сеть, конфиг или Endpoint.\n'
+  else
+    printf '%bНайдено неисправностей: %s (WARN: %s).%b\n' "$C_RED" "$DIAG_FAILS" "$DIAG_WARNS" "$C_RESET"
+    printf 'Исправьте пункты [FAIL] сверху вниз и повторите: sudo awg-manager diagnose\n'
+  fi
+  printf '\n'
+  return 0
+}
+
 #--- бэкап и удаление ---------------------------------------------------------
 do_backup() {
   step "Создание бэкапа AmneziaWG"
@@ -1255,6 +1461,7 @@ show_menu() {
     printf '  Telegram-бот:     %b%s%b\n' "$C_CYAN" "$bot_status" "$C_RESET"
     printf '  Обход AI (Gemini/GPT): %b%s%b\n' "$C_CYAN" "$warp_status" "$C_RESET"
     printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
+    printf '  %bНе подключается? Пункт 12 — самодиагностика (блокировки/порт/NAT)%b\n' "$C_YELLOW" "$C_RESET"
     printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ:%b\n' "$C_BOLD" "$C_RESET"
     printf '    1) Список клиентов, статус и QR-коды\n'
     printf '    2) Добавить нового клиента\n'
@@ -1269,6 +1476,7 @@ show_menu() {
     printf '    9) Резервная копия (бэкап) / Восстановление\n'
     printf '   10) Переустановить AmneziaWG начисто\n'
     printf '   11) Полное удаление AmneziaWG\n'
+    printf '   12) Самодиагностика — почему не подключается (блокировки/порт/NAT)\n'
     printf '    0) Выход\n'
     printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
     read -r -p "Выберите пункт меню: " choice || { printf '\n'; break; }
@@ -1361,6 +1569,7 @@ show_menu() {
           do_uninstall
         fi
         ;;
+      12) do_diagnose ;;
       0|q|quit|exit) break ;;
       *) printf 'Неизвестный пункт: %s\n' "$choice" ;;
     esac
@@ -1402,6 +1611,8 @@ case "$ACTION" in
   warp-test) do_warp_test ;;
   ru-bypass) do_ru_bypass ;;
   status) do_status ;;
+  diagnose) do_diagnose ;;
+  diagnose-live) diag_live_capture ;;
   backup) do_backup ;;
   restore) do_restore "${2:-}" ;;
   uninstall) do_uninstall ;;
@@ -1420,6 +1631,8 @@ case "$ACTION" in
   warp-disable  Отключить обход Gemini
   warp-test     Проверить доступность Google Gemini API
   status        Детальный статус сервисов и интерфейса
+  diagnose      Самодиагностика: модуль, порт, NAT, firewall, handshake (почему не подключается)
+  diagnose-live 15-секундный перехват входящих пакетов (точный тест блокировки)
   backup        Создать резервную копию
   restore       Восстановить из архива
   uninstall     Полное удаление с сервера
