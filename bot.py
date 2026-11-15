@@ -1,41 +1,33 @@
 #!/usr/bin/env python3
 """
-AmneziaWG 3.1 Telegram Management Bot
-Управление клиентами, генерация QR-кодов, мониторинг трафика и Gemini routing.
+AmneziaWG 3.1 Telegram Management Bot (Hardened Standard Edition).
+Управление клиентами (0.0.0.0/0), генерация QR-кодов, мониторинг и самодиагностика.
 Не требует внешних pip-библиотек (чистый Python 3 стандартной библиотеки).
 """
 
-import os
-import sys
+import html
 import json
-import time
-import uuid
-import datetime
+import os
+import re
 import subprocess
-import urllib.request
+import sys
+import time
 import urllib.error
 import urllib.parse
+import urllib.request
+import uuid
 from pathlib import Path
 
 AWG_DIR = "/etc/amnezia/amneziawg"
 AWG_IFACE = "awg0"
 ENV_FILE = f"{AWG_DIR}/bot.env"
-RU_BYPASS_FILE = f"{AWG_DIR}/amnezia-russia-bypass.json"
-RU_BYPASS_URL = "https://raw.githubusercontent.com/lib4u/amnezia-tunneling-ru/main/amnezia.json"
 MANAGER_BIN = "/usr/local/bin/awg-manager"
 
-# 51 подсеть для исключения RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
-ALLOWED_IPS_NO_LAN = (
-    "1.0.0.0/8, 2.0.0.0/7, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, "
-    "32.0.0.0/3, 64.0.0.0/3, 96.0.0.0/6, 100.0.0.0/10, 100.128.0.0/9, 101.0.0.0/8, "
-    "102.0.0.0/7, 104.0.0.0/5, 112.0.0.0/5, 120.0.0.0/6, 124.0.0.0/7, 126.0.0.0/8, "
-    "128.0.0.0/3, 160.0.0.0/5, 168.0.0.0/8, 169.0.0.0/9, 169.128.0.0/10, 169.192.0.0/11, "
-    "169.224.0.0/12, 169.240.0.0/13, 169.248.0.0/14, 169.252.0.0/15, 169.255.0.0/16, "
-    "170.0.0.0/7, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, 172.128.0.0/9, 173.0.0.0/8, "
-    "174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, 192.128.0.0/11, 192.160.0.0/13, 192.169.0.0/16, "
-    "192.170.0.0/15, 192.172.0.0/14, 192.176.0.0/12, 192.192.0.0/10, 193.0.0.0/8, "
-    "194.0.0.0/7, 196.0.0.0/6, 200.0.0.0/5, 208.0.0.0/4"
-)
+CLIENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+RESERVED_NAMES = {"awg0", "warp0", "server", "default"}
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+STATE_TTL_SEC = 600
+
 
 def load_env():
     env = {}
@@ -51,46 +43,99 @@ def load_env():
             env[k] = os.environ[k]
     return env
 
+
 ENV = load_env()
-BOT_TOKEN = ENV.get("BOT_TOKEN", "")
-ADMIN_IDS = [x.strip() for x in str(ENV.get("ADMIN_ID", "")).split(",") if x.strip()]
-ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else ""
+BOT_TOKEN = str(ENV.get("BOT_TOKEN", "")).strip()
+ADMIN_IDS = [
+    x.strip()
+    for x in str(ENV.get("ADMIN_ID", "")).split(",")
+    if re.fullmatch(r"\d+", x.strip())
+]
 GROUP_ID = str(ENV.get("GROUP_ID", "")).strip()
 TOPIC_ID = str(ENV.get("TOPIC_ID", "")).strip()
 
-if not BOT_TOKEN or not ADMIN_IDS:
-    print(f"ОШИБКА: Задайте BOT_TOKEN и ADMIN_ID в {ENV_FILE} или переменных окружения", file=sys.stderr)
+BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# Хранилище временного состояния пользователей {"{chat_id}_{user_id}": state}
+# Временное состояние пользователей {"{chat_id}_{user_id}": (state, ts)}
 USER_STATE = {}
 
+
+def redact(text):
+    s = str(text)
+    if BOT_TOKEN:
+        s = s.replace(BOT_TOKEN, "***")
+    return s
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", str(text or ""))
+
+
+def is_valid_client_name(name):
+    if not isinstance(name, str) or not CLIENT_NAME_RE.fullmatch(name):
+        return False
+    if name.lower() in RESERVED_NAMES or name.endswith("-lan-bypass"):
+        return False
+    return True
+
+
+def safe_awg_path(name, ext):
+    if not is_valid_client_name(name):
+        return None
+    base = Path(AWG_DIR).resolve()
+    target = (base / f"{name}.{ext}").resolve()
+    if target.parent != base:
+        return None
+    return target
+
+
 def is_admin(user_id):
-    if not ADMIN_IDS:
-        return True
-    return str(user_id) in ADMIN_IDS
+    uid = str(user_id or "").strip()
+    if not ADMIN_IDS or not re.fullmatch(r"\d+", uid):
+        return False
+    return uid in ADMIN_IDS
+
 
 def check_access(chat_id, user_id, thread_id=None):
-    chat_id = str(chat_id)
-    user_id = str(user_id)
-    th_id = str(thread_id or "")
+    chat_id = str(chat_id or "").strip()
+    user_id = str(user_id or "").strip()
+    th_id = str(thread_id) if thread_id is not None else ""
 
-    # Проверка прав: пользователь должен быть в списке администраторов
     if not is_admin(user_id):
         return False, "⛔ Доступ запрещён. Управлять VPN могут только назначенные администраторы."
 
-    # Если задан GROUP_ID, доступ разрешён в этой группе или в ЛС с админом
     if GROUP_ID:
         if chat_id != user_id and chat_id != GROUP_ID:
             return False, "⛔ Бот настроен на работу только в назначенной группе/топике."
-        # Если задан TOPIC_ID и сообщение из группы — проверяем топик
-        if chat_id == GROUP_ID and TOPIC_ID and th_id and th_id != TOPIC_ID:
-            return False, f"⛔ Команды VPN принимаются только в топике #{TOPIC_ID}."
+        if chat_id == GROUP_ID and TOPIC_ID and th_id != TOPIC_ID:
+            return False, f"⛔ Команды VPN принимаются только в топике #{html.escape(TOPIC_ID)}."
 
     return True, ""
 
+
+def set_state(user_key, state):
+    now = time.time()
+    stale = [k for k, (_, ts) in USER_STATE.items() if now - ts > STATE_TTL_SEC]
+    for k in stale:
+        USER_STATE.pop(k, None)
+    USER_STATE[user_key] = (state, now)
+
+
+def get_state(user_key):
+    item = USER_STATE.get(user_key)
+    if not item:
+        return None
+    state, ts = item
+    if time.time() - ts > STATE_TTL_SEC:
+        USER_STATE.pop(user_key, None)
+        return None
+    return state
+
+
 def api_call(method, payload=None, files=None):
+    if not BASE_URL:
+        return {"ok": False, "description": "BOT_TOKEN is not configured"}
+
     url = f"{BASE_URL}/{method}"
     if files:
         boundary = uuid.uuid4().hex
@@ -99,16 +144,23 @@ def api_call(method, payload=None, files=None):
             for k, v in payload.items():
                 if isinstance(v, (dict, list)):
                     v = json.dumps(v)
-                body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+                body.extend(
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode("utf-8")
+                )
         for k, (filename, content, mime) in files.items():
-            body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n".encode("utf-8"))
+            safe_name = re.sub(r'["\\\r\n/]', "_", str(filename))
+            body.extend(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"; filename="{safe_name}"\r\nContent-Type: {mime}\r\n\r\n'.encode("utf-8")
+            )
             body.extend(content)
             body.extend(b"\r\n")
         body.extend(f"--{boundary}--\r\n".encode("utf-8"))
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        req = urllib.request.Request(
+            url, data=bytes(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        )
     else:
-        data_bytes = json.dumps(payload).encode("utf-8") if payload else None
-        headers = {"Content-Type": "application/json"} if payload else {}
+        data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if payload is not None else {}
         req = urllib.request.Request(url, data=data_bytes, headers=headers)
 
     try:
@@ -116,85 +168,93 @@ def api_call(method, payload=None, files=None):
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         err_msg = e.read().decode("utf-8", errors="ignore")
-        print(f"API HTTP Error {e.code}: {err_msg}", file=sys.stderr)
-        return {"ok": False, "description": err_msg}
+        print(f"API HTTP Error {e.code}: {redact(err_msg)}", file=sys.stderr)
+        try:
+            parsed = json.loads(err_msg)
+            retry_after = parsed.get("parameters", {}).get("retry_after")
+            if e.code == 429 and isinstance(retry_after, (int, float)) and 0 < retry_after <= 60:
+                time.sleep(retry_after)
+        except Exception:
+            pass
+        return {"ok": False, "description": redact(err_msg)}
     except Exception as e:
-        print(f"API Request Exception: {e}", file=sys.stderr)
-        return {"ok": False, "description": str(e)}
+        print(f"API Request Exception: {redact(e)}", file=sys.stderr)
+        return {"ok": False, "description": redact(e)}
 
-def send_message(chat_id, text, reply_markup=None, message_thread_id=None):
+
+def _apply_thread(payload, chat_id, message_thread_id):
+    th = message_thread_id or (TOPIC_ID if str(chat_id).startswith("-") and TOPIC_ID else None)
+    if th and str(chat_id).startswith("-"):
+        try:
+            payload["message_thread_id"] = int(th)
+        except Exception:
+            pass
+
+
+def send_message(chat_id, text, reply_markup=None, message_thread_id=None, parse_mode="HTML"):
     payload = {
         "chat_id": str(chat_id),
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
+        "text": text[:4090],
+        "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    th = message_thread_id or (TOPIC_ID if str(chat_id).startswith("-") else None)
-    if th and str(chat_id).startswith("-"):
-        try:
-            payload["message_thread_id"] = int(th)
-        except Exception:
-            pass
+    _apply_thread(payload, chat_id, message_thread_id)
     return api_call("sendMessage", payload)
 
+
 def send_photo(chat_id, photo_bytes, caption=None, reply_markup=None, message_thread_id=None):
-    payload = {"chat_id": str(chat_id), "parse_mode": "Markdown"}
+    payload = {"chat_id": str(chat_id), "parse_mode": "HTML"}
     if caption:
-        payload["caption"] = caption
+        payload["caption"] = caption[:1020]
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    th = message_thread_id or (TOPIC_ID if str(chat_id).startswith("-") else None)
-    if th and str(chat_id).startswith("-"):
-        try:
-            payload["message_thread_id"] = int(th)
-        except Exception:
-            pass
+    _apply_thread(payload, chat_id, message_thread_id)
     files = {"photo": ("qr.png", photo_bytes, "image/png")}
     return api_call("sendPhoto", payload, files=files)
 
+
 def send_document(chat_id, doc_bytes, filename, caption=None, reply_markup=None, message_thread_id=None):
-    payload = {"chat_id": str(chat_id), "parse_mode": "Markdown"}
+    payload = {"chat_id": str(chat_id), "parse_mode": "HTML"}
     if caption:
-        payload["caption"] = caption
+        payload["caption"] = caption[:1020]
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    th = message_thread_id or (TOPIC_ID if str(chat_id).startswith("-") else None)
-    if th and str(chat_id).startswith("-"):
-        try:
-            payload["message_thread_id"] = int(th)
-        except Exception:
-            pass
+    _apply_thread(payload, chat_id, message_thread_id)
     files = {"document": (filename, doc_bytes, "application/octet-stream")}
     return api_call("sendDocument", payload, files=files)
+
 
 def answer_callback(callback_id, text=None, alert=False):
     payload = {"callback_query_id": callback_id}
     if text:
-        payload["text"] = text
+        payload["text"] = text[:200]
         payload["show_alert"] = alert
     return api_call("answerCallbackQuery", payload)
+
 
 def format_bytes(b):
     try:
         b = int(b)
     except Exception:
         return "0 B"
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
         if b < 1024.0:
             return f"{b:.1f} {unit}"
         b /= 1024.0
     return f"{b:.1f} PB"
+
 
 def format_time_ago(ts):
     try:
         ts = int(ts)
     except Exception:
         return "никогда"
-    if ts == 0:
+    if ts <= 0:
         return "никогда"
-    diff = int(time.time()) - ts
+    diff = max(0, int(time.time()) - ts)
     if diff < 60:
         return f"{diff} сек назад"
     if diff < 3600:
@@ -203,15 +263,17 @@ def format_time_ago(ts):
         return f"{diff // 3600} ч назад"
     return f"{diff // 86400} дн назад"
 
+
 def parse_awg_clients():
     conf_file = f"{AWG_DIR}/{AWG_IFACE}.conf"
     if not os.path.exists(conf_file):
         return []
 
-    # Читаем awg show для runtime-статистики
     stats = {}
     try:
-        out = subprocess.check_output(["awg", "show", AWG_IFACE, "dump"], stderr=subprocess.DEVNULL).decode("utf-8")
+        out = subprocess.check_output(
+            ["awg", "show", AWG_IFACE, "dump"], stderr=subprocess.DEVNULL, timeout=10
+        ).decode("utf-8")
         for line in out.strip().split("\n"):
             parts = line.split("\t")
             if len(parts) >= 8:
@@ -227,16 +289,20 @@ def parse_awg_clients():
         pass
 
     clients = []
-    current = {}
+    current = None
     with open(conf_file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line == "[Peer]":
-                if current and "pubkey" in current:
+                if current and current.get("pubkey"):
                     clients.append(current)
                 current = {"name": "", "pubkey": "", "allowed_ips": ""}
+            elif line.startswith("[") and line.endswith("]"):
+                if current and current.get("pubkey"):
+                    clients.append(current)
+                current = None
             elif line.startswith("#"):
-                if current and not current.get("name"):
+                if current is not None and not current.get("name"):
                     current["name"] = line.lstrip("#").strip()
             elif "=" in line and current is not None:
                 k, v = line.split("=", 1)
@@ -247,7 +313,7 @@ def parse_awg_clients():
                 elif k == "AllowedIPs":
                     current["allowed_ips"] = v
 
-        if current and "pubkey" in current:
+        if current and current.get("pubkey"):
             clients.append(current)
 
     now = int(time.time())
@@ -258,12 +324,12 @@ def parse_awg_clients():
         c["handshake"] = st.get("latest_handshake", 0)
         c["rx"] = st.get("rx", 0)
         c["tx"] = st.get("tx", 0)
-        # онлайн, если рукопожатие было в пределах 180 секунд
         c["is_online"] = (now - c["handshake"] < 180) and (c["handshake"] > 0)
         if not c.get("name"):
             c["name"] = c.get("allowed_ips", "").split("/")[0] or pub[:8]
 
     return clients
+
 
 def get_server_stats():
     conf_file = f"{AWG_DIR}/{AWG_IFACE}.conf"
@@ -271,337 +337,275 @@ def get_server_stats():
         return "❌ Туннель не установлен"
 
     try:
-        active = subprocess.run(["systemctl", "is-active", f"awg-quick@{AWG_IFACE}"], capture_output=True, text=True).stdout.strip() == "active"
+        active = (
+            subprocess.run(
+                ["systemctl", "is-active", f"awg-quick@{AWG_IFACE}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+            == "active"
+        )
     except Exception:
         active = False
+
+    port = "?"
+    has_31 = False
+    has_dc = False
+    try:
+        with open(conf_file, "r", encoding="utf-8") as f:
+            raw = f.read()
+        m = re.search(r"^ListenPort\s*=\s*(\d+)", raw, re.MULTILINE)
+        if m:
+            port = m.group(1)
+        has_31 = bool(re.search(r"^HeaderProtectionKey\s*=", raw, re.MULTILINE))
+        has_dc = bool(re.search(r"^DisableCookies\s*=\s*on\b", raw, re.MULTILINE))
+    except Exception:
+        pass
 
     clients = parse_awg_clients()
     online_count = sum(1 for c in clients if c["is_online"])
     total_rx = sum(c["rx"] for c in clients)
     total_tx = sum(c["tx"] for c in clients)
 
-    # Проверка обхода Gemini
-    warp_status = "⚪ Отключён"
-    try:
-        warp_active = subprocess.run(["systemctl", "is-active", "awg-gemini-warp"], capture_output=True, text=True).stdout.strip() == "active"
-        if warp_active:
-            warp_status = "🟢 Активен (WARP)"
-    except Exception:
-        pass
-
     status_icon = "🟢 Активен" if active else "🔴 Остановлен"
-    
-    text = (
-        f"📊 *Состояние AmneziaWG 3.1*\n"
+    proto_str = "AmneziaWG 3.1 (HPK + CPS)" if has_31 else "AmneziaWG"
+    if has_dc:
+        proto_str += " + DisableCookies"
+
+    return (
+        f"📊 <b>Состояние туннеля</b>\n"
         f"• Сервис: {status_icon}\n"
-        f"• Интерфейс: `{AWG_IFACE}`\n"
-        f"• Клиенты: *{len(clients)}* (🟢 *{online_count} онлайн*)\n"
-        f"• Общий трафик: ↓ {format_bytes(total_tx)} / ↑ {format_bytes(total_rx)}\n"
-        f"• Обход Gemini: {warp_status}\n"
+        f"• Интерфейс: <code>{html.escape(AWG_IFACE)}</code> ({html.escape(port)}/udp)\n"
+        f"• Профиль: <code>{html.escape(proto_str)}</code>\n"
+        f"• Клиенты: <b>{len(clients)}</b> (🟢 <b>{online_count} онлайн</b>)\n"
+        f"• Трафик клиентов: ↓ {html.escape(format_bytes(total_tx))} / ↑ {html.escape(format_bytes(total_rx))}\n"
     )
-    return text
+
+
+def _resolve_manager_bin():
+    if os.path.exists(MANAGER_BIN):
+        return MANAGER_BIN
+    sibling = str(Path(__file__).resolve().parent / "install.sh")
+    if os.path.exists(sibling):
+        return sibling
+    return MANAGER_BIN
+
 
 def run_manager_cmd(action, arg=""):
-    cmd = [MANAGER_BIN if os.path.exists(MANAGER_BIN) else "/root/vpn_script/install.sh", action]
+    cmd = [_resolve_manager_bin(), action]
     if arg:
         cmd.append(arg)
+    env = os.environ.copy()
+    env["AWGM_PLAIN"] = "1"
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        return proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
+        combined = strip_ansi((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else ""))
+        return proc.returncode == 0, combined.strip()
     except Exception as e:
-        return False, str(e)
+        return False, redact(e)
+
 
 def handle_start(chat_id, from_id=None, thread_id=None):
     if from_id:
         USER_STATE.pop(f"{chat_id}_{from_id}", None)
     text = (
-        "🛡 *AmneziaWG 3.1 — Управление туннелем*\n\n"
-        "Нативный модуль ядра (DKMS) с полным профилем обфускации 3.1.\n"
-        "Выберите действие ниже:"
+        "🛡 <b>AmneziaWG 3.1 — Стандартный VPN-сервер</b>\n\n"
+        "Нативный модуль ядра (DKMS) с маскировкой под QUIC и защитой заголовков 3.1.\n"
+        "Весь трафик клиентов идёт через туннель (<code>0.0.0.0/0</code>).\n\n"
+        "Выберите действие:"
     )
     markup = {
         "inline_keyboard": [
             [{"text": "➕ Добавить клиента", "callback_data": "menu_add"}],
             [{"text": "👥 Список клиентов", "callback_data": "menu_list"}],
-            [{"text": "📊 Статус туннеля", "callback_data": "menu_status"}, {"text": "🌐 Обход AI (Gemini/GPT)", "callback_data": "menu_gemini"}],
-            [{"text": "🇷🇺 Обход РФ и локальных сетей (LAN)", "callback_data": "menu_ru_bypass"}]
+            [
+                {"text": "📊 Статус", "callback_data": "menu_status"},
+                {"text": "🩺 Диагностика", "callback_data": "menu_diagnose"},
+            ],
         ]
     }
     send_message(chat_id, text, markup, message_thread_id=thread_id)
+
 
 def handle_list_clients(chat_id, thread_id=None):
     clients = parse_awg_clients()
     if not clients:
-        text = "👥 *Клиентов нет.*\nНажмите кнопку ниже, чтобы создать первого клиента:"
+        text = "👥 <b>Клиентов нет.</b>\nНажмите кнопку ниже, чтобы создать первого клиента:"
         markup = {"inline_keyboard": [[{"text": "➕ Добавить клиента", "callback_data": "menu_add"}]]}
         send_message(chat_id, text, markup, message_thread_id=thread_id)
         return
 
-    text = f"👥 *Клиенты AmneziaWG ({len(clients)}):*\n\n"
+    text = f"👥 <b>Клиенты AmneziaWG ({len(clients)}):</b>\n\n"
     keyboard = []
 
     for idx, c in enumerate(clients, 1):
+        name = c["name"]
         status_ico = "🟢" if c["is_online"] else "⚪"
         handshake_str = format_time_ago(c["handshake"])
         traffic_str = f"↓{format_bytes(c['tx'])} / ↑{format_bytes(c['rx'])}"
-        text += (
-            f"*{idx}. {c['name']}* ({c['allowed_ips']})\n"
-            f"   {status_ico} {handshake_str} | {traffic_str}\n\n"
+        entry = (
+            f"<b>{idx}. {html.escape(name)}</b> (<code>{html.escape(c['allowed_ips'])}</code>)\n"
+            f"   {status_ico} {html.escape(handshake_str)} | {html.escape(traffic_str)}\n\n"
         )
-        keyboard.append([
-            {"text": f"📱 QR / Конфиг: {c['name']}", "callback_data": f"qr_{c['name']}"},
-            {"text": f"❌ Удалить", "callback_data": f"del_{c['name']}"}
-        ])
+        if len(text) + len(entry) < 3800:
+            text += entry
 
-    keyboard.append([{"text": "➕ Добавить нового", "callback_data": "menu_add"}, {"text": "🔄 Обновить", "callback_data": "menu_list"}])
+        if is_valid_client_name(name) and len(f"confirm_del_{name}".encode("utf-8")) <= 64:
+            keyboard.append(
+                [
+                    {"text": f"📱 QR / Конфиг: {name}", "callback_data": f"qr_{name}"},
+                    {"text": "❌ Удалить", "callback_data": f"del_{name}"},
+                ]
+            )
+
+    keyboard.append(
+        [
+            {"text": "➕ Добавить нового", "callback_data": "menu_add"},
+            {"text": "🔄 Обновить", "callback_data": "menu_list"},
+        ]
+    )
     keyboard.append([{"text": "« Главное меню", "callback_data": "menu_main"}])
 
     send_message(chat_id, text, {"inline_keyboard": keyboard}, message_thread_id=thread_id)
 
-def ensure_lan_bypass_config(name):
-    """Генерирует {name}-lan-bypass.conf и {name}-lan-bypass.png, если их ещё нет."""
-    conf_path = f"{AWG_DIR}/{name}.conf"
-    lan_conf_path = f"{AWG_DIR}/{name}-lan-bypass.conf"
-    lan_png_path = f"{AWG_DIR}/{name}-lan-bypass.png"
-
-    if not os.path.exists(conf_path):
-        return False
-
-    if not os.path.exists(lan_conf_path):
-        try:
-            with open(conf_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            import re
-            lan_content = re.sub(
-                r"^AllowedIPs\s*=.*$",
-                f"AllowedIPs = {ALLOWED_IPS_NO_LAN}",
-                content,
-                flags=re.MULTILINE
-            )
-            with open(lan_conf_path, "w", encoding="utf-8") as f:
-                f.write(lan_content)
-            os.chmod(lan_conf_path, 0o600)
-        except Exception as e:
-            print(f"Ошибка создания {lan_conf_path}: {e}", file=sys.stderr)
-            return False
-
-    if not os.path.exists(lan_png_path):
-        try:
-            subprocess.run(
-                ["qrencode", "-o", lan_png_path, "-s", "6", "-m", "2"],
-                input=open(lan_conf_path, "rb").read(),
-                check=True
-            )
-            os.chmod(lan_png_path, 0o600)
-        except Exception as e:
-            print(f"Ошибка qrencode для {lan_png_path}: {e}", file=sys.stderr)
-
-    return True
 
 def handle_qr(chat_id, name, thread_id=None):
-    conf_path = f"{AWG_DIR}/{name}.conf"
-    png_path = f"{AWG_DIR}/{name}.png"
-
-    if not os.path.exists(conf_path):
-        send_message(chat_id, f"❌ Конфиг клиента `{name}` не найден.", message_thread_id=thread_id)
+    conf_path = safe_awg_path(name, "conf")
+    png_path = safe_awg_path(name, "png")
+    if not conf_path or not png_path or not conf_path.exists():
+        send_message(chat_id, f"❌ Конфиг клиента <code>{html.escape(name)}</code> не найден.", message_thread_id=thread_id)
         return
 
-    # Если PNG отсутствует, сгенерируем на лету
-    if not os.path.exists(png_path):
+    conf_bytes = conf_path.read_bytes()
+
+    if not png_path.exists():
         try:
-            subprocess.run(["qrencode", "-o", png_path, "-s", "6", "-m", "2"], input=open(conf_path, "rb").read(), check=True)
+            subprocess.run(
+                ["qrencode", "-o", str(png_path), "-s", "6", "-m", "2"],
+                input=conf_bytes,
+                check=True,
+                timeout=15,
+            )
             os.chmod(png_path, 0o600)
         except Exception as e:
-            print(f"Ошибка qrencode: {e}", file=sys.stderr)
-
-    # Проверяем и подготавливаем LAN bypass конфиг
-    ensure_lan_bypass_config(name)
-    lan_conf_path = f"{AWG_DIR}/{name}-lan-bypass.conf"
+            print(f"Ошибка qrencode: {redact(e)}", file=sys.stderr)
 
     caption = (
-        f"📱 *Клиент:* `{name}`\n"
-        f"🔑 *Профиль:* AmneziaWG 3.1 (Стандартный: весь трафик)\n\n"
-        f"Сканируйте QR в официальном приложении *Amnezia >= 5.0.1.5* или скачайте прикреплённые конфиги ниже."
+        f"📱 <b>Клиент:</b> <code>{html.escape(name)}</code>\n"
+        f"🔑 <b>Профиль:</b> AmneziaWG 3.1 (полный туннель <code>0.0.0.0/0</code>)\n\n"
+        f"Сканируйте QR-код в приложении <b>Amnezia &gt;= 5.0.1.5</b> или импортируйте файл <code>{html.escape(name)}.conf</code>."
     )
 
-    markup = {
-        "inline_keyboard": [
-            [{"text": "🏠 Показать QR для обхода локальных сетей (LAN)", "callback_data": f"qr_lan_{name}"}],
-            [{"text": "👥 К списку клиентов", "callback_data": "menu_list"}]
-        ]
-    }
+    markup = {"inline_keyboard": [[{"text": "👥 К списку клиентов", "callback_data": "menu_list"}]]}
 
-    if os.path.exists(png_path):
-        with open(png_path, "rb") as f:
-            send_photo(chat_id, f.read(), caption=caption, reply_markup=markup, message_thread_id=thread_id)
-    
-    with open(conf_path, "rb") as f:
-        send_document(
-            chat_id,
-            f.read(),
-            filename=f"{name}.conf",
-            caption=f"📄 *{name}.conf* — Полный туннель (`AllowedIPs = 0.0.0.0/0`)",
-            message_thread_id=thread_id
-        )
+    if png_path.exists():
+        send_photo(chat_id, png_path.read_bytes(), caption=caption, reply_markup=markup, message_thread_id=thread_id)
 
-    if os.path.exists(lan_conf_path):
-        with open(lan_conf_path, "rb") as f:
-            send_document(
-                chat_id,
-                f.read(),
-                filename=f"{name}-lan-bypass.conf",
-                caption=(
-                    f"🏠 *{name}-lan-bypass.conf* — Конфиг с обходом локальных сетей!\n"
-                    f"Домашний роутер (`192.168.x.x`), сетевые принтеры и NAS работают напрямую мимо VPN."
-                ),
-                message_thread_id=thread_id
-            )
-
-def handle_qr_lan(chat_id, name, thread_id=None):
-    ensure_lan_bypass_config(name)
-    lan_conf_path = f"{AWG_DIR}/{name}-lan-bypass.conf"
-    lan_png_path = f"{AWG_DIR}/{name}-lan-bypass.png"
-
-    if not os.path.exists(lan_conf_path):
-        send_message(chat_id, f"❌ Конфиг `{name}-lan-bypass.conf` не найден.", message_thread_id=thread_id)
-        return
-
-    caption = (
-        f"🏠 *QR-код с обходом локальных сетей (LAN bypass)*\n"
-        f"📱 *Клиент:* `{name}`\n"
-        f"🔑 *Профиль:* AmneziaWG 3.1\n\n"
-        f"В этом QR-коде подсети `192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12` и `169.254.0.0/16` исключены из VPN — "
-        f"доступ к домашнему роутеру, сетевым принтерам и умному дому идёт напрямую через Wi-Fi / LAN."
+    send_document(
+        chat_id,
+        conf_bytes,
+        filename=f"{name}.conf",
+        caption=f"📄 <b>{html.escape(name)}.conf</b> — полный туннель (<code>AllowedIPs = 0.0.0.0/0</code>)",
+        message_thread_id=thread_id,
     )
 
-    markup = {
-        "inline_keyboard": [
-            [{"text": "📱 Показать стандартный QR (0.0.0.0/0)", "callback_data": f"qr_{name}"}],
-            [{"text": "👥 К списку клиентов", "callback_data": "menu_list"}]
-        ]
-    }
-
-    if os.path.exists(lan_png_path):
-        with open(lan_png_path, "rb") as f:
-            send_photo(chat_id, f.read(), caption=caption, reply_markup=markup, message_thread_id=thread_id)
 
 def handle_add_prompt(chat_id, from_id, thread_id=None):
-    USER_STATE[f"{chat_id}_{from_id}"] = "waiting_client_name"
+    set_state(f"{chat_id}_{from_id}", "waiting_client_name")
     text = (
-        "➕ *Добавление нового клиента*\n\n"
+        "➕ <b>Добавление нового клиента</b>\n\n"
         "Отправьте имя клиента сообщением в чат.\n"
-        "Допустимы латинские буквы, цифры, дефис и подчёркивание (например: `phone`, `laptop`, `user2`).\n\n"
-        "Или нажмите кнопку для отмены:"
+        "Допустимы латинские буквы, цифры, дефис и подчёркивание (1–32 символа, например: <code>phone</code>, <code>user_2</code>).\n\n"
+        "Для отмены отправьте /cancel или нажмите кнопку ниже:"
     )
     markup = {"inline_keyboard": [[{"text": "« Отмена", "callback_data": "menu_main"}]]}
     send_message(chat_id, text, markup, message_thread_id=thread_id)
 
+
 def handle_create_client(chat_id, from_id, name, thread_id=None):
     USER_STATE.pop(f"{chat_id}_{from_id}", None)
     name = name.strip()
-    import re
-    if not re.match(r"^[A-Za-z0-9_-]{1,32}$", name):
-        send_message(chat_id, "❌ Некорректное имя! Допустимы буквы A-Z, цифры, `_` и `-` (длина 1-32). Попробуйте снова.", message_thread_id=thread_id)
+    if not is_valid_client_name(name):
+        send_message(
+            chat_id,
+            "❌ Некорректное имя! Допустимы буквы A–Z, цифры, <code>_</code> и <code>-</code> (1–32 символа, кроме системных имён).",
+            message_thread_id=thread_id,
+        )
         return
 
-    send_message(chat_id, f"⏳ Создаю клиента `{name}`...", message_thread_id=thread_id)
+    send_message(chat_id, f"⏳ Создаю клиента <code>{html.escape(name)}</code>...", message_thread_id=thread_id)
     ok, out = run_manager_cmd("add-client", name)
     if ok:
-        send_message(chat_id, f"✅ Клиент `{name}` успешно добавлен!", message_thread_id=thread_id)
+        send_message(chat_id, f"✅ Клиент <code>{html.escape(name)}</code> успешно добавлен!", message_thread_id=thread_id)
         handle_qr(chat_id, name, thread_id=thread_id)
     else:
-        send_message(chat_id, f"❌ Ошибка добавления клиента `{name}`:\n```\n{out[-400:]}\n```", message_thread_id=thread_id)
+        err_tail = html.escape(out[-600:])
+        send_message(
+            chat_id,
+            f"❌ Ошибка добавления клиента <code>{html.escape(name)}</code>:\n<pre>{err_tail}</pre>",
+            message_thread_id=thread_id,
+        )
+
 
 def handle_delete_confirm(chat_id, name, thread_id=None):
-    text = f"⚠️ *Вы действительно хотите удалить клиента `{name}`?*\nПосле удаления доступ через этот ключ будет немедленно отозван."
+    if not is_valid_client_name(name):
+        send_message(chat_id, "❌ Некорректное имя клиента.", message_thread_id=thread_id)
+        return
+
+    text = (
+        f"⚠️ <b>Вы действительно хотите удалить клиента <code>{html.escape(name)}</code>?</b>\n"
+        f"После удаления доступ через этот ключ будет немедленно отозван."
+    )
     markup = {
         "inline_keyboard": [
-            [{"text": f"✅ Да, удалить `{name}`", "callback_data": f"confirm_del_{name}"}],
-            [{"text": "« Отмена", "callback_data": "menu_list"}]
+            [{"text": f"✅ Да, удалить {name}", "callback_data": f"confirm_del_{name}"}],
+            [{"text": "« Отмена", "callback_data": "menu_list"}],
         ]
     }
     send_message(chat_id, text, markup, message_thread_id=thread_id)
 
+
 def handle_delete_exec(chat_id, name, thread_id=None):
-    send_message(chat_id, f"⏳ Удаляю клиента `{name}`...", message_thread_id=thread_id)
+    if not is_valid_client_name(name):
+        send_message(chat_id, "❌ Некорректное имя клиента.", message_thread_id=thread_id)
+        return
+
+    send_message(chat_id, f"⏳ Удаляю клиента <code>{html.escape(name)}</code>...", message_thread_id=thread_id)
     ok, out = run_manager_cmd("remove-client", name)
     if ok:
-        send_message(chat_id, f"✅ Клиент `{name}` удалён.", message_thread_id=thread_id)
+        send_message(chat_id, f"✅ Клиент <code>{html.escape(name)}</code> удалён.", message_thread_id=thread_id)
         handle_list_clients(chat_id, thread_id=thread_id)
     else:
-        send_message(chat_id, f"❌ Ошибка удаления `{name}`:\n```\n{out[-400:]}\n```", message_thread_id=thread_id)
+        err_tail = html.escape(out[-600:])
+        send_message(
+            chat_id,
+            f"❌ Ошибка удаления <code>{html.escape(name)}</code>:\n<pre>{err_tail}</pre>",
+            message_thread_id=thread_id,
+        )
 
-def handle_gemini_info(chat_id, thread_id=None):
-    active = False
-    try:
-        active = subprocess.run(["systemctl", "is-active", "awg-ai-warp"], capture_output=True, text=True).stdout.strip() == "active"
-        if not active:
-            active = subprocess.run(["systemctl", "is-active", "awg-gemini-warp"], capture_output=True, text=True).stdout.strip() == "active"
-    except Exception:
-        pass
 
-    status_str = "🟢 *Включён (WARP routing)*" if active else "⚪ *Отключён*"
-    text = (
-        f"🌐 *Обход блокировок AI (Gemini + ChatGPT + Claude)*\n\n"
-        f"• Текущий статус: {status_str}\n\n"
-        f"При включении запросы к сервисам:\n"
-        f"• *Google Gemini & AI Studio* (`geosite:google-deepmind`, NotebookLM)\n"
-        f"• *OpenAI & ChatGPT* (`geosite:openai`, Sora, DALL-E)\n"
-        f"• *Anthropic Claude*\n\n"
-        f"автоматически маршрутизируются через Cloudflare WARP с чистым резидентским Anycast IP. "
-        f"Остальной мировой интернет идёт напрямую через гигабитный порт вашего VPS."
-    )
-    kb = []
-    if active:
-        kb.append([{"text": "🔴 Отключить обход AI", "callback_data": "gemini_disable"}])
-        kb.append([{"text": "🔍 Проверить доступность AI API", "callback_data": "gemini_test"}])
-    else:
-        kb.append([{"text": "🟢 Включить обход AI (WARP)", "callback_data": "gemini_enable"}])
+def handle_diagnose(chat_id, thread_id=None):
+    send_message(chat_id, "⏳ Запускаю самодиагностику сервера...", message_thread_id=thread_id)
+    ok, out = run_manager_cmd("diagnose")
+    snippet = html.escape(out[-3400:]) if out else "Нет вывода"
+    prefix = "🩺 <b>Самодиагностика AmneziaWG</b>\n" if ok else "⚠️ <b>Самодиагностика завершилась с ошибкой</b>\n"
+    markup = {"inline_keyboard": [[{"text": "« Главное меню", "callback_data": "menu_main"}]]}
+    send_message(chat_id, f"{prefix}<pre>{snippet}</pre>", markup, message_thread_id=thread_id)
 
-    kb.append([{"text": "« Главное меню", "callback_data": "menu_main"}])
-    send_message(chat_id, text, {"inline_keyboard": kb}, message_thread_id=thread_id)
-
-def handle_ru_bypass(chat_id, thread_id=None):
-    send_message(chat_id, "⏳ Подготавливаю файл обхода российских сайтов (GeoIP RU)...", message_thread_id=thread_id)
-    content = None
-    if os.path.exists(RU_BYPASS_FILE):
-        try:
-            with open(RU_BYPASS_FILE, "rb") as f:
-                content = f.read()
-        except Exception:
-            pass
-
-    if not content:
-        try:
-            req = urllib.request.Request(RU_BYPASS_URL, headers={"User-Agent": "curl/8.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                content = resp.read()
-                try:
-                    with open(RU_BYPASS_FILE, "wb") as f:
-                        f.write(content)
-                except Exception:
-                    pass
-        except Exception as e:
-            send_message(chat_id, f"❌ Не удалось загрузить базу обхода РФ: {e}", message_thread_id=thread_id)
-            return
-
-    caption = (
-        "🇷🇺 *Раздельное туннелирование сайтов РФ и локальных сетей (GeoIP RU + LAN)*\n\n"
-        "Чтобы Госуслуги, Сбербанк, Т-Банк, Кинопоиск, Яндекс и сервисы зоны `.ru`, "
-        "а также *домашний роутер и локальная сеть* (`192.168.x.x`, `10.x.x.x`, `172.16.x.x`) "
-        "работали напрямую через домашнего провайдера на максимальной скорости:\n\n"
-        "1. Сохраните прикреплённый файл `amnezia.json` на телефон/ПК.\n"
-        "2. В приложении *Amnezia VPN*:\n"
-        "   ⚙️ *Настройки* ➔ *Подключение* ➔ *Раздельное туннелирование сайтов*.\n"
-        "3. Выберите режим: *«Адреса из списка НЕ должны использовать VPN»*.\n"
-        "4. Нажмите *Импорт* и выберите скачанный файл.\n\n"
-        "✅ Готово! Все российские сайты, банки и локальные устройства пойдут напрямую, а блокировки и AI — через AmneziaWG."
-    )
-    send_document(chat_id, content, filename="amnezia.json", caption=caption, message_thread_id=thread_id)
 
 def main_loop():
-    admin_str = ", ".join(ADMIN_IDS) if ADMIN_IDS else "Все"
-    print(f"AmneziaWG Telegram Bot запущен. ADMIN_IDS: {admin_str}, GROUP_ID: {GROUP_ID or 'Все'}, TOPIC_ID: {TOPIC_ID or 'Все'}")
+    if not BOT_TOKEN or not ADMIN_IDS:
+        print(
+            f"ОШИБКА: Задайте валидные BOT_TOKEN и числовой ADMIN_ID в {ENV_FILE} или переменных окружения",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(
+        f"AmneziaWG Telegram Bot запущен. ADMIN_IDS: {len(ADMIN_IDS)}, "
+        f"GROUP_ID: {GROUP_ID or 'Все'}, TOPIC_ID: {TOPIC_ID or 'Все'}"
+    )
     offset = 0
     while True:
         try:
@@ -613,64 +617,75 @@ def main_loop():
             for u in updates.get("result", []):
                 offset = u["update_id"] + 1
 
-                # Обработка сообщений
                 if "message" in u:
                     msg = u["message"]
                     chat_id = str(msg.get("chat", {}).get("id", ""))
                     from_id = str(msg.get("from", {}).get("id", ""))
                     thread_id = msg.get("message_thread_id")
                     text = msg.get("text", "").strip()
+                    if not text or not chat_id or not from_id:
+                        continue
 
-                    # Сервисная команда /id, /topic, /chatid - работает везде для помощи в настройке
-                    if text.lower().startswith(("/id", "/topic", "/chatid", "/thread")):
+                    cmd_head = text.split(None, 1)[0].split("@")[0].lower()
+
+                    # Служебная команда /id только для администраторов (помощь в настройке GROUP_ID / TOPIC_ID)
+                    if cmd_head in ("/id", "/topic", "/chatid", "/thread"):
+                        if not is_admin(from_id):
+                            continue
                         title = msg.get("chat", {}).get("title", "Личные сообщения")
                         chat_type = msg.get("chat", {}).get("type", "private")
-                        t_id_str = str(thread_id) if thread_id else "Нет (General / ЛС)"
+                        t_id_str = str(thread_id) if thread_id is not None else "Нет (General / ЛС)"
                         send_message(
                             chat_id,
-                            f"ℹ️ *Информация о чате и топике:*\n\n"
-                            f"• *Чат:* `{title}`\n"
-                            f"• *Тип чата:* `{chat_type}`\n"
-                            f"• *GROUP_ID (chat_id):* `{chat_id}`\n"
-                            f"• *TOPIC_ID (thread_id):* `{t_id_str}`\n"
-                            f"• *Ваш User ID:* `{from_id}`\n\n"
-                            f"Для привязки бота к этой группе/топику добавьте в `/etc/amnezia/amneziawg/bot.env`:\n"
-                            f"```env\nGROUP_ID=\"{chat_id}\"\nTOPIC_ID=\"{thread_id or ''}\"\n```",
-                            message_thread_id=thread_id
+                            f"ℹ️ <b>Информация о чате и топике:</b>\n\n"
+                            f"• <b>Чат:</b> <code>{html.escape(title)}</code>\n"
+                            f"• <b>Тип чата:</b> <code>{html.escape(chat_type)}</code>\n"
+                            f"• <b>GROUP_ID (chat_id):</b> <code>{html.escape(chat_id)}</code>\n"
+                            f"• <b>TOPIC_ID (thread_id):</b> <code>{html.escape(t_id_str)}</code>\n"
+                            f"• <b>Ваш User ID:</b> <code>{html.escape(from_id)}</code>",
+                            message_thread_id=thread_id,
                         )
                         continue
 
-                    # Проверка прав доступа к боту
                     ok, err = check_access(chat_id, from_id, thread_id)
                     if not ok:
-                        if chat_id == from_id or text.startswith("/"):
+                        if chat_id == from_id:
                             send_message(chat_id, err, message_thread_id=thread_id)
                         continue
 
                     user_key = f"{chat_id}_{from_id}"
-                    state = USER_STATE.get(user_key)
-                    if state == "waiting_client_name" and text and not text.startswith("/"):
+                    if cmd_head == "/cancel":
+                        USER_STATE.pop(user_key, None)
+                        handle_start(chat_id, from_id=from_id, thread_id=thread_id)
+                        continue
+
+                    state = get_state(user_key)
+                    if state == "waiting_client_name" and not text.startswith("/"):
                         handle_create_client(chat_id, from_id, text, thread_id=thread_id)
                         continue
 
-                    cmd = text.split("@")[0].lower() if "@" in text else text.lower()
-                    if cmd in ("/start", "/menu"):
+                    parts = text.split(None, 1)
+                    arg = parts[1].strip() if len(parts) > 1 else ""
+
+                    if cmd_head in ("/start", "/menu"):
                         handle_start(chat_id, from_id=from_id, thread_id=thread_id)
-                    elif cmd in ("/clients", "/list"):
+                    elif cmd_head in ("/clients", "/list"):
                         handle_list_clients(chat_id, thread_id=thread_id)
-                    elif cmd in ("/status",):
+                    elif cmd_head == "/status":
                         send_message(chat_id, get_server_stats(), message_thread_id=thread_id)
-                    elif cmd in ("/add",):
-                        handle_add_prompt(chat_id, from_id=from_id, thread_id=thread_id)
-                    elif cmd in ("/gemini", "/ai", "/openai", "/gpt"):
-                        handle_gemini_info(chat_id, thread_id=thread_id)
-                    elif cmd in ("/ru", "/bypass"):
-                        handle_ru_bypass(chat_id, thread_id=thread_id)
+                    elif cmd_head == "/diagnose":
+                        handle_diagnose(chat_id, thread_id=thread_id)
+                    elif cmd_head == "/add":
+                        if arg:
+                            handle_create_client(chat_id, from_id, arg, thread_id=thread_id)
+                        else:
+                            handle_add_prompt(chat_id, from_id=from_id, thread_id=thread_id)
+                    elif cmd_head == "/qr" and arg:
+                        handle_qr(chat_id, arg, thread_id=thread_id)
                     else:
                         if chat_id == from_id or text.startswith("/"):
                             handle_start(chat_id, from_id=from_id, thread_id=thread_id)
 
-                # Обработка инлайн-кнопок
                 elif "callback_query" in u:
                     cb = u["callback_query"]
                     cb_id = cb["id"]
@@ -682,7 +697,7 @@ def main_loop():
 
                     ok, err = check_access(chat_id, from_id, thread_id)
                     if not ok:
-                        answer_callback(cb_id, err or "⛔ Доступ запрещён", alert=True)
+                        answer_callback(cb_id, "⛔ Доступ запрещён", alert=True)
                         continue
 
                     answer_callback(cb_id)
@@ -695,44 +710,19 @@ def main_loop():
                         handle_add_prompt(chat_id, from_id=from_id, thread_id=thread_id)
                     elif data == "menu_status":
                         send_message(chat_id, get_server_stats(), message_thread_id=thread_id)
-                    elif data == "menu_gemini":
-                        handle_gemini_info(chat_id, thread_id=thread_id)
-                    elif data == "menu_ru_bypass":
-                        handle_ru_bypass(chat_id, thread_id=thread_id)
-                    elif data.startswith("qr_lan_"):
-                        name = data[7:]
-                        handle_qr_lan(chat_id, name, thread_id=thread_id)
+                    elif data == "menu_diagnose":
+                        handle_diagnose(chat_id, thread_id=thread_id)
                     elif data.startswith("qr_"):
-                        name = data[3:]
-                        handle_qr(chat_id, name, thread_id=thread_id)
+                        handle_qr(chat_id, data[3:], thread_id=thread_id)
                     elif data.startswith("del_"):
-                        name = data[4:]
-                        handle_delete_confirm(chat_id, name, thread_id=thread_id)
+                        handle_delete_confirm(chat_id, data[4:], thread_id=thread_id)
                     elif data.startswith("confirm_del_"):
-                        name = data[12:]
-                        handle_delete_exec(chat_id, name, thread_id=thread_id)
-                    elif data == "gemini_enable":
-                        send_message(chat_id, "⏳ Настраиваю обход AI (Gemini + ChatGPT) через Cloudflare WARP...", message_thread_id=thread_id)
-                        ok, out = run_manager_cmd("warp-enable")
-                        send_message(chat_id, "✅ Обход AI (Gemini + ChatGPT) включён!" if ok else f"❌ Ошибка:\n{out[-300:]}", message_thread_id=thread_id)
-                        handle_gemini_info(chat_id, thread_id=thread_id)
-                    elif data == "gemini_disable":
-                        send_message(chat_id, "⏳ Отключаю обход AI...", message_thread_id=thread_id)
-                        ok, out = run_manager_cmd("warp-disable")
-                        send_message(chat_id, "⚪ Обход AI выключен." if ok else f"❌ Ошибка:\n{out[-300:]}", message_thread_id=thread_id)
-                        handle_gemini_info(chat_id, thread_id=thread_id)
-                    elif data == "gemini_test":
-                        send_message(chat_id, "⏳ Тестирую доступ к Google Gemini и OpenAI через туннель...", message_thread_id=thread_id)
-                        ok, out = run_manager_cmd("warp-test")
-                        send_message(chat_id, out, message_thread_id=thread_id)
+                        handle_delete_exec(chat_id, data[12:], thread_id=thread_id)
 
         except Exception as e:
-            print(f"Ошибка в цикле polling: {e}", file=sys.stderr)
+            print(f"Ошибка в цикле polling: {redact(e)}", file=sys.stderr)
             time.sleep(3)
 
-        except Exception as e:
-            print(f"Ошибка в цикле polling: {e}", file=sys.stderr)
-            time.sleep(3)
 
 if __name__ == "__main__":
     main_loop()
