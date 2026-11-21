@@ -25,7 +25,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   die "Этот скрипт должен быть запущен с правами root (sudo bash $0)"
 fi
 
-VERSION="3.2.0"
+VERSION="3.2.1"
 REPO_URL="${RAW_BASE_URL:-https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main}"
 
 printf '%b' "$C_CYAN$C_BOLD"

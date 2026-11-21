@@ -22,7 +22,7 @@ fi
 set -Eeuo pipefail
 
 #--- конфигурация --------------------------------------------------------------
-AWG_MANAGER_VERSION="3.2.0"
+AWG_MANAGER_VERSION="3.2.1"
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_DNS="${AWG_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
