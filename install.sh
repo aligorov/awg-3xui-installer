@@ -275,6 +275,37 @@ detect_public_ipv6() {
     return 0
   fi
 
+  # 5. Авто-поиск и подъём IPv6 для ЛЮБОГО случайного VPS (SLAAC RS / IMDS / cloud-init / netplan)
+  local wan_dev
+  wan_dev="$(detect_wan_iface || true)"
+  wan_dev="${wan_dev:-eth0}"
+  if [ -n "$wan_dev" ] && command -v python3 >/dev/null 2>&1; then
+    local py_cand
+    py_cand="$(python3 - "$wan_dev" <<'PY'
+import sys, os
+wan = sys.argv[1]
+for api_p in ["/etc/amnezia/awg-api/api.py", "/usr/local/bin/awg-api"]:
+    if os.path.isfile(api_p):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("awg_api", api_p)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            v6, _, _, _ = mod.detect_public_ips_with_diag()
+            if v6:
+                print(v6)
+                sys.exit(0)
+        except Exception:
+            pass
+sys.exit(1)
+PY
+)" 2>/dev/null || true
+    if [ -n "$py_cand" ]; then
+      printf '%s\n' "$py_cand"
+      return 0
+    fi
+  fi
+
   return 1
 }
 

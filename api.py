@@ -662,6 +662,177 @@ def _upgrade_temporary_v6(ifname, ip_norm, recs):
     return perms[0]["ip"]
 
 
+def _solicit_router_ra(wan_dev):
+    """Шлёт Router Solicitation на WAN чтобы заставить шлюз датацентра прислать RA с префиксом IPv6."""
+    if not wan_dev:
+        return
+    try:
+        subprocess.run(
+            ["ping6", "-c", "1", "-w", "1", f"ff02::2%{wan_dev}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["rdisc6", "-m", wan_dev],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+
+def _discover_cloud_ipv6():
+    """Ищет выделенный провайдером IPv6 в cloud-init, IMDS метаданных и netplan."""
+    # 1. IMDS OpenStack network_data.json
+    try:
+        req = urllib.request.Request(
+            "http://169.254.169.254/openstack/latest/network_data.json",
+            headers={"User-Agent": "cloud-init"},
+        )
+        with urllib.request.urlopen(req, timeout=1.0) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            for net in data.get("networks", []):
+                ip = normalize_public_ipv6(net.get("ip_address", ""))
+                if ip:
+                    gw = ""
+                    for route in net.get("routes", []):
+                        if route.get("network") in ("::", "::/0", "default"):
+                            gw = normalize_public_ipv6(route.get("gateway", ""))
+                    return ip, int(net.get("netmask", 64) or 64), gw, "imds_openstack"
+    except Exception:
+        pass
+
+    # 2. IMDS DigitalOcean metadata v1
+    try:
+        req = urllib.request.Request(
+            "http://169.254.169.254/metadata/v1.json",
+            headers={"User-Agent": "cloud-init"},
+        )
+        with urllib.request.urlopen(req, timeout=1.0) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            for iface in data.get("interfaces", {}).get("public", []):
+                v6 = iface.get("ipv6", {})
+                ip = normalize_public_ipv6(v6.get("ip_address", ""))
+                if ip:
+                    gw = normalize_public_ipv6(v6.get("gateway", ""))
+                    plen = int(v6.get("netmask", 64) or 64)
+                    return ip, plen, gw, "imds_digitalocean"
+    except Exception:
+        pass
+
+    # 3. cloud-init cached data
+    for p in ["/run/cloud-init/instance-data.json", "/var/lib/cloud/instance/instance-data.json"]:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    txt = f.read()
+                try:
+                    cdata = json.loads(txt)
+                    net_cfg = cdata.get("v1", {}).get("network_config", {}).get("config", [])
+                    for item in net_cfg:
+                        for sub in item.get("subnets", []):
+                            ip = normalize_public_ipv6(sub.get("address", ""))
+                            if ip:
+                                plen = int(sub.get("netmask", 64) if str(sub.get("netmask", "")).isdigit() else 64)
+                                gw = normalize_public_ipv6(sub.get("gateway", ""))
+                                return ip, plen, gw, "cloud_init_json"
+                except Exception:
+                    pass
+                for m in re.finditer(r"\b(2[0-9a-fA-F]{3}:[0-9a-fA-F:]+)(?:/(\d+))?\b", txt):
+                    cand = normalize_public_ipv6(m.group(1))
+                    if cand and not cand.endswith("::1"):
+                        plen = int(m.group(2)) if m.group(2) else 64
+                        gw_m = re.search(r"(?:gateway6|via|gateway)\s*[:=]\s*[\"'\''\s]*([23][0-9a-fA-F:]+)", txt)
+                        gw = normalize_public_ipv6(gw_m.group(1)) if gw_m else ""
+                        return cand, plen, gw, "cloud_init_regex"
+            except Exception:
+                pass
+
+    # 4. netplan yaml
+    for p in glob.glob("/etc/netplan/*.yaml") + glob.glob("/etc/netplan/*.yml"):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                txt = f.read()
+            for m in re.finditer(r"\b(2[0-9a-fA-F]{3}:[0-9a-fA-F:]+)(?:/(\d+))?\b", txt):
+                cand = normalize_public_ipv6(m.group(1))
+                if cand and not cand.endswith("::1"):
+                    plen = int(m.group(2)) if m.group(2) else 64
+                    gw_m = re.search(r"(?:gateway6|via|gateway)\s*[:=]\s*[\"'\''\s]*([23][0-9a-fA-F:]+)", txt)
+                    gw = normalize_public_ipv6(gw_m.group(1)) if gw_m else ""
+                    return cand, plen, gw, "netplan_file"
+        except Exception:
+            pass
+
+    # 5. interfaces
+    for p in ["/etc/network/interfaces"] + glob.glob("/etc/network/interfaces.d/*"):
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    txt = f.read()
+                m = re.search(r"address\s+([23][0-9a-fA-F:]+)(?:/(\d+))?", txt)
+                if m:
+                    cand = normalize_public_ipv6(m.group(1))
+                    if cand:
+                        plen = int(m.group(2)) if m.group(2) else 64
+                        gw_m = re.search(r"gateway\s+([23][0-9a-fA-F:]+)", txt)
+                        gw = normalize_public_ipv6(gw_m.group(1)) if gw_m else ""
+                        return cand, plen, gw, "interfaces_file"
+            except Exception:
+                pass
+
+    return "", 0, "", "not_found"
+
+
+def _activate_discovered_ipv6(ip, plen, gw, wan_dev):
+    """Поднимает обнаруженный в облачных метаданных IPv6 на WAN интерфейсе."""
+    if not ip or not wan_dev:
+        return False
+    plen = plen or 64
+    try:
+        subprocess.run(
+            ["ip", "-6", "addr", "add", f"{ip}/{plen}", "dev", wan_dev],
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except Exception:
+        pass
+    if gw:
+        try:
+            subprocess.run(
+                ["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan_dev],
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception:
+            pass
+    if os.path.isdir("/etc/netplan"):
+        np_path = "/etc/netplan/60-awg-ipv6.yaml"
+        if not os.path.isfile(np_path):
+            routes_block = f"      routes:\n        - to: default\n          via: {gw}\n" if gw else ""
+            content = (
+                "network:\n"
+                "  version: 2\n"
+                "  ethernets:\n"
+                f"    {wan_dev}:\n"
+                "      addresses:\n"
+                f"        - {ip}/{plen}\n"
+                f"{routes_block}"
+            )
+            try:
+                with open(np_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                os.chmod(np_path, 0o600)
+                subprocess.run(["netplan", "apply"], stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
+    return True
+
+
 def _probe_external_ipv6(iface_or_ip="", max_urls=4):
     urls = (
         "https://api6.ipify.org",
@@ -751,6 +922,22 @@ def _detect_public_ipv6_with_diag():
         if ext_v6:
             return ext_v6, local_ips, "ok"
         return "", local_ips, "no_egress"
+
+    # Автоматический поиск и подъём IPv6 для ЛЮБОГО случайного VPS (SLAAC / IMDS / cloud-init / netplan)
+    primary_wan = wan4_devs[0] if wan4_devs else ("eth0" if os.path.exists("/sys/class/net/eth0") else "")
+    if primary_wan:
+        _solicit_router_ra(primary_wan)
+        time.sleep(0.3)
+        recs_after = _collect_local_public_ipv6()
+        if recs_after:
+            ext_v6 = _probe_external_ipv6()
+            return ext_v6 or recs_after[0]["ip"], [r["ip"] for r in recs_after], "ok"
+
+        disc_ip, disc_plen, disc_gw, disc_src = _discover_cloud_ipv6()
+        if disc_ip:
+            _activate_discovered_ipv6(disc_ip, disc_plen, disc_gw, primary_wan)
+            ext_v6 = _probe_external_ipv6()
+            return ext_v6 or disc_ip, [disc_ip], "discovered_" + disc_src
 
     return "", [], "no_interface_ipv6"
 
