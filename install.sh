@@ -441,15 +441,21 @@ get_current_preset() {
 }
 
 preset_title() {
-  case "$1" in
-    quic)     printf 'HTTP/3 (QUIC) — 443/udp (маскировка под YouTube / HTTPS)' ;;
-    stun)     printf 'WebRTC / STUN — 3478/udp (маскировка под Telegram / WhatsApp звонки)' ;;
-    stun-alt) printf 'WebRTC / STUN (Alt) — 20000-50000/udp со STUN Magic Cookie' ;;
-    dns)      printf 'DNS (EDNS0) — 53/udp (маскировка под DNS-запросы ya.ru)' ;;
-    steam)    printf 'Игровой (Steam) — 27015/udp (опрос серверов CS2/Steam A2S)' ;;
-    custom)   printf 'Пользовательский (ручной порт и I1)' ;;
-    *)        printf 'HTTP/3 (QUIC) — 443/udp' ;;
+  local p="${1:-quic}" actual_port="${2:-}" def_port="" desc="" alt_desc=""
+  case "$p" in
+    quic)     def_port="443";   desc="HTTP/3 (QUIC) — 443/udp (маскировка под YouTube / HTTPS)"; alt_desc="HTTP/3 (QUIC) — %s/udp (QUIC-маскировка; базовый порт 443/udp)" ;;
+    stun)     def_port="3478";  desc="WebRTC / STUN — 3478/udp (маскировка под Telegram / WhatsApp звонки)"; alt_desc="WebRTC / STUN — %s/udp (STUN-маскировка; базовый порт 3478/udp)" ;;
+    stun-alt) def_port="";      desc="WebRTC / STUN (Alt) — 20000-50000/udp со STUN Magic Cookie"; alt_desc="WebRTC / STUN (Alt) — %s/udp со STUN Magic Cookie" ;;
+    dns)      def_port="53";    desc="DNS (EDNS0) — 53/udp (маскировка под DNS-запросы ya.ru)"; alt_desc="DNS (EDNS0) — %s/udp (DNS-маскировка; базовый порт 53/udp)" ;;
+    steam)    def_port="27015"; desc="Игровой (Steam) — 27015/udp (опрос серверов CS2/Steam A2S)"; alt_desc="Игровой (Steam) — %s/udp (Steam A2S; базовый 27015/udp)" ;;
+    custom)   def_port="";      desc="Пользовательский (ручной порт и I1)"; alt_desc="Пользовательский — %s/udp (ручной порт и I1)" ;;
+    *)        def_port="443";   desc="HTTP/3 (QUIC) — 443/udp"; alt_desc="HTTP/3 (QUIC) — %s/udp" ;;
   esac
+  if [ -n "$actual_port" ] && [ "$actual_port" != "-" ] && [ "$actual_port" != "$def_port" ]; then
+    printf "$alt_desc" "$actual_port"
+  else
+    printf '%s' "$desc"
+  fi
 }
 
 cps_i1() {
@@ -660,7 +666,7 @@ notify_rotation_tg() {
   local new_port="$2"
   local old_port="${3:-}"
   local p_title
-  p_title="$(preset_title "$p_name")"
+  p_title="$(preset_title "$p_name" "$new_port")"
 
   [ -r "$BOT_ENV" ] || return 0
 
@@ -1446,7 +1452,11 @@ EOF
   local tok
   tok="$(ensure_client_token "$name")"
   local ep_pub="${endpoint:-$(detect_public_ip || true)}"
-  local sub_url="http://${ep_pub}:${AWG_API_PORT}/sub/${tok}"
+  local api_ep_host="$ep_pub"
+  if [[ "$api_ep_host" =~ : ]] && [[ ! "$api_ep_host" =~ ^\[ ]]; then
+    api_ep_host="[${api_ep_host}]"
+  fi
+  local sub_url="http://${api_ep_host}:${AWG_API_PORT}/sub/${tok}"
 
   release_lock
   step "Клиент '$name' ($ip) успешно создан!"
@@ -1742,8 +1752,10 @@ do_status() {
   else
     printf '  Сервис awg-quick:  %b🔴 Остановлен%b\n' "$C_RED" "$C_RESET"
   fi
-  printf '  ListenPort:        %s/udp\n' "$(conf_get ListenPort "$conf")"
-  printf '  Маскировка:        %b%s%b\n' "$C_CYAN" "$(preset_title "$(get_current_preset)")" "$C_RESET"
+  local srv_port
+  srv_port="$(conf_get ListenPort "$conf")"
+  printf '  ListenPort:        %s/udp\n' "$srv_port"
+  printf '  Маскировка:        %b%s%b\n' "$C_CYAN" "$(preset_title "$(get_current_preset)" "$srv_port")" "$C_RESET"
   local srv_addr
   srv_addr="$(conf_get Address "$conf")"
   if printf '%s' "$srv_addr" | grep -q ':'; then
@@ -1755,9 +1767,17 @@ do_status() {
   fi
   printf '  Клиентов в базе:   %s\n' "$(grep -c '^\[Peer\]' "$conf" || true)"
 
-  local cur_ep=""
+  local cur_ep="" cf_ep
   if [ -f "$AWG_DIR/client1.conf" ]; then
     cur_ep="$(conf_get Endpoint "$AWG_DIR/client1.conf" || true)"
+  fi
+  if [ -z "$cur_ep" ]; then
+    for cf_ep in "$AWG_DIR"/*.conf; do
+      [ -f "$cf_ep" ] || continue
+      [ "$cf_ep" != "$AWG_DIR/$AWG_IFACE.conf" ] || continue
+      cur_ep="$(conf_get Endpoint "$cf_ep" || true)"
+      [ -n "$cur_ep" ] && break
+    done
   fi
   local pub4 pub6
   pub4="$(detect_public_ip || true)"
@@ -2128,6 +2148,8 @@ do_switch_endpoint() {
     [ -f "$cf" ] || continue
     [ "$cf" != "$AWG_DIR/$AWG_IFACE.conf" ] || continue
     sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${formatted_ep}|" "$cf"
+    qrencode -o "${cf%.conf}.png" -s 6 -m 2 < "$cf" 2>/dev/null || true
+    chmod 600 "${cf%.conf}.png" 2>/dev/null || true
     touch "$cf"
     count=$((count + 1))
   done
@@ -2339,7 +2361,7 @@ EOF
 
   printf '\n%b============================================================%b\n' "$C_GREEN" "$C_RESET"
   printf '  %bСерверный туннель AmneziaWG успешно обновлен!%b\n' "$C_BOLD" "$C_RESET"
-  printf '  Профиль маскировки:  %s\n' "$(preset_title "$p_name")"
+  printf '  Профиль маскировки:  %s\n' "$(preset_title "$p_name" "$new_port")"
   printf '  Слушающий UDP-порт:  %s/udp\n' "$new_port"
   printf '  Все клиенты с токенами подхватят новый конфиг автоматически.\n'
   printf '%b============================================================%b\n\n' "$C_GREEN" "$C_RESET"
@@ -2437,7 +2459,7 @@ do_preset() {
     printf '\n%b=== Смена профиля маскировки туннеля (Stealth Presets) ===%b\n' "$C_CYAN$C_BOLD" "$C_RESET"
     local cur_p
     cur_p="$(get_current_preset)"
-    printf 'Текущий активный профиль сервера: %b%s%b\n\n' "$C_GREEN$C_BOLD" "$(preset_title "$cur_p")" "$C_RESET"
+    printf 'Текущий активный профиль сервера: %b%s%b\n\n' "$C_GREEN$C_BOLD" "$(preset_title "$cur_p" "$(conf_get ListenPort "$conf")")" "$C_RESET"
     printf 'Выберите профиль маскировки трафика:\n'
     printf '  1) HTTP/3 (QUIC)      — 443/udp   (маскировка под YouTube / HTTPS) [По умолчанию]\n'
     printf '  2) WebRTC / STUN      — 3478/udp  (маскировка под Telegram / WhatsApp звонки)\n'
@@ -2849,7 +2871,7 @@ show_menu() {
     printf '  %bAmneziaWG 3.1 — Панель управления сервером%b\n' "$C_BOLD" "$C_RESET"
     printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
     printf '  Туннель awg0:  %s (%s/udp, %s, клиентов: %s)\n' "$srv_status" "$port" "$subnet" "$count"
-    printf '  Маскировка:    %b%s%b\n' "$C_GREEN" "$(preset_title "$cur_preset")" "$C_RESET"
+    printf '  Маскировка:    %b%s%b\n' "$C_GREEN" "$(preset_title "$cur_preset" "$port")" "$C_RESET"
     printf '  Telegram-бот:  %b%s%b\n' "$C_CYAN" "$bot_status" "$C_RESET"
     printf '  API подписок:  %b%s%b\n' "$C_CYAN" "$api_status" "$C_RESET"
     printf '  Шедулер:       %b%s%b\n' "$C_CYAN" "$sched_status" "$C_RESET"
