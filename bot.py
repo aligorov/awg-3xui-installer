@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 AmneziaWG 3.1 Telegram Management Bot (Hardened Standard Edition).
-Управление клиентами (0.0.0.0/0), генерация QR-кодов, мониторинг и самодиагностика.
+Управление клиентами (0.0.0.0/0), генерация QR-кодов, мониторинг,
+ротация сервера, управление токенами и самодиагностика.
 Не требует внешних pip-библиотек (чистый Python 3 стандартной библиотеки).
 """
 
@@ -21,7 +22,9 @@ from pathlib import Path
 AWG_DIR = "/etc/amnezia/amneziawg"
 AWG_IFACE = "awg0"
 ENV_FILE = f"{AWG_DIR}/bot.env"
+TOKENS_FILE = f"{AWG_DIR}/tokens.json"
 MANAGER_BIN = "/usr/local/bin/awg-manager"
+API_PORT = os.environ.get("AWG_API_PORT", "8443")
 
 CLIENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 RESERVED_NAMES = {"awg0", "warp0", "server", "default"}
@@ -38,7 +41,7 @@ def load_env():
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip().strip("'\"")
-    for k in ("BOT_TOKEN", "ADMIN_ID", "GROUP_ID", "TOPIC_ID"):
+    for k in ("BOT_TOKEN", "ADMIN_ID", "GROUP_ID", "TOPIC_ID", "AWG_API_PORT"):
         if k in os.environ:
             env[k] = os.environ[k]
     return env
@@ -53,6 +56,7 @@ ADMIN_IDS = [
 ]
 GROUP_ID = str(ENV.get("GROUP_ID", "")).strip()
 TOPIC_ID = str(ENV.get("TOPIC_ID", "")).strip()
+API_PORT = str(ENV.get("AWG_API_PORT", API_PORT)).strip()
 
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
@@ -264,6 +268,48 @@ def format_time_ago(ts):
     return f"{diff // 86400} дн назад"
 
 
+def get_client_token(name):
+    if not is_valid_client_name(name):
+        return None
+    if os.path.exists(TOKENS_FILE):
+        try:
+            with open(TOKENS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and name in data:
+                    cdata = data[name]
+                    if isinstance(cdata, dict) and cdata.get("token"):
+                        return cdata["token"]
+                    elif isinstance(cdata, str) and cdata.startswith("awg_tok_"):
+                        return cdata
+        except Exception:
+            pass
+
+    ok, out = run_manager_cmd("token", name)
+    if ok:
+        m = re.search(r"awg_tok_[a-f0-9]{32,64}", out)
+        if m:
+            return m.group(0)
+    return None
+
+
+def get_public_endpoint():
+    conf1 = f"{AWG_DIR}/client1.conf"
+    if os.path.exists(conf1):
+        try:
+            with open(conf1, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("Endpoint") and "=" in line:
+                        ep = line.split("=", 1)[1].strip()
+                        host = ep.split(":")[0].strip("[]")
+                        if host:
+                            return host
+        except Exception:
+            pass
+    if "AWG_ENDPOINT" in os.environ and os.environ["AWG_ENDPOINT"]:
+        return os.environ["AWG_ENDPOINT"].split(":")[0].strip("[]")
+    return "YOUR_SERVER_IP"
+
+
 def parse_awg_clients():
     conf_file = f"{AWG_DIR}/{AWG_IFACE}.conf"
     if not os.path.exists(conf_file):
@@ -368,6 +414,23 @@ def get_server_stats():
     total_rx = sum(c["rx"] for c in clients)
     total_tx = sum(c["tx"] for c in clients)
 
+    # Статус таймера авто-ротации
+    sched_str = "Выкл"
+    try:
+        sched_act = (
+            subprocess.run(
+                ["systemctl", "is-active", "awg-rotate.timer"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            == "active"
+        )
+        if sched_act:
+            sched_str = "🟢 Активен (шедулер)"
+    except Exception:
+        pass
+
     status_icon = "🟢 Активен" if active else "🔴 Остановлен"
     proto_str = "AmneziaWG 3.1 (HPK + CPS)" if has_31 else "AmneziaWG"
     if has_dc:
@@ -378,6 +441,8 @@ def get_server_stats():
         f"• Сервис: {status_icon}\n"
         f"• Интерфейс: <code>{html.escape(AWG_IFACE)}</code> ({html.escape(port)}/udp)\n"
         f"• Профиль: <code>{html.escape(proto_str)}</code>\n"
+        f"• Авто-ротация: <b>{html.escape(sched_str)}</b>\n"
+        f"• API подписок: <code>:{html.escape(API_PORT)}</code>\n"
         f"• Клиенты: <b>{len(clients)}</b> (🟢 <b>{online_count} онлайн</b>)\n"
         f"• Трафик клиентов: ↓ {html.escape(format_bytes(total_tx))} / ↑ {html.escape(format_bytes(total_rx))}\n"
     )
@@ -399,7 +464,7 @@ def run_manager_cmd(action, arg=""):
     env = os.environ.copy()
     env["AWGM_PLAIN"] = "1"
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env)
         combined = strip_ansi((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else ""))
         return proc.returncode == 0, combined.strip()
     except Exception as e:
@@ -410,15 +475,19 @@ def handle_start(chat_id, from_id=None, thread_id=None):
     if from_id:
         USER_STATE.pop(f"{chat_id}_{from_id}", None)
     text = (
-        "🛡 <b>AmneziaWG 3.1 — Стандартный VPN-сервер</b>\n\n"
-        "Нативный модуль ядра (DKMS) с маскировкой под QUIC и защитой заголовков 3.1.\n"
+        "🛡 <b>AmneziaWG 3.1 — Защищённый VPN-сервер</b>\n\n"
+        "Нативный модуль ядра с защитой от ТСПУ (QUIC мимикрия, HPK, DisableCookies).\n"
         "Весь трафик клиентов идёт через туннель (<code>0.0.0.0/0</code>).\n\n"
-        "Выберите действие:"
+        "⚡ <b>Автоматическое обновление:</b> клиенты в контейнерах MikroTik обновляются по постоянным токенам при ротации сервера."
     )
     markup = {
         "inline_keyboard": [
             [{"text": "➕ Добавить клиента", "callback_data": "menu_add"}],
             [{"text": "👥 Список клиентов", "callback_data": "menu_list"}],
+            [
+                {"text": "🔄 Ротация сервера", "callback_data": "menu_rotate"},
+                {"text": "⏱ Авто-шедулер", "callback_data": "menu_schedule"},
+            ],
             [
                 {"text": "📊 Статус", "callback_data": "menu_status"},
                 {"text": "🩺 Диагностика", "callback_data": "menu_diagnose"},
@@ -454,8 +523,9 @@ def handle_list_clients(chat_id, thread_id=None):
         if is_valid_client_name(name) and len(f"confirm_del_{name}".encode("utf-8")) <= 64:
             keyboard.append(
                 [
-                    {"text": f"📱 QR / Конфиг: {name}", "callback_data": f"qr_{name}"},
-                    {"text": "❌ Удалить", "callback_data": f"del_{name}"},
+                    {"text": f"📱 QR: {name}", "callback_data": f"qr_{name}"},
+                    {"text": f"🔑 Токен: {name}", "callback_data": f"tok_{name}"},
+                    {"text": "❌", "callback_data": f"del_{name}"},
                 ]
             )
 
@@ -497,7 +567,12 @@ def handle_qr(chat_id, name, thread_id=None):
         f"Сканируйте QR-код в приложении <b>Amnezia &gt;= 5.0.1.5</b> или импортируйте файл <code>{html.escape(name)}.conf</code>."
     )
 
-    markup = {"inline_keyboard": [[{"text": "👥 К списку клиентов", "callback_data": "menu_list"}]]}
+    markup = {
+        "inline_keyboard": [
+            [{"text": f"🔑 Токен подписки: {name}", "callback_data": f"tok_{name}"}],
+            [{"text": "👥 К списку клиентов", "callback_data": "menu_list"}],
+        ]
+    }
 
     if png_path.exists():
         send_photo(chat_id, png_path.read_bytes(), caption=caption, reply_markup=markup, message_thread_id=thread_id)
@@ -511,12 +586,43 @@ def handle_qr(chat_id, name, thread_id=None):
     )
 
 
+def handle_token_info(chat_id, name, thread_id=None):
+    if not is_valid_client_name(name):
+        send_message(chat_id, "❌ Некорректное имя клиента.", message_thread_id=thread_id)
+        return
+
+    token = get_client_token(name)
+    if not token:
+        send_message(chat_id, f"❌ Не удалось получить токен для <code>{html.escape(name)}</code>.", message_thread_id=thread_id)
+        return
+
+    pub_ip = get_public_endpoint()
+    sub_url = f"http://{pub_ip}:{API_PORT}/sub/{token}"
+    vpn_url = f"http://{pub_ip}:{API_PORT}/vpn/{token}"
+
+    text = (
+        f"🔑 <b>Данные подписки клиента:</b> <code>{html.escape(name)}</code>\n\n"
+        f"• <b>Токен для контейнера:</b>\n<code>{html.escape(token)}</code>\n\n"
+        f"• <b>Ссылка подписки (.conf):</b>\n<code>{html.escape(sub_url)}</code>\n\n"
+        f"• <b>Ссылка Amnezia (vpn://):</b>\n<code>{html.escape(vpn_url)}</code>\n\n"
+        f"💡 Вставьте токен в веб-интерфейсе контейнера AmneziaWG на роутере MikroTik. "
+        f"При ротации сервера этот токен останется прежним, и клиент обновится автоматически."
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "📱 QR / Конфиг", "callback_data": f"qr_{name}"}],
+            [{"text": "👥 К списку клиентов", "callback_data": "menu_list"}],
+        ]
+    }
+    send_message(chat_id, text, markup, message_thread_id=thread_id)
+
+
 def handle_add_prompt(chat_id, from_id, thread_id=None):
     set_state(f"{chat_id}_{from_id}", "waiting_client_name")
     text = (
         "➕ <b>Добавление нового клиента</b>\n\n"
         "Отправьте имя клиента сообщением в чат.\n"
-        "Допустимы латинские буквы, цифры, дефис и подчёркивание (1–32 символа, например: <code>phone</code>, <code>user_2</code>).\n\n"
+        "Допустимы латинские буквы, цифры, дефис и подчёркивание (1–32 символа, например: <code>phone</code>, <code>mikrotik</code>).\n\n"
         "Для отмены отправьте /cancel или нажмите кнопку ниже:"
     )
     markup = {"inline_keyboard": [[{"text": "« Отмена", "callback_data": "menu_main"}]]}
@@ -537,7 +643,16 @@ def handle_create_client(chat_id, from_id, name, thread_id=None):
     send_message(chat_id, f"⏳ Создаю клиента <code>{html.escape(name)}</code>...", message_thread_id=thread_id)
     ok, out = run_manager_cmd("add-client", name)
     if ok:
-        send_message(chat_id, f"✅ Клиент <code>{html.escape(name)}</code> успешно добавлен!", message_thread_id=thread_id)
+        tok = get_client_token(name)
+        pub_ip = get_public_endpoint()
+        sub_info = ""
+        if tok:
+            sub_url = f"http://{pub_ip}:{API_PORT}/sub/{tok}"
+            sub_info = (
+                f"\n\n🔑 <b>Токен для вебки контейнера:</b>\n<code>{html.escape(tok)}</code>\n"
+                f"🌐 <b>Ссылка подписки:</b>\n<code>{html.escape(sub_url)}</code>"
+            )
+        send_message(chat_id, f"✅ Клиент <code>{html.escape(name)}</code> успешно добавлен!{sub_info}", message_thread_id=thread_id)
         handle_qr(chat_id, name, thread_id=thread_id)
     else:
         err_tail = html.escape(out[-600:])
@@ -555,7 +670,7 @@ def handle_delete_confirm(chat_id, name, thread_id=None):
 
     text = (
         f"⚠️ <b>Вы действительно хотите удалить клиента <code>{html.escape(name)}</code>?</b>\n"
-        f"После удаления доступ через этот ключ будет немедленно отозван."
+        f"После удаления доступ через этот ключ и токен будет немедленно отозван."
     )
     markup = {
         "inline_keyboard": [
@@ -594,6 +709,76 @@ def handle_diagnose(chat_id, thread_id=None):
     send_message(chat_id, f"{prefix}<pre>{snippet}</pre>", markup, message_thread_id=thread_id)
 
 
+def handle_rotate_prompt(chat_id, thread_id=None):
+    text = (
+        "⚠️ <b>Перегенерация сервера AmneziaWG 3.1</b>\n\n"
+        "Будут обновлены:\n"
+        "• Случайный UDP-порт (уход из-под бана порта ТСПУ)\n"
+        "• HeaderProtectionKey, CPS I1, S1–S4 и ключи шифрования\n\n"
+        "⚡ <b>Клиенты с токенами (MikroTik контейнеры) обновятся автоматически!</b>\n"
+        "Ручные клиенты (смартфоны) потребуют скачивания нового QR-кода.\n\n"
+        "Вы действительно хотите выполнить ротацию?"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "🔄 Да, выполнить ротацию", "callback_data": "confirm_rotate"}],
+            [{"text": "« Отмена", "callback_data": "menu_main"}],
+        ]
+    }
+    send_message(chat_id, text, markup, message_thread_id=thread_id)
+
+
+def handle_rotate_exec(chat_id, thread_id=None):
+    send_message(chat_id, "⏳ Выполняю перегенерацию сервера и обновление клиентов...", message_thread_id=thread_id)
+    ok, out = run_manager_cmd("rotate")
+    snippet = html.escape(out[-3000:]) if out else "Нет вывода"
+    if ok:
+        prefix = "✅ <b>Ротация AmneziaWG 3.1 успешно выполнена!</b>\n"
+    else:
+        prefix = "❌ <b>Ошибка ротации сервера:</b>\n"
+    markup = {"inline_keyboard": [[{"text": "« Главное меню", "callback_data": "menu_main"}]]}
+    send_message(chat_id, f"{prefix}<pre>{snippet}</pre>", markup, message_thread_id=thread_id)
+
+
+def handle_schedule_menu(chat_id, thread_id=None):
+    ok, out = run_manager_cmd("schedule", "status")
+    active_str = "Выключено"
+    if "Active: active" in out:
+        if "3days" in out or "01,04" in out:
+            active_str = "🟢 Раз в 3 дня (04:00)"
+        elif "daily" in out:
+            active_str = "🟢 Каждый день (04:00)"
+        elif "weekly" in out or "Sun" in out:
+            active_str = "🟢 Раз в неделю (04:00)"
+        else:
+            active_str = "🟢 Включено"
+
+    text = (
+        "⏱ <b>Автоматическая ротация сервера AmneziaWG</b>\n\n"
+        "Сервер ночью сам меняет порт, ключи и сигнатуры обфускации, чтобы ТСПУ не успевал наложить блокировку.\n"
+        "Клиенты с токенами (MikroTik) обновляются на лету.\n\n"
+        f"Текущее расписание: <b>{html.escape(active_str)}</b>\n\n"
+        "Выберите интервал:"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "📅 Каждые 3 дня (04:00) [Рекомендуется]", "callback_data": "sched_3days"}],
+            [{"text": "📅 Раз в неделю (04:00)", "callback_data": "sched_weekly"}],
+            [{"text": "📅 Каждый день (04:00)", "callback_data": "sched_daily"}],
+            [{"text": "⛔ Отключить таймер", "callback_data": "sched_off"}],
+            [{"text": "« Главное меню", "callback_data": "menu_main"}],
+        ]
+    }
+    send_message(chat_id, text, markup, message_thread_id=thread_id)
+
+
+def handle_schedule_set(chat_id, mode, thread_id=None):
+    ok, out = run_manager_cmd("schedule", mode)
+    msg = html.escape(out[-600:]) if out else "Готово"
+    send_message(chat_id, f"⏱ {msg}", message_thread_id=thread_id)
+    handle_schedule_menu(chat_id, thread_id=thread_id)
+
+
 def main_loop():
     if not BOT_TOKEN or not ADMIN_IDS:
         print(
@@ -604,7 +789,7 @@ def main_loop():
 
     print(
         f"AmneziaWG Telegram Bot запущен. ADMIN_IDS: {len(ADMIN_IDS)}, "
-        f"GROUP_ID: {GROUP_ID or 'Все'}, TOPIC_ID: {TOPIC_ID or 'Все'}"
+        f"GROUP_ID: {GROUP_ID or 'Все'}, TOPIC_ID: {TOPIC_ID or 'Все'}, API_PORT: {API_PORT}"
     )
     offset = 0
     while True:
@@ -628,7 +813,6 @@ def main_loop():
 
                     cmd_head = text.split(None, 1)[0].split("@")[0].lower()
 
-                    # Служебная команда /id только для администраторов (помощь в настройке GROUP_ID / TOPIC_ID)
                     if cmd_head in ("/id", "/topic", "/chatid", "/thread"):
                         if not is_admin(from_id):
                             continue
@@ -675,6 +859,18 @@ def main_loop():
                         send_message(chat_id, get_server_stats(), message_thread_id=thread_id)
                     elif cmd_head == "/diagnose":
                         handle_diagnose(chat_id, thread_id=thread_id)
+                    elif cmd_head == "/rotate":
+                        handle_rotate_prompt(chat_id, thread_id=thread_id)
+                    elif cmd_head == "/schedule":
+                        if arg in ("3days", "weekly", "daily", "off"):
+                            handle_schedule_set(chat_id, arg, thread_id=thread_id)
+                        else:
+                            handle_schedule_menu(chat_id, thread_id=thread_id)
+                    elif cmd_head == "/token":
+                        if arg:
+                            handle_token_info(chat_id, arg, thread_id=thread_id)
+                        else:
+                            handle_list_clients(chat_id, thread_id=thread_id)
                     elif cmd_head == "/add":
                         if arg:
                             handle_create_client(chat_id, from_id, arg, thread_id=thread_id)
@@ -712,6 +908,16 @@ def main_loop():
                         send_message(chat_id, get_server_stats(), message_thread_id=thread_id)
                     elif data == "menu_diagnose":
                         handle_diagnose(chat_id, thread_id=thread_id)
+                    elif data == "menu_rotate":
+                        handle_rotate_prompt(chat_id, thread_id=thread_id)
+                    elif data == "confirm_rotate":
+                        handle_rotate_exec(chat_id, thread_id=thread_id)
+                    elif data == "menu_schedule":
+                        handle_schedule_menu(chat_id, thread_id=thread_id)
+                    elif data.startswith("sched_"):
+                        handle_schedule_set(chat_id, data[6:], thread_id=thread_id)
+                    elif data.startswith("tok_"):
+                        handle_token_info(chat_id, data[4:], thread_id=thread_id)
                     elif data.startswith("qr_"):
                         handle_qr(chat_id, data[3:], thread_id=thread_id)
                     elif data.startswith("del_"):

@@ -29,12 +29,15 @@ AWG_MTU="${AWG_MTU:-1280}"
 AWG_PORT="${AWG_PORT:-}"            # пусто -> 443/udp (или случайный 20000-59999 если занят)
 AWG_SUBNET="${AWG_SUBNET:-}"        # пусто -> случайный 10.x.y.0/24
 AWG_ENDPOINT="${AWG_ENDPOINT:-}"    # пусто -> автоопределение внешнего IPv4
+AWG_API_PORT="${AWG_API_PORT:-8443}"# порт HTTP API подписок для контейнеров MikroTik
 CRED_FILE="/root/awg-credentials.txt"
 BACKUP_DIR="/root/awg-backups"
 LOG_FILE="/var/log/awg-install.log"
 DBG_FILE="/var/log/awg-install.debug.log"
 LOCK_FILE="/run/lock/awg-manager.lock"
+TOKENS_FILE="/etc/amnezia/amneziawg/tokens.json"
 BOT_DIR="/opt/awg-bot"
+API_DIR="/opt/awg-api"
 BOT_ENV="/etc/amnezia/amneziawg/bot.env"
 RAW_BASE_URL="https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main"
 TMP_DIR=""
@@ -345,6 +348,159 @@ fetch_bot_script() {
   return 1
 }
 
+ensure_client_token() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  install -d -m 700 "$AWG_DIR"
+  [ -f "$TOKENS_FILE" ] || { echo "{}" > "$TOKENS_FILE"; chmod 600 "$TOKENS_FILE"; }
+
+  python3 - "$name" "$TOKENS_FILE" <<'PY'
+import sys, json, os, secrets, time
+
+name = sys.argv[1]
+tfile = sys.argv[2]
+data = {}
+try:
+    with open(tfile, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+entry = data.get(name)
+tok = None
+if isinstance(entry, dict) and entry.get("token"):
+    tok = entry["token"]
+elif isinstance(entry, str) and entry.startswith("awg_tok_"):
+    tok = entry
+
+if not tok:
+    tok = f"awg_tok_{secrets.token_hex(16)}"
+    data[name] = {"token": tok, "created_at": int(time.time())}
+    with open(tfile, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tfile, 0o600)
+
+print(tok)
+PY
+}
+
+get_client_token() {
+  local name="$1"
+  [ -f "$TOKENS_FILE" ] || return 1
+  python3 - "$name" "$TOKENS_FILE" <<'PY'
+import sys, json
+name = sys.argv[1]
+tfile = sys.argv[2]
+try:
+    with open(tfile, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and name in data:
+        entry = data[name]
+        tok = entry.get("token") if isinstance(entry, dict) else entry
+        if tok:
+            print(tok)
+            sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+PY
+}
+
+remove_client_token() {
+  local name="$1"
+  [ -f "$TOKENS_FILE" ] || return 0
+  python3 - "$name" "$TOKENS_FILE" <<'PY'
+import sys, json
+name = sys.argv[1]
+tfile = sys.argv[2]
+try:
+    with open(tfile, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and name in data:
+        del data[name]
+        with open(tfile, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+except Exception:
+    pass
+PY
+}
+
+fetch_api_script() {
+  local api_src="" tmp_api
+  mkdir -p "$API_DIR"
+  chmod 755 "$API_DIR"
+  if is_script_file; then
+    api_src="$(dirname "$(readlink -f "$0")")/api.py"
+  fi
+  if [ -n "$api_src" ] && [ -f "$api_src" ]; then
+    cp "$api_src" "$API_DIR/api.py"
+    chmod 755 "$API_DIR/api.py"
+    return 0
+  fi
+  tmp_api="$(mktemp)"
+  if curl -fsSL "${RAW_BASE_URL}/api.py" -o "$tmp_api" 2>/dev/null \
+    && [ -s "$tmp_api" ] && python3 -m py_compile "$tmp_api" 2>/dev/null; then
+    install -m 755 "$tmp_api" "$API_DIR/api.py"
+    rm -f "$tmp_api"
+    return 0
+  fi
+  rm -f "$tmp_api"
+  return 1
+}
+
+setup_api_service() {
+  step "Настройка API-сервиса подписок клиентов (порт ${AWG_API_PORT}/tcp)"
+  fetch_api_script || warn "не удалось установить api.py"
+
+  cat > /etc/systemd/system/awg-api.service <<EOF
+[Unit]
+Description=AmneziaWG Client Subscription and Token API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${API_DIR}
+Environment=AWG_DIR=${AWG_DIR}
+Environment=AWG_API_PORT=${AWG_API_PORT}
+ExecStart=/usr/bin/python3 ${API_DIR}/api.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now awg-api.service >/dev/null 2>&1 || true
+  systemctl restart awg-api.service >/dev/null 2>&1 || true
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw allow "${AWG_API_PORT}/tcp" >/dev/null 2>&1 || true
+    step "ufw: открыт порт ${AWG_API_PORT}/tcp для API подписок"
+  fi
+}
+
+do_api_status() {
+  printf '\n%b=== Статус API-сервиса подписок ===%b\n' "$C_BOLD" "$C_RESET"
+  systemctl status awg-api --no-pager || true
+}
+
+do_api_restart() {
+  systemctl restart awg-api && step "API-сервис подписок перезапущен"
+}
+
 cleanup() {
   if [ -n "${TMP_DIR:-}" ]; then rm -rf "$TMP_DIR"; fi
   release_lock
@@ -614,6 +770,10 @@ EOF
     warn "Не удалось установить bot.py сейчас (будет скачан при настройке бота)."
   fi
 
+  local tok1
+  tok1="$(ensure_client_token "client1")"
+  setup_api_service
+
   ( umask 077
     cat > "$CRED_FILE" <<EOF
 # AmneziaWG 3.1 — $(date '+%F %T')
@@ -621,6 +781,8 @@ AWG_ENDPOINT=${PUBLIC_IP}:${AWG_PORT}/udp
 AWG_SUBNET=${AWG_SUBNET}
 AWG_CLIENT_CONFIG=${AWG_DIR}/client1.conf
 AWG_CLIENT_QR=${AWG_DIR}/client1.png
+AWG_CLIENT_TOKEN=${tok1}
+AWG_CLIENT_SUB_URL=http://${PUBLIC_IP}:${AWG_API_PORT}/sub/${tok1}
 EOF
     chmod 600 "$CRED_FILE"
   )
@@ -637,6 +799,8 @@ EOF
   printf '  Маскировка ТСПУ: QUIC I1 + HPK + S1-S4 + CPA%s\n' "$([ "$use_disable_cookies" -eq 1 ] && echo ' + DisableCookies' || echo '')"
   printf '  Клиентский файл: %s/client1.conf (0.0.0.0/0)\n' "$AWG_DIR"
   printf '  QR-код (PNG):    %s/client1.png\n' "$AWG_DIR"
+  printf '  Токен подписки:  %s\n' "$tok1"
+  printf '  URL подписки:    http://%s:%s/sub/%s\n' "$PUBLIC_IP" "$AWG_API_PORT" "$tok1"
   printf '%s\n' '------------------------------------------------------------'
   printf '  УПРАВЛЕНИЕ СЕРВЕРОМ:\n'
   printf '  • Консольное меню:   sudo awg-manager\n'
@@ -755,10 +919,17 @@ EOF
     chmod 600 "$AWG_DIR/$name.png" 2>/dev/null || true
   )
 
+  local tok
+  tok="$(ensure_client_token "$name")"
+  local ep_pub="${endpoint:-$(detect_public_ip || true)}"
+  local sub_url="http://${ep_pub}:${AWG_API_PORT}/sub/${tok}"
+
   release_lock
   step "Клиент '$name' ($ip) успешно создан!"
   printf '  Файл конфига (0.0.0.0/0): %s/%s.conf\n' "$AWG_DIR" "$name"
-  printf '  QR-код:                   %s/%s.png\n\n' "$AWG_DIR" "$name"
+  printf '  QR-код:                   %s/%s.png\n' "$AWG_DIR" "$name"
+  printf '  Токен для контейнера:     %b%s%b\n' "$C_CYAN" "$tok" "$C_RESET"
+  printf '  Ссылка подписки (.conf):  %s\n\n' "$sub_url"
   if [ "$IS_TTY" = 1 ]; then
     qrencode -t ansiutf8 < "$AWG_DIR/$name.conf" || true
   fi
@@ -817,6 +988,7 @@ do_remove_client() {
   fi
 
   if [ -n "$name" ] && is_valid_client_name "$name"; then
+    remove_client_token "$name"
     rm -f "$AWG_DIR/$name.conf" "$AWG_DIR/$name.png" \
       "$AWG_DIR/${name}-lan-bypass.conf" "$AWG_DIR/${name}-lan-bypass.png"
     step "Клиент '$name' удалён"
@@ -1055,6 +1227,22 @@ do_status() {
   else
     printf '  Telegram-бот:      %b⚪ Не запущен%b\n' "$C_YELLOW" "$C_RESET"
   fi
+
+  local api_act
+  api_act="$(systemctl is-active awg-api 2>/dev/null || true)"
+  if [ "$api_act" = "active" ]; then
+    printf '  API подписок:      %b🟢 Работает (порт %s/tcp)%b\n' "$C_GREEN" "$AWG_API_PORT" "$C_RESET"
+  else
+    printf '  API подписок:      %b⚪ Не запущен%b\n' "$C_YELLOW" "$C_RESET"
+  fi
+
+  local sched_act
+  sched_act="$(systemctl is-active awg-rotate.timer 2>/dev/null || true)"
+  if [ "$sched_act" = "active" ]; then
+    printf '  Авто-шедулер:      %b🟢 Включен (ночная ротация)%b\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '  Авто-шедулер:      %b⚪ Отключен%b\n' "$C_YELLOW" "$C_RESET"
+  fi
   printf '%b------------------------------------------------------------%b\n' "$C_CYAN" "$C_RESET"
 
   do_list_clients
@@ -1289,6 +1477,326 @@ do_diagnose() {
   return 0
 }
 
+#--- ротация, токены и шедулер -----------------------------------------------
+do_token() {
+  local name="${1:-}"
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
+  if [ -z "$name" ]; then
+    if [ "$IS_TTY" = 1 ]; then
+      read -r -p "Имя клиента для получения токена: " name || die "ввод прерван"
+    else
+      die "укажите имя: awg-manager token <client_name>"
+    fi
+  fi
+  is_valid_client_name "$name" || die "некорректное имя '$name'"
+
+  local token
+  token="$(ensure_client_token "$name")"
+  [ -n "$token" ] || die "не удалось получить токен для '$name'"
+
+  local pub_ip
+  if [ -f "$AWG_DIR/client1.conf" ]; then
+    pub_ip="$(conf_get Endpoint "$AWG_DIR/client1.conf" | sed -E 's/^\[?([^\]]+)\]?:[0-9]+$/\1/')"
+  fi
+  pub_ip="${pub_ip:-$(detect_public_ip || true)}"
+
+  printf '\n%b=== Данные подписки клиента: %s ===%b\n' "$C_BOLD" "$name" "$C_RESET"
+  printf '  Клиент:                  %s\n' "$name"
+  printf '  Токен для вебки:         %b%s%b\n' "$C_CYAN" "$token" "$C_RESET"
+  printf '  URL сервера API:         http://%s:%s\n' "$pub_ip" "$AWG_API_PORT"
+  printf '  Ссылка подписки (.conf): http://%s:%s/sub/%s\n' "$pub_ip" "$AWG_API_PORT" "$token"
+  printf '  Ссылка Amnezia (vpn://): http://%s:%s/vpn/%s\n' "$pub_ip" "$AWG_API_PORT" "$token"
+  printf '  RouterOS скрипт (.rsc):  http://%s:%s/rsc/%s\n\n' "$pub_ip" "$AWG_API_PORT" "$token"
+  printf 'Вставьте токен или ссылку подписки в веб-интерфейсе контейнера AmneziaWG на роутере.\n'
+}
+
+do_rotate() {
+  acquire_lock
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
+  step "Ротация AmneziaWG 3.1: смена порта, ключей и параметров обфускации"
+  local old_port new_port="" try_p
+  old_port="$(conf_get ListenPort "$conf")"
+
+  for _ in $(seq 1 40); do
+    try_p="$(rand_range 20000 59999)"
+    if [ "$try_p" != "$old_port" ] && [ -z "$(ss -Hlnu "sport = :${try_p}" 2>/dev/null)" ]; then
+      new_port="$try_p"
+      break
+    fi
+  done
+  [ -n "$new_port" ] || die "не удалось найти новый свободный UDP-порт"
+  step "UDP-порт: ${old_port} -> ${new_port}"
+
+  local srv_addr mtu wan_iface
+  srv_addr="$(conf_get Address "$conf")"
+  mtu="$(conf_get MTU "$conf")"
+  mtu="${mtu:-$AWG_MTU}"
+  wan_iface="$(detect_wan_iface)"
+
+  local ep_host="" public_ip
+  if [ -f "$AWG_DIR/client1.conf" ]; then
+    ep_host="$(conf_get Endpoint "$AWG_DIR/client1.conf" | sed -E 's/^\[?([^\]]+)\]?:[0-9]+$/\1/')"
+  fi
+  public_ip="${ep_host:-$(detect_public_ip || true)}"
+  [ -n "$public_ip" ] || die "не удалось определить публичный IP сервера"
+
+  local clients_raw
+  clients_raw="$(awk '
+    BEGIN { name=""; ip="" }
+    /^\[Peer\]/ { if (name && ip) print name "|" ip; name=""; ip="" }
+    /^#/ && !name { name=$0; sub(/^#[ \t]*/, "", name) }
+    /^AllowedIPs/ { ip=$0; sub(/^AllowedIPs[ \t]*=[ \t]*/, "", ip) }
+    END { if (name && ip) print name "|" ip }
+  ' "$conf")"
+
+  [ -n "$clients_raw" ] || die "в $conf не найдено клиентов для ротации"
+
+  ( umask 077
+    set +x
+    local srv_priv srv_pub
+    srv_priv="$(awg genkey)"
+    srv_pub="$(printf '%s\n' "$srv_priv" | awg pubkey)"
+
+    local jc jmin jmax s1 s2 s3 s4 s4_free=() h1 h2 h3 h4 i1 hpk cpa dc_line=""
+    jc=$(rand_range 3 5)
+    jmin=$(rand_range 40 79)
+    jmax=$((jmin + $(rand_range 50 160)))
+    s1=$(rand_range 15 150)
+    s2=$(rand_range 15 150)
+    while [ $((s1 + 56)) -eq "$s2" ]; do s2=$(rand_range 15 150); done
+    s3=$(rand_range 12 55)
+    while [ $((s2 + 28)) -eq "$s3" ] || [ $((s1 + 84)) -eq "$s3" ]; do s3=$(rand_range 12 55); done
+
+    for ((s4_cand = 12; s4_cand <= 27; s4_cand++)); do
+      if [ "$s4_cand" -eq 16 ]; then continue; fi
+      s4_collides "$s1" "$s2" "$s3" "$s4_cand" || s4_free+=("$s4_cand")
+    done
+    [ "${#s4_free[@]}" -gt 0 ] || die "ошибка расчёта параметров S4"
+    s4="${s4_free[$(rand_range 0 $((${#s4_free[@]} - 1)))]}"
+    h1=1; h2=2; h3=3; h4=4
+    i1="$(cps_i1)" || die "ошибка генерации I1"
+    hpk="$(awg genkey)"
+    cpa='32-128'
+    if grep -q '^DisableCookies[[:space:]]*=[[:space:]]*on' "$conf"; then
+      dc_line=$'DisableCookies = on\n'
+    fi
+
+    local subnet
+    subnet="$(get_subnet_prefix)0/24"
+
+    local tmp_conf
+    tmp_conf="$(mktemp)"
+    chmod 600 "$tmp_conf"
+
+    cat > "$tmp_conf" <<EOF
+[Interface]
+PrivateKey = ${srv_priv}
+Address = ${srv_addr}
+ListenPort = ${new_port}
+MTU = ${mtu}
+Jc = ${jc}
+Jmin = ${jmin}
+Jmax = ${jmax}
+S1 = ${s1}
+S2 = ${s2}
+S3 = ${s3}
+S4 = ${s4}
+H1 = ${h1}
+H2 = ${h2}
+H3 = ${h3}
+H4 = ${h4}
+I1 = ${i1}
+HeaderProtectionKey = ${hpk}
+ContentPaddingAddition = ${cpa}
+${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${wan_iface} -j ACCEPT; iptables -w -C FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -w -t nat -D POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+EOF
+
+    local c_name c_ip cli_priv cli_pub c_count=0
+    while IFS='|' read -r c_name c_ip; do
+      [ -n "$c_name" ] && [ -n "$c_ip" ] || continue
+      is_valid_client_name "$c_name" || continue
+
+      cli_priv="$(awg genkey)"
+      cli_pub="$(printf '%s\n' "$cli_priv" | awg pubkey)"
+
+      cat >> "$tmp_conf" <<EOF
+
+[Peer]
+# ${c_name}
+PublicKey = ${cli_pub}
+AllowedIPs = ${c_ip}
+EOF
+
+      cat > "$AWG_DIR/${c_name}.conf" <<EOF
+[Interface]
+PrivateKey = ${cli_priv}
+Address = ${c_ip}
+DNS = ${AWG_DNS}
+MTU = ${mtu}
+Jc = ${jc}
+Jmin = ${jmin}
+Jmax = ${jmax}
+S1 = ${s1}
+S2 = ${s2}
+S3 = ${s3}
+S4 = ${s4}
+H1 = ${h1}
+H2 = ${h2}
+H3 = ${h3}
+H4 = ${h4}
+I1 = ${i1}
+HeaderProtectionKey = ${hpk}
+ContentPaddingAddition = ${cpa}
+
+[Peer]
+PublicKey = ${srv_pub}
+Endpoint = ${public_ip}:${new_port}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+      chmod 600 "$AWG_DIR/${c_name}.conf"
+      qrencode -o "$AWG_DIR/${c_name}.png" -s 6 -m 2 < "$AWG_DIR/${c_name}.conf" || true
+      chmod 600 "$AWG_DIR/${c_name}.png" 2>/dev/null || true
+
+      ensure_client_token "$c_name" >/dev/null
+      c_count=$((c_count + 1))
+    done <<< "$clients_raw"
+
+    mv "$tmp_conf" "$conf"
+    chmod 600 "$conf"
+    step "Обновлены ключи и параметры для ${c_count} клиентов (токены сохранены)"
+  )
+
+  if [ -n "$old_port" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw delete allow "${old_port}/udp" >/dev/null 2>&1 || true
+    ufw allow "${new_port}/udp" >/dev/null 2>&1 || true
+    step "ufw: закрыт порт ${old_port}/udp, открыт ${new_port}/udp"
+  fi
+
+  systemctl restart "awg-quick@${AWG_IFACE}" || die "не удалось перезапустить туннель"
+  step "Туннель awg0 успешно перезапущен на порту ${new_port}/udp"
+
+  if systemctl is-active --quiet awg-api 2>/dev/null; then
+    systemctl restart awg-api 2>/dev/null || true
+  fi
+
+  if [ -r "$BOT_ENV" ] && systemctl is-active --quiet awg-bot 2>/dev/null; then
+    python3 -c "
+import html, urllib.request, json, os, sys
+try:
+    sys.path.insert(0, '$BOT_DIR')
+    from bot import load_env, ADMIN_IDS, send_message
+    env = load_env()
+    for uid in ADMIN_IDS:
+        try:
+            send_message(
+                uid,
+                '🔄 <b>Выполнена ротация AmneziaWG 3.1!</b>\n\n'
+                f'• Новый порт: <code>${new_port}/udp</code>\n'
+                '• Профиль 3.1: обновлены HPK, CPS I1, S1–S4 и ключи\n'
+                '• Клиенты с токенами (MikroTik контейнеры) обновятся автоматически.\n'
+                '• Для ручных клиентов (смартфоны) запросите новые QR через /clients'
+            )
+        except Exception:
+            pass
+except Exception:
+    pass
+" 2>/dev/null || true
+  fi
+
+  release_lock
+  printf '\n%b============================================================%b\n' "$C_GREEN" "$C_RESET"
+  printf '  %bРотация AmneziaWG успешно завершена!%b\n' "$C_BOLD" "$C_RESET"
+  printf '  Новый UDP-порт:  %s/udp\n' "$new_port"
+  printf '  Все клиенты с токенами подхватят новый конфиг автоматически.\n'
+  printf '%b============================================================%b\n\n' "$C_GREEN" "$C_RESET"
+}
+
+do_schedule() {
+  local mode="${1:-}"
+  local timer_file="/etc/systemd/system/awg-rotate.timer"
+  local svc_file="/etc/systemd/system/awg-rotate.service"
+
+  if [ -z "$mode" ] && [ "$IS_TTY" = 1 ]; then
+    printf '\n%b=== Настройка авто-ротации по расписанию (шедулер) ===%b\n' "$C_BOLD" "$C_RESET"
+    local cur="Выключено"
+    if systemctl is-active --quiet awg-rotate.timer 2>/dev/null; then
+      cur="Активен ($(systemctl cat awg-rotate.timer 2>/dev/null | grep '^OnCalendar' | head -n1 || true))"
+    fi
+    printf 'Текущий статус: %s\n\n' "$cur"
+    printf '1) Раз в 3 дня в 04:00 (рекомендуется против ТСПУ)\n'
+    printf '2) Раз в неделю (воскресенье, 04:00)\n'
+    printf '3) Каждый день в 04:00\n'
+    printf '4) Отключить авто-ротацию\n'
+    printf '0) Назад\n'
+    local ch
+    read -r -p "Выберите вариант [1-4, 0]: " ch || return 0
+    case "$ch" in
+      1) mode="3days" ;;
+      2) mode="weekly" ;;
+      3) mode="daily" ;;
+      4) mode="off" ;;
+      *) return 0 ;;
+    esac
+  fi
+
+  case "$mode" in
+    off|disable|stop)
+      systemctl disable --now awg-rotate.timer 2>/dev/null || true
+      step "Авто-ротация AmneziaWG отключена"
+      ;;
+    3days|daily|weekly|"")
+      local cal=""
+      if [ "$mode" = "daily" ]; then
+        cal="*-*-* 04:00:00"
+      elif [ "$mode" = "weekly" ]; then
+        cal="Sun *-*-* 04:00:00"
+      else
+        mode="3days"
+        cal="*-*-01,04,07,10,13,16,19,22,25,28 04:00:00"
+      fi
+
+      cat > "$svc_file" <<EOF
+[Unit]
+Description=AmneziaWG Scheduled Key and Port Rotation
+After=network.target awg-quick@${AWG_IFACE}.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/awg-manager rotate
+EOF
+
+      cat > "$timer_file" <<EOF
+[Unit]
+Description=AmneziaWG Auto-Rotation Timer
+
+[Timer]
+OnCalendar=${cal}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+      systemctl daemon-reload
+      systemctl enable --now awg-rotate.timer >/dev/null 2>&1
+      step "Авто-ротация включена: ${mode} (${cal})"
+      ;;
+    status)
+      printf '\n=== Статус таймера авто-ротации ===\n'
+      systemctl status awg-rotate.timer --no-pager || true
+      ;;
+    *)
+      die "неизвестный режим '$mode'. Допустимо: 3days, weekly, daily, off, status"
+      ;;
+  esac
+}
+
 #--- бэкап, восстановление, переустановка и удаление ---------------------------
 do_backup() {
   acquire_lock
@@ -1379,7 +1887,12 @@ do_uninstall() {
 
   systemctl stop awg-bot 2>/dev/null || true
   systemctl disable awg-bot 2>/dev/null || true
-  rm -f /etc/systemd/system/awg-bot.service
+  systemctl stop awg-api 2>/dev/null || true
+  systemctl disable awg-api 2>/dev/null || true
+  systemctl stop awg-rotate.timer 2>/dev/null || true
+  systemctl disable awg-rotate.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/awg-bot.service /etc/systemd/system/awg-api.service \
+    /etc/systemd/system/awg-rotate.service /etc/systemd/system/awg-rotate.timer
 
   local port="" wan="" prefix=""
   if [ -f "$AWG_DIR/$AWG_IFACE.conf" ]; then
@@ -1399,12 +1912,15 @@ do_uninstall() {
   if [ -n "$port" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
   fi
+  if [ -n "$AWG_API_PORT" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw delete allow "${AWG_API_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
 
   apt-get purge "${APT[@]}" amneziawg amneziawg-dkms amneziawg-tools 2>/dev/null || true
   rmmod amneziawg 2>/dev/null || true
   add-apt-repository -y --remove ppa:amnezia/ppa 2>/dev/null || true
 
-  rm -rf "$AWG_DIR" "$BOT_DIR" /usr/local/bin/awg-manager "$CRED_FILE" \
+  rm -rf "$AWG_DIR" "$BOT_DIR" "$API_DIR" /usr/local/bin/awg-manager "$CRED_FILE" \
     /etc/sysctl.d/99-awg-hardening.conf /etc/sysctl.d/99-awg-forward.conf
   systemctl daemon-reload
   release_lock
@@ -1439,20 +1955,23 @@ show_menu() {
     printf '  Telegram-бот:  %b%s%b\n' "$C_CYAN" "$bot_status" "$C_RESET"
     printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
     printf '  %bНе подключается? Пункт 10 — самодиагностика (ТСПУ/порт/NAT)%b\n' "$C_YELLOW" "$C_RESET"
-    printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ:%b\n' "$C_BOLD" "$C_RESET"
+    printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ И ПОДПИСКАМИ:%b\n' "$C_BOLD" "$C_RESET"
     printf '    1) Список клиентов, статус и QR-коды\n'
     printf '    2) Добавить нового клиента\n'
     printf '    3) Удалить клиента\n'
-    printf '  %bСЕРВИС И МОНИТОРИНГ:%b\n' "$C_BOLD" "$C_RESET"
-    printf '    4) Настроить Telegram-бота (управление через ТГ)\n'
-    printf '    5) Детальный статус и статистика\n'
-    printf '    6) Перезапустить туннель\n'
+    printf '    4) Показать токен и ссылку подписки для клиента\n'
+    printf '  %bСЕРВИС, РОТАЦИЯ И ШЕДУЛЕР:%b\n' "$C_BOLD" "$C_RESET"
+    printf '    5) Ротация сервера сейчас (смена порта, ключей и обфускации)\n'
+    printf '    6) Настроить авто-ротацию по расписанию (шедулер)\n'
+    printf '    7) Настроить Telegram-бота (управление через ТГ)\n'
+    printf '    8) Детальный статус и статистика\n'
+    printf '    9) Перезапустить туннель\n'
     printf '  %bОБСЛУЖИВАНИЕ:%b\n' "$C_BOLD" "$C_RESET"
-    printf '    7) Резервная копия (бэкап) / Восстановление\n'
-    printf '    8) Переустановить AmneziaWG начисто (с бэкапом)\n'
-    printf '    9) Полное удаление AmneziaWG\n'
-    printf '   10) Самодиагностика — почему не подключается\n'
-    printf '   11) Перехват входящих пакетов 15с (diagnose-live)\n'
+    printf '   10) Резервная копия (бэкап) / Восстановление\n'
+    printf '   11) Переустановить AmneziaWG начисто (с бэкапом)\n'
+    printf '   12) Полное удаление AmneziaWG\n'
+    printf '   13) Самодиагностика — почему не подключается\n'
+    printf '   14) Перехват входящих пакетов 15с (diagnose-live)\n'
     printf '    0) Выход\n'
     printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
     read -r -p "Выберите пункт меню: " choice || { printf '\n'; break; }
@@ -1489,7 +2008,14 @@ show_menu() {
         ;;
       2) do_add_client "" ;;
       3) do_remove_client "" ;;
-      4)
+      4) do_token "" ;;
+      5)
+        if confirm_yes "Выполнить ротацию сервера AmneziaWG 3.1 прямо сейчас (смена порта, ключей и обфускации)?"; then
+          do_rotate
+        fi
+        ;;
+      6) do_schedule "" ;;
+      7)
         printf '\n1) Настроить токен и запустить бота\n2) Статус бота\n3) Перезапустить бота\n'
         local bch
         read -r -p "Выбор: " bch || true
@@ -1499,9 +2025,9 @@ show_menu() {
           3) do_bot_restart ;;
         esac
         ;;
-      5) do_status ;;
-      6) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
-      7)
+      8) do_status ;;
+      9) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
+      10)
         printf '\n1) Создать бэкап\n2) Восстановить из файла\n'
         local bkch
         read -r -p "Выбор: " bkch || true
@@ -1510,18 +2036,18 @@ show_menu() {
           do_restore "$bkp"
         fi
         ;;
-      8)
+      11)
         if confirm_yes "Переустановить AmneziaWG начисто (текущие конфиги сохранятся в бэкап, ключи обновятся)?"; then
           do_reinstall
         fi
         ;;
-      9)
+      12)
         if confirm_yes "Полностью удалить AmneziaWG с сервера?"; then
           do_uninstall
         fi
         ;;
-      10) do_diagnose ;;
-      11) diag_live_capture ;;
+      13) do_diagnose ;;
+      14) diag_live_capture ;;
       0|q|quit|exit) break ;;
       *) printf 'Неизвестный пункт: %s\n' "$choice" ;;
     esac
@@ -1556,6 +2082,11 @@ case "$ACTION" in
   menu) show_menu ;;
   install) do_install ;;
   reinstall) do_reinstall ;;
+  rotate) do_rotate ;;
+  schedule) do_schedule "${2:-}" ;;
+  token) do_token "${2:-}" ;;
+  api-status) do_api_status ;;
+  api-restart) do_api_restart ;;
   add-client) do_add_client "${2:-}" ;;
   remove-client) do_remove_client "${2:-}" ;;
   list-clients|clients) do_list_clients ;;
@@ -1576,6 +2107,11 @@ case "$ACTION" in
   menu          Интерактивное меню управления (TUI)
   install       Установка или идемпотентная проверка сервера
   reinstall     Полная переустановка ключей и туннеля (с бэкапом)
+  rotate        Ротация сервера (смена порта, ключей и обфускации)
+  schedule      Настройка авто-ротации по расписанию (3days|weekly|daily|off|status)
+  token         Показать токен и ссылку подписки для клиента
+  api-status    Статус API-сервиса подписок клиентов
+  api-restart   Перезапуск API-сервиса подписок клиентов
   clients       Список клиентов, статус онлайн и трафик
   add-client    Добавить нового клиента
   remove-client Удалить клиента (по имени или pubkey)
