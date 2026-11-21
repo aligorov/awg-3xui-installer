@@ -203,6 +203,9 @@ detect_wan_iface() {
   if [ -z "$iface" ]; then
     iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
   fi
+  if [ -z "$iface" ] && [ -r /proc/net/route ]; then
+    iface="$(awk 'NR>1 && $2=="00000000" {print $1; exit}' /proc/net/route 2>/dev/null || true)"
+  fi
   printf '%s' "$iface"
 }
 
@@ -2788,6 +2791,10 @@ apply_tunnel_rotation() {
   mtu="$(conf_get MTU "$conf")"
   mtu="${mtu:-$AWG_MTU}"
   wan_iface="$(detect_wan_iface || true)"
+  if [ -z "$wan_iface" ]; then
+    wan_iface="$(grep '^PostUp' "$conf" 2>/dev/null | grep -oE '\-o [A-Za-z0-9_.:-]+ -j MASQUERADE' | head -n1 | awk '{print $2}' || true)"
+  fi
+  [ -n "$wan_iface" ] || die "не удалось определить WAN-интерфейс сервера (проверьте default route или перезапустите awg-api)"
 
   local public_ip
   public_ip="$(get_public_endpoint_host)"
