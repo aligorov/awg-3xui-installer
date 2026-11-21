@@ -501,6 +501,81 @@ do_api_restart() {
   systemctl restart awg-api && step "API-сервис подписок перезапущен"
 }
 
+do_update() {
+  step "Проверка и обновление awg-manager до последней версии"
+  acquire_lock
+
+  local tmp_upd
+  tmp_upd="$(mktemp -d /tmp/awg-update.XXXXXX)"
+  trap 'rm -rf "$tmp_upd"' RETURN
+
+  step "Загрузка актуальных скриптов с GitHub..."
+  local dl_err=0
+  curl -fsSL "${RAW_BASE_URL}/install.sh" -o "$tmp_upd/install.sh" || dl_err=1
+  curl -fsSL "${RAW_BASE_URL}/api.py" -o "$tmp_upd/api.py" || dl_err=1
+  curl -fsSL "${RAW_BASE_URL}/bot.py" -o "$tmp_upd/bot.py" || dl_err=1
+
+  if [ "$dl_err" -ne 0 ] || [ ! -s "$tmp_upd/install.sh" ]; then
+    release_lock
+    die "Не удалось загрузить файлы обновления. Проверьте сеть на сервере."
+  fi
+
+  if ! bash -n "$tmp_upd/install.sh" 2>/dev/null; then
+    release_lock
+    die "Сбой валидации синтаксиса install.sh"
+  fi
+  if ! python3 -m py_compile "$tmp_upd/api.py" 2>/dev/null; then
+    release_lock
+    die "Сбой валидации синтаксиса api.py"
+  fi
+  if ! python3 -m py_compile "$tmp_upd/bot.py" 2>/dev/null; then
+    release_lock
+    die "Сбой валидации синтаксиса bot.py"
+  fi
+
+  step "Установка обновлений CLI и сервисов..."
+  install -m 755 "$tmp_upd/install.sh" /usr/local/bin/awg-manager
+
+  mkdir -p "$API_DIR"
+  install -m 755 "$tmp_upd/api.py" "$API_DIR/api.py"
+  setup_api_service
+
+  if [ -d "$BOT_DIR" ]; then
+    install -m 755 "$tmp_upd/bot.py" "$BOT_DIR/bot.py"
+    if systemctl is-active --quiet awg-bot 2>/dev/null; then
+      systemctl restart awg-bot 2>/dev/null || true
+    fi
+  fi
+
+  # Генерация постоянных токенов для существующих клиентов, если их ещё нет
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  if [ -f "$conf" ]; then
+    while IFS= read -r client_name; do
+      if [ -n "$client_name" ]; then
+        ensure_client_token "$client_name" >/dev/null 2>&1 || true
+      fi
+    done < <(awk '
+      BEGIN { name="" }
+      /^\[Peer\]/ { name="" }
+      /^#/ && !name { name=$0; sub(/^#[ \t]*/, "", name) }
+      /^PublicKey/ {
+        if (name) print name
+      }
+    ' "$conf")
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw allow "${AWG_API_PORT:-8443}/tcp" comment 'AmneziaWG Subscription API' >/dev/null 2>&1 || true
+  fi
+
+  systemctl daemon-reload
+  release_lock
+  step "awg-manager успешно обновлён до актуальной версии!"
+  printf '  CLI утилита:        /usr/local/bin/awg-manager (обновлена)\n'
+  printf '  API подписок:       awg-api.service (порт %s/tcp, активен)\n' "${AWG_API_PORT:-8443}"
+  printf '  Туннель и клиенты:  продолжают работать без перезапуска.\n\n'
+}
+
 cleanup() {
   if [ -n "${TMP_DIR:-}" ]; then rm -rf "$TMP_DIR"; fi
   release_lock
@@ -1973,6 +2048,7 @@ show_menu() {
     "Перезапустить туннель"
     "Самодиагностика — почему не подключается"
     "Перехват входящих пакетов 15с (diagnose-live)"
+    "Обновить awg-manager до последней версии"
     "Резервная копия (бэкап) / Восстановление"
     "Переустановить AmneziaWG начисто (с бэкапом)"
     "Полное удаление AmneziaWG"
@@ -2038,12 +2114,12 @@ show_menu() {
           printf '  %bСЕРВИС, РОТАЦИЯ И ШЕДУЛЕР:%b\n' "$C_BOLD" "$C_RESET"
         elif [ "$i" -eq 9 ]; then
           printf '  %bДИАГНОСТИКА И ОБСЛУЖИВАНИЕ:%b\n' "$C_BOLD" "$C_RESET"
-        elif [ "$i" -eq 14 ]; then
+        elif [ "$i" -eq 15 ]; then
           printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
         fi
 
         local num_str=""
-        if [ "$i" -eq 14 ]; then
+        if [ "$i" -eq 15 ]; then
           num_str=" 0"
         else
           printf -v num_str "%2d" "$((i+1))"
@@ -2072,7 +2148,7 @@ show_menu() {
           break
           ;;
         0)
-          selected=14
+          selected=15
           ;;
         [1-9])
           if [ "$key" -le "$num_items" ]; then
@@ -2101,10 +2177,11 @@ show_menu() {
       printf ' 12) %s\n' "${items[11]}"
       printf ' 13) %s\n' "${items[12]}"
       printf ' 14) %s\n' "${items[13]}"
-      printf '  0) %s\n' "${items[14]}"
+      printf ' 15) %s\n' "${items[14]}"
+      printf '  0) %s\n' "${items[15]}"
       printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
       local choice=""
-      read -r -p "Выберите пункт (1-14, 0 для выхода): " choice || break
+      read -r -p "Выберите пункт (1-15, 0 для выхода): " choice || break
       case "$choice" in
         1) selected=0 ;;
         2) selected=1 ;;
@@ -2120,6 +2197,7 @@ show_menu() {
         12) selected=11 ;;
         13) selected=12 ;;
         14) selected=13 ;;
+        15) selected=14 ;;
         0|q|quit|exit) break ;;
         *) printf 'Неизвестный пункт: %s\n' "$choice"; continue ;;
       esac
@@ -2185,7 +2263,8 @@ show_menu() {
       8) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
       9) do_diagnose ;;
       10) diag_live_capture ;;
-      11)
+      11) do_update ;;
+      12)
         printf '\n%bРезервная копия и восстановление:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Создать бэкап сейчас\n'
         printf '  2) Восстановить из файла архива\n'
@@ -2199,17 +2278,17 @@ show_menu() {
           do_restore "$bkp"
         fi
         ;;
-      12)
+      13)
         if confirm_yes "Переустановить AmneziaWG начисто (текущие конфиги сохранятся в бэкап, ключи обновятся)?"; then
           do_reinstall
         fi
         ;;
-      13)
+      14)
         if confirm_yes "Полностью удалить AmneziaWG с сервера?"; then
           do_uninstall
         fi
         ;;
-      14)
+      15)
         break
         ;;
     esac
@@ -2266,6 +2345,7 @@ case "$ACTION" in
   status) do_status ;;
   diagnose) do_diagnose ;;
   diagnose-live) diag_live_capture ;;
+  update|self-update) do_update ;;
   backup) do_backup ;;
   restore) do_restore "${2:-}" ;;
   uninstall) do_uninstall ;;
@@ -2274,7 +2354,8 @@ case "$ACTION" in
 Использование: sudo awg-manager [команда]
 
 Команды:
-  menu          Интерактивное меню управления (TUI)
+  menu          Интерактивное меню управления (TUI со стрелками ↑/↓)
+  update        Обновить awg-manager и API подписок до последней версии
   install       Установка или идемпотентная проверка сервера
   reinstall     Полная переустановка ключей и туннеля (с бэкапом)
   rotate        Ротация сервера (смена порта, ключей и обфускации)
