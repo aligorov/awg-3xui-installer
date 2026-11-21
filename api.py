@@ -95,6 +95,29 @@ def find_client_by_token(token):
     return None
 
 
+def sanitize_config_endpoint(conf_str):
+    """Очищает Endpoint в конфиге клиента от возможных дублированных портов: 64.118.150.81:48389:45968 -> 64.118.150.81:45968"""
+    lines = []
+    for line in conf_str.splitlines():
+        if line.strip().startswith("Endpoint") and "=" in line:
+            prefix, val = line.split("=", 1)
+            raw = val.strip()
+            clean_host = raw.replace("http://", "").replace("https://", "").split("/")[0]
+            if clean_host.startswith("[") and "]" in clean_host:
+                h = clean_host[1:clean_host.index("]")]
+            elif re.match(r"^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", clean_host):
+                h = re.match(r"^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", clean_host).group(1)
+            else:
+                h = clean_host.split(":")[0]
+            last_port = raw.rsplit(":", 1)[-1]
+            if not last_port.isdigit():
+                last_port = "443"
+            lines.append(f"{prefix.strip()} = {h}:{last_port}")
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def conf_to_vpn_url(conf_text, client_name="client"):
     """Преобразует текст .conf в официальную ссылку Amnezia vpn://..."""
     endpoint = ""
@@ -274,6 +297,8 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
         try:
             raw_bytes = conf_path.read_bytes()
             conf_str = raw_bytes.decode("utf-8")
+            conf_str = sanitize_config_endpoint(conf_str)
+            raw_bytes = conf_str.encode("utf-8")
         except Exception as e:
             self.send_json(500, {"error": "Internal Error", "message": str(e)})
             return

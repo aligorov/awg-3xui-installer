@@ -72,6 +72,44 @@ conf_get() { # $1=ключ $2=файл -> значение первого сов
   sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" "$2" | head -n1
 }
 
+extract_host_from_endpoint() {
+  # Извлекает чистый IP или домен из Endpoint/URL, отсекая любые цепочки портов (:port:port) и скобки
+  local raw="$1"
+  raw="${raw#http://}"
+  raw="${raw#https://}"
+  raw="${raw%%/*}"
+  if [[ "$raw" =~ ^\[([a-fA-F0-9:]+)\] ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return
+  fi
+  if [[ "$raw" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return
+  fi
+  printf '%s' "${raw%%:*}"
+}
+
+sanitize_existing_client_endpoints() {
+  local lport
+  lport="$(conf_get ListenPort "$AWG_DIR/$AWG_IFACE.conf" || true)"
+  [ -n "$lport" ] || return 0
+
+  local cf
+  for cf in "$AWG_DIR"/*.conf; do
+    [ -f "$cf" ] || continue
+    [ "$cf" != "$AWG_DIR/$AWG_IFACE.conf" ] || continue
+    local cur_ep
+    cur_ep="$(conf_get Endpoint "$cf" || true)"
+    if [ -n "$cur_ep" ]; then
+      local clean_h
+      clean_h="$(extract_host_from_endpoint "$cur_ep")"
+      if [ -n "$clean_h" ]; then
+        sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${clean_h}:${lport}|" "$cf"
+      fi
+    fi
+  done
+}
+
 acquire_lock() {
   mkdir -p /run/lock
   exec 9>"$LOCK_FILE"
@@ -641,6 +679,9 @@ do_update() {
     ' "$conf")
   fi
 
+  # Авто-исправление возможных дубликатов портов в конфигах клиентов
+  sanitize_existing_client_endpoints || true
+
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw allow "${AWG_API_PORT:-8443}/tcp" comment 'AmneziaWG Subscription API' >/dev/null 2>&1 || true
   fi
@@ -1015,7 +1056,7 @@ do_add_client() {
 
   local ep_host=""
   if [ -f "$AWG_DIR/client1.conf" ]; then
-    ep_host="$(conf_get Endpoint "$AWG_DIR/client1.conf" | sed -E 's/^\[?([^\]]+)\]?:[0-9]+$/\1/')"
+    ep_host="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/client1.conf")")"
   fi
   endpoint="${ep_host:-$(detect_public_ip || true)}"
   [ -n "$endpoint" ] || die "не удалось определить внешний IP сервера"
@@ -1567,7 +1608,7 @@ do_diagnose() {
       [ "$(basename "$f")" = "${AWG_IFACE}.conf" ] && continue
       ep="$(conf_get Endpoint "$f")"; [ -n "$ep" ] || continue
       checked=$((checked + 1))
-      eip="$(printf '%s' "$ep" | sed -E 's/^\[?([^\]]+)\]?:[0-9]+$/\1/')"
+      eip="$(extract_host_from_endpoint "$ep")"
       [ "$eip" = "$pub" ] || mism=$((mism + 1))
     done
     if [ "$checked" -eq 0 ]; then d_info "Клиентских конфигов с Endpoint нет"
@@ -1649,9 +1690,11 @@ do_token() {
   token="$(ensure_client_token "$name")"
   [ -n "$token" ] || die "не удалось получить токен для '$name'"
 
+  sanitize_existing_client_endpoints || true
+
   local pub_ip
   if [ -f "$AWG_DIR/client1.conf" ]; then
-    pub_ip="$(conf_get Endpoint "$AWG_DIR/client1.conf" | sed -E 's/^\[?([^\]]+)\]?:[0-9]+$/\1/')"
+    pub_ip="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/client1.conf")")"
   fi
   pub_ip="${pub_ip:-$(detect_public_ip || true)}"
 
@@ -1691,7 +1734,7 @@ apply_tunnel_rotation() {
 
   local ep_host="" public_ip
   if [ -f "$AWG_DIR/client1.conf" ]; then
-    ep_host="$(conf_get Endpoint "$AWG_DIR/client1.conf" | sed -E 's/^\[?([^\]]+)\]?:[0-9]+$/\1/')"
+    ep_host="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/client1.conf")")"
   fi
   public_ip="${ep_host:-$(detect_public_ip || true)}"
   [ -n "$public_ip" ] || die "не удалось определить публичный IP сервера"
