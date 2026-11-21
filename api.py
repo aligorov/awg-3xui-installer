@@ -119,7 +119,10 @@ def sanitize_client_config(conf_str):
             last_port = raw.rsplit(":", 1)[-1]
             if not last_port.isdigit():
                 last_port = "443"
-            lines.append(f"{prefix.strip()} = {h}:{last_port}")
+            if ":" in h:
+                lines.append(f"{prefix.strip()} = [{h}]:{last_port}")
+            else:
+                lines.append(f"{prefix.strip()} = {h}:{last_port}")
             continue
 
         # 2. AllowedIPs fix: ensure dual-stack 0.0.0.0/0, ::/0

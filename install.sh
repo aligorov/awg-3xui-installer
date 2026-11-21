@@ -91,6 +91,16 @@ extract_host_from_endpoint() {
   printf '%s' "${raw%%:*}"
 }
 
+format_endpoint() {
+  local h="$1"
+  local p="$2"
+  if [[ "$h" =~ : ]] && [[ ! "$h" =~ ^\[ ]]; then
+    printf '[%s]:%s' "$h" "$p"
+  else
+    printf '%s:%s' "$h" "$p"
+  fi
+}
+
 sanitize_existing_client_endpoints() {
   local lport
   lport="$(conf_get ListenPort "$AWG_DIR/$AWG_IFACE.conf" || true)"
@@ -106,7 +116,9 @@ sanitize_existing_client_endpoints() {
       local clean_h
       clean_h="$(extract_host_from_endpoint "$cur_ep")"
       if [ -n "$clean_h" ]; then
-        sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${clean_h}:${lport}|" "$cf"
+        local ep_str
+        ep_str="$(format_endpoint "$clean_h" "$lport")"
+        sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${ep_str}|" "$cf"
       fi
     fi
   done
@@ -763,17 +775,32 @@ ensure_dualstack_support() {
     fi
 
     if ! grep -q 'ip6tables' "$conf"; then
-      local postup postdown
-      postup="$(conf_get PostUp "$conf")"
-      postdown="$(conf_get PostDown "$conf")"
-      if [ -n "$postup" ]; then
-        local ip6_postup="; ip6tables -w -t nat -C POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
-        sed -i -E "s|^PostUp[[:space:]]*=.*$|PostUp = ${postup}${ip6_postup}|" "$conf"
-      fi
-      if [ -n "$postdown" ]; then
-        local ip6_postdown="; ip6tables -w -t nat -D POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
-        sed -i -E "s|^PostDown[[:space:]]*=.*$|PostDown = ${postdown}${ip6_postdown}|" "$conf"
-      fi
+      python3 - "$conf" "$ip6_subnet" "$wan6_iface" <<'PY'
+import sys
+conf = sys.argv[1]
+ip6_subnet = sys.argv[2]
+wan6_iface = sys.argv[3]
+
+ip6_postup = f"; ip6tables -w -t nat -C POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+
+ip6_postdown = f"; ip6tables -w -t nat -D POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+
+try:
+    with open(conf, 'r') as f:
+        lines = f.readlines()
+    out = []
+    for line in lines:
+        if line.strip().startswith('PostUp') and '=' in line and 'ip6tables' not in line:
+            out.append(f"{line.rstrip()}{ip6_postup}\n")
+        elif line.strip().startswith('PostDown') and '=' in line and 'ip6tables' not in line:
+            out.append(f"{line.rstrip()}{ip6_postdown}\n")
+        else:
+            out.append(line)
+    with open(conf, 'w') as f:
+        f.writelines(out)
+except Exception:
+    pass
+PY
     fi
   fi
 
@@ -1163,7 +1190,7 @@ ContentPaddingAddition = ${cpa}
 
 [Peer]
 PublicKey = ${srv_pub}
-Endpoint = ${PUBLIC_IP}:${AWG_PORT}
+Endpoint = $(format_endpoint "$PUBLIC_IP" "$AWG_PORT")
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
@@ -1348,7 +1375,7 @@ ContentPaddingAddition = ${P[ContentPaddingAddition]}
 
 [Peer]
 PublicKey = ${srv_pub}
-Endpoint = ${endpoint}:${P[ListenPort]}
+Endpoint = $(format_endpoint "$endpoint" "${P[ListenPort]}")
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
@@ -2130,7 +2157,7 @@ ContentPaddingAddition = ${cpa}
 
 [Peer]
 PublicKey = ${srv_pub}
-Endpoint = ${public_ip}:${new_port}
+Endpoint = $(format_endpoint "$public_ip" "$new_port")
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
