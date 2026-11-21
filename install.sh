@@ -636,6 +636,10 @@ apply_sysctl_hardening() {
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2
+net.ipv6.conf.all.autoconf = 1
+net.ipv6.conf.default.autoconf = 1
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 net.ipv4.conf.all.accept_redirects = 0
@@ -647,7 +651,17 @@ net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.tcp_syncookies = 1
 EOF
   rm -f /etc/sysctl.d/99-awg-forward.conf
-  sysctl -q -p /etc/sysctl.d/99-awg-hardening.conf
+  sysctl -q -p /etc/sysctl.d/99-awg-hardening.conf || true
+  # Применяем accept_ra=2 ко всем существующим интерфейсам, чтобы включённый forwarding=1
+  # не блокировал автоматическое получение IPv6 от роутера датацентра (SLAAC / RA)
+  local ifc
+  for ifc in /proc/sys/net/ipv6/conf/*; do
+    [ -d "$ifc" ] || continue
+    local iname
+    iname="$(basename "$ifc")"
+    sysctl -w "net.ipv6.conf.${iname}.accept_ra=2" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv6.conf.${iname}.autoconf=1" >/dev/null 2>&1 || true
+  done
 }
 
 fetch_bot_script() {
