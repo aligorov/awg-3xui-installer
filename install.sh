@@ -279,24 +279,161 @@ detect_public_ipv6() {
   local wan_dev
   wan_dev="$(detect_wan_iface || true)"
   wan_dev="${wan_dev:-eth0}"
+
+  # Включение приёма SLAAC RA на WAN интерфейсе
+  if [ -n "$wan_dev" ] && [ -d "/proc/sys/net/ipv6/conf/$wan_dev" ]; then
+    sysctl -w "net.ipv6.conf.$wan_dev.accept_ra=2" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv6.conf.$wan_dev.autoconf=1" >/dev/null 2>&1 || true
+    ping6 -c 1 -w 1 "ff02::2%$wan_dev" >/dev/null 2>&1 || true
+    command -v rdisc6 >/dev/null 2>&1 && rdisc6 -m "$wan_dev" >/dev/null 2>&1 || true
+  fi
+
   if [ -n "$wan_dev" ] && command -v python3 >/dev/null 2>&1; then
     local py_cand
     py_cand="$(python3 - "$wan_dev" <<'PY'
-import sys, os
-wan = sys.argv[1]
-for api_p in ["/etc/amnezia/awg-api/api.py", "/usr/local/bin/awg-api"]:
-    if os.path.isfile(api_p):
+import glob, ipaddress, json, os, re, subprocess, sys, urllib.request
+
+wan = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else "eth0"
+
+# 1. Проверка адресов на интерфейсе после RS
+try:
+    out = subprocess.check_output(["ip", "-6", "-o", "addr", "show", "scope", "global"], stderr=subprocess.DEVNULL).decode("utf-8", errors="replace")
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 4:
+            dev = parts[1]
+            if not re.match(r"^(lo|awg|wg|warp|docker|br-|veth|tun|tap)", dev):
+                ip = parts[3].split("/")[0]
+                try:
+                    obj = ipaddress.IPv6Address(ip)
+                    if obj.is_global and not ip.endswith("::1"):
+                        print(ip)
+                        sys.exit(0)
+                except Exception:
+                    pass
+except Exception:
+    pass
+
+# 2. Поиск в метаданных и конфигах облачного провайдера
+def check_text(txt):
+    cands = []
+    for m in re.finditer(r"\b(2[0-9a-fA-F]{3}:[0-9a-fA-F:]+)(?:/(\d+))?\b", txt):
+        raw = m.group(1).lower()
+        plen = int(m.group(2)) if m.group(2) else 64
         try:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("awg_api", api_p)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            v6, _, _, _ = mod.detect_public_ips_with_diag()
-            if v6:
-                print(v6)
-                sys.exit(0)
+            ip_obj = ipaddress.IPv6Address(raw)
+            if ip_obj.is_global and not ip_obj.is_multicast and not ip_obj.is_link_local and not ip_obj.is_private:
+                cands.append((raw, plen))
         except Exception:
             pass
+    if not cands:
+        return None
+    best_ip, best_plen = cands[0]
+    for c_ip, c_plen in cands:
+        if not c_ip.endswith("::1"):
+            best_ip, best_plen = c_ip, c_plen
+            break
+    gw_m = re.search(r"(?:gateway6|via|gateway)\s*[:=]\s*[\"'\s]*([23][0-9a-fA-F:]+)", txt)
+    found_gw = ""
+    if gw_m:
+        try:
+            g = ipaddress.IPv6Address(gw_m.group(1).lower())
+            if g.is_global:
+                found_gw = str(g)
+        except Exception:
+            pass
+    if not found_gw:
+        try:
+            net = ipaddress.IPv6Network(f"{best_ip}/{best_plen}", strict=False)
+            found_gw = str(net.network_address + 1)
+        except Exception:
+            pass
+    return best_ip, best_plen, found_gw
+
+found = None
+# IMDS
+for imds_url in [
+    "http://169.254.169.254/openstack/latest/network_data.json",
+    "http://169.254.169.254/metadata/v1.json",
+    "http://169.254.169.254/hetzner/v1/metadata/network"
+]:
+    try:
+        req = urllib.request.Request(imds_url, headers={"User-Agent": "cloud-init"})
+        with urllib.request.urlopen(req, timeout=0.8) as r:
+            found = check_text(r.read().decode("utf-8", errors="replace"))
+            if found:
+                break
+    except Exception:
+        pass
+
+# Файлы на диске
+if not found:
+    file_patterns = [
+        "/run/cloud-init/instance-data.json",
+        "/run/cloud-init/result.json",
+        "/var/lib/cloud/instance/instance-data.json",
+        "/var/lib/cloud/instances/*/network-data.json",
+        "/var/lib/cloud/instance/user-data",
+        "/etc/netplan/*.yaml",
+        "/etc/netplan/*.yml",
+        "/etc/network/interfaces",
+        "/etc/network/interfaces.d/*",
+        "/etc/systemd/network/*.network",
+        "/etc/sysconfig/network-scripts/ifcfg-*"
+    ]
+    for pat in file_patterns:
+        for fpath in glob.glob(pat):
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        found = check_text(f.read())
+                        if found:
+                            break
+                except Exception:
+                    pass
+        if found:
+            break
+
+if found:
+    ip, plen, gw = found
+    try:
+        subprocess.run(["ip", "-6", "addr", "replace", f"{ip}/{plen}", "dev", wan], stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:
+        try:
+            subprocess.run(["ip", "-6", "addr", "add", f"{ip}/{plen}", "dev", wan], stderr=subprocess.DEVNULL, timeout=2)
+        except Exception:
+            pass
+    if gw:
+        try:
+            subprocess.run(["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan, "onlink"], stderr=subprocess.DEVNULL, timeout=2)
+        except Exception:
+            try:
+                subprocess.run(["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan], stderr=subprocess.DEVNULL, timeout=2)
+            except Exception:
+                pass
+    if os.path.isdir("/etc/netplan"):
+        np_file = "/etc/netplan/60-awg-ipv6.yaml"
+        if not os.path.isfile(np_file):
+            routes_part = f"      routes:\n        - to: default\n          via: {gw}\n          on-link: true\n" if gw else ""
+            cfg = (
+                "network:\n"
+                "  version: 2\n"
+                "  ethernets:\n"
+                f"    {wan}:\n"
+                "      addresses:\n"
+                f"        - {ip}/{plen}\n"
+                f"{routes_part}"
+            )
+            try:
+                with open(np_file, "w", encoding="utf-8") as f:
+                    f.write(cfg)
+                os.chmod(np_file, 0o600)
+                subprocess.run(["netplan", "apply"], stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
+    print(ip)
+    sys.exit(0)
+
 sys.exit(1)
 PY
 )" 2>/dev/null || true

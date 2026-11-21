@@ -19,6 +19,7 @@ AmneziaWG Client Subscription & Management API Server (v2).
 """
 
 import base64
+import glob
 import hashlib
 import http.server
 import ipaddress
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 AWG_DIR = os.environ.get("AWG_DIR", "/etc/amnezia/amneziawg")
@@ -687,103 +689,81 @@ def _solicit_router_ra(wan_dev):
 
 
 def _discover_cloud_ipv6():
-    """Ищет выделенный провайдером IPv6 в cloud-init, IMDS метаданных и netplan."""
-    # 1. IMDS OpenStack network_data.json
-    try:
-        req = urllib.request.Request(
-            "http://169.254.169.254/openstack/latest/network_data.json",
-            headers={"User-Agent": "cloud-init"},
-        )
-        with urllib.request.urlopen(req, timeout=1.0) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            for net in data.get("networks", []):
-                ip = normalize_public_ipv6(net.get("ip_address", ""))
-                if ip:
-                    gw = ""
-                    for route in net.get("routes", []):
-                        if route.get("network") in ("::", "::/0", "default"):
-                            gw = normalize_public_ipv6(route.get("gateway", ""))
-                    return ip, int(net.get("netmask", 64) or 64), gw, "imds_openstack"
-    except Exception:
-        pass
-
-    # 2. IMDS DigitalOcean metadata v1
-    try:
-        req = urllib.request.Request(
-            "http://169.254.169.254/metadata/v1.json",
-            headers={"User-Agent": "cloud-init"},
-        )
-        with urllib.request.urlopen(req, timeout=1.0) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            for iface in data.get("interfaces", {}).get("public", []):
-                v6 = iface.get("ipv6", {})
-                ip = normalize_public_ipv6(v6.get("ip_address", ""))
-                if ip:
-                    gw = normalize_public_ipv6(v6.get("gateway", ""))
-                    plen = int(v6.get("netmask", 64) or 64)
-                    return ip, plen, gw, "imds_digitalocean"
-    except Exception:
-        pass
-
-    # 3. cloud-init cached data
-    for p in ["/run/cloud-init/instance-data.json", "/var/lib/cloud/instance/instance-data.json"]:
-        if os.path.isfile(p):
+    """Ищет выделенный провайдером IPv6 в cloud-init, IMDS метаданных, netplan и конфигах сети."""
+    def check_text(txt, source_name):
+        cands = []
+        for m in re.finditer(r"\b(2[0-9a-fA-F]{3}:[0-9a-fA-F:]+)(?:/(\d+))?\b", txt):
+            raw = m.group(1).lower()
+            plen = int(m.group(2)) if m.group(2) else 64
             try:
-                with open(p, "r", encoding="utf-8") as f:
-                    txt = f.read()
-                try:
-                    cdata = json.loads(txt)
-                    net_cfg = cdata.get("v1", {}).get("network_config", {}).get("config", [])
-                    for item in net_cfg:
-                        for sub in item.get("subnets", []):
-                            ip = normalize_public_ipv6(sub.get("address", ""))
-                            if ip:
-                                plen = int(sub.get("netmask", 64) if str(sub.get("netmask", "")).isdigit() else 64)
-                                gw = normalize_public_ipv6(sub.get("gateway", ""))
-                                return ip, plen, gw, "cloud_init_json"
-                except Exception:
-                    pass
-                for m in re.finditer(r"\b(2[0-9a-fA-F]{3}:[0-9a-fA-F:]+)(?:/(\d+))?\b", txt):
-                    cand = normalize_public_ipv6(m.group(1))
-                    if cand and not cand.endswith("::1"):
-                        plen = int(m.group(2)) if m.group(2) else 64
-                        gw_m = re.search(r"(?:gateway6|via|gateway)\s*[:=]\s*[\"'\''\s]*([23][0-9a-fA-F:]+)", txt)
-                        gw = normalize_public_ipv6(gw_m.group(1)) if gw_m else ""
-                        return cand, plen, gw, "cloud_init_regex"
+                ip_obj = ipaddress.IPv6Address(raw)
+                if ip_obj.is_global and not ip_obj.is_multicast and not ip_obj.is_link_local and not ip_obj.is_private:
+                    cands.append((raw, plen))
             except Exception:
                 pass
+        if not cands:
+            return None
+        best_ip, best_plen = cands[0]
+        for c_ip, c_plen in cands:
+            if not c_ip.endswith("::1"):
+                best_ip, best_plen = c_ip, c_plen
+                break
+        gw_m = re.search(r"(?:gateway6|via|gateway)\s*[:=]\s*[\"'\s]*([23][0-9a-fA-F:]+)", txt)
+        found_gw = ""
+        if gw_m:
+            try:
+                g = ipaddress.IPv6Address(gw_m.group(1).lower())
+                if g.is_global:
+                    found_gw = str(g)
+            except Exception:
+                pass
+        if not found_gw:
+            try:
+                net = ipaddress.IPv6Network(f"{best_ip}/{best_plen}", strict=False)
+                found_gw = str(net.network_address + 1)
+            except Exception:
+                pass
+        return best_ip, best_plen, found_gw, source_name
 
-    # 4. netplan yaml
-    for p in glob.glob("/etc/netplan/*.yaml") + glob.glob("/etc/netplan/*.yml"):
+    # 1. IMDS Cloud Metadata
+    for imds_url in [
+        "http://169.254.169.254/openstack/latest/network_data.json",
+        "http://169.254.169.254/metadata/v1.json",
+        "http://169.254.169.254/hetzner/v1/metadata/network",
+    ]:
         try:
-            with open(p, "r", encoding="utf-8") as f:
-                txt = f.read()
-            for m in re.finditer(r"\b(2[0-9a-fA-F]{3}:[0-9a-fA-F:]+)(?:/(\d+))?\b", txt):
-                cand = normalize_public_ipv6(m.group(1))
-                if cand and not cand.endswith("::1"):
-                    plen = int(m.group(2)) if m.group(2) else 64
-                    gw_m = re.search(r"(?:gateway6|via|gateway)\s*[:=]\s*[\"'\''\s]*([23][0-9a-fA-F:]+)", txt)
-                    gw = normalize_public_ipv6(gw_m.group(1)) if gw_m else ""
-                    return cand, plen, gw, "netplan_file"
+            req = urllib.request.Request(imds_url, headers={"User-Agent": "cloud-init"})
+            with urllib.request.urlopen(req, timeout=0.8) as r:
+                res = check_text(r.read().decode("utf-8", errors="replace"), imds_url)
+                if res:
+                    return res
         except Exception:
             pass
 
-    # 5. interfaces
-    for p in ["/etc/network/interfaces"] + glob.glob("/etc/network/interfaces.d/*"):
-        if os.path.isfile(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    txt = f.read()
-                m = re.search(r"address\s+([23][0-9a-fA-F:]+)(?:/(\d+))?", txt)
-                if m:
-                    cand = normalize_public_ipv6(m.group(1))
-                    if cand:
-                        plen = int(m.group(2)) if m.group(2) else 64
-                        gw_m = re.search(r"gateway\s+([23][0-9a-fA-F:]+)", txt)
-                        gw = normalize_public_ipv6(gw_m.group(1)) if gw_m else ""
-                        return cand, plen, gw, "interfaces_file"
-            except Exception:
-                pass
+    # 2. Local config files on disk
+    file_patterns = [
+        "/run/cloud-init/instance-data.json",
+        "/run/cloud-init/result.json",
+        "/var/lib/cloud/instance/instance-data.json",
+        "/var/lib/cloud/instances/*/network-data.json",
+        "/var/lib/cloud/instance/user-data",
+        "/etc/netplan/*.yaml",
+        "/etc/netplan/*.yml",
+        "/etc/network/interfaces",
+        "/etc/network/interfaces.d/*",
+        "/etc/systemd/network/*.network",
+        "/etc/sysconfig/network-scripts/ifcfg-*",
+    ]
+    for pat in file_patterns:
+        for fpath in glob.glob(pat):
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        res = check_text(f.read(), fpath)
+                        if res:
+                            return res
+                except Exception:
+                    pass
 
     return "", 0, "", "not_found"
 
@@ -795,25 +775,43 @@ def _activate_discovered_ipv6(ip, plen, gw, wan_dev):
     plen = plen or 64
     try:
         subprocess.run(
-            ["ip", "-6", "addr", "add", f"{ip}/{plen}", "dev", wan_dev],
+            ["ip", "-6", "addr", "replace", f"{ip}/{plen}", "dev", wan_dev],
             stderr=subprocess.DEVNULL,
             timeout=3,
         )
     except Exception:
-        pass
-    if gw:
         try:
             subprocess.run(
-                ["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan_dev],
+                ["ip", "-6", "addr", "add", f"{ip}/{plen}", "dev", wan_dev],
                 stderr=subprocess.DEVNULL,
                 timeout=3,
             )
         except Exception:
             pass
+    if gw:
+        try:
+            subprocess.run(
+                ["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan_dev, "onlink"],
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception:
+            try:
+                subprocess.run(
+                    ["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan_dev],
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
+            except Exception:
+                pass
     if os.path.isdir("/etc/netplan"):
         np_path = "/etc/netplan/60-awg-ipv6.yaml"
         if not os.path.isfile(np_path):
-            routes_block = f"      routes:\n        - to: default\n          via: {gw}\n" if gw else ""
+            routes_block = (
+                f"      routes:\n        - to: default\n          via: {gw}\n          on-link: true\n"
+                if gw
+                else ""
+            )
             content = (
                 "network:\n"
                 "  version: 2\n"
@@ -915,12 +913,15 @@ def _detect_public_ipv6_with_diag():
         ext_cand = _probe_external_ipv6(ranked[0]["ip"], max_urls=1)
         if ext_cand:
             return ext_cand, local_ips, "ok"
-        return "", local_ips, "no_default_route"
+        cand = _upgrade_temporary_v6(ranked[0]["ifname"], ranked[0]["ip"], recs)
+        return cand, local_ips, "local_assigned"
 
     if default_devs or saw_wan_route:
         ext_v6 = _probe_external_ipv6()
         if ext_v6:
             return ext_v6, local_ips, "ok"
+        if local_ips:
+            return local_ips[0], local_ips, "local_assigned"
         return "", local_ips, "no_egress"
 
     # Автоматический поиск и подъём IPv6 для ЛЮБОГО случайного VPS (SLAAC / IMDS / cloud-init / netplan)
@@ -1733,6 +1734,24 @@ class DualModeThreadedHTTPServerV6(DualModeThreadedHTTPServer):
 
 
 def build_ssl_context():
+    if not (os.path.isfile(API_TLS_CERT) and os.path.isfile(API_TLS_KEY)):
+        try:
+            os.makedirs(os.path.dirname(API_TLS_CERT), mode=0o700, exist_ok=True)
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", API_TLS_KEY, "-out", API_TLS_CERT,
+                    "-days", "3650", "-nodes",
+                    "-subj", "/CN=awg-api",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            os.chmod(API_TLS_CERT, 0o600)
+            os.chmod(API_TLS_KEY, 0o600)
+        except Exception:
+            pass
     if not (os.path.isfile(API_TLS_CERT) and os.path.isfile(API_TLS_KEY)):
         return None
     try:
