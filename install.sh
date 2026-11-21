@@ -2965,6 +2965,25 @@ do_switch_endpoint() {
       target_host="$(extract_host_from_endpoint "$target")"
       [ -n "$target_host" ] || die "некорректный адрес: $target"
       printf '%s\n' "$target_host" > "$ENDPOINT_MODE_FILE"
+      # Если указан публичный IPv6 (2000::/3), поднимаем его на WAN интерфейсе
+      if [[ "$target_host" =~ : ]] && [[ ! "${target_host,,}" =~ ^(fe80|fc|fd) ]]; then
+        local w_dev; w_dev="$(detect_wan_iface || true)"; w_dev="${w_dev:-eth0}"
+        if [ -n "$w_dev" ]; then
+          ip -6 addr replace "${target_host}/64" dev "$w_dev" 2>/dev/null || true
+          local calc_gw
+          calc_gw="$(python3 -c "import ipaddress; n=ipaddress.IPv6Network('${target_host}/64', strict=False); print(n.network_address + 1)" 2>/dev/null || true)"
+          if [ -n "$calc_gw" ]; then
+            ip -6 route replace default via "$calc_gw" dev "$w_dev" onlink 2>/dev/null || true
+          fi
+          if [ -d "/etc/netplan" ]; then
+            local np_f="/etc/netplan/60-awg-ipv6.yaml"
+            printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      addresses:\n        - %s/64\n      routes:\n        - to: default\n          via: %s\n          on-link: true\n' "$w_dev" "$target_host" "${calc_gw:-fe80::1}" > "$np_f"
+            chmod 600 "$np_f" 2>/dev/null || true
+            netplan apply >/dev/null 2>&1 || true
+          fi
+          step "IPv6 ${target_host}/64 активирован на интерфейсе ${w_dev} со шлюзом ${calc_gw}"
+        fi
+      fi
       ;;
   esac
 
