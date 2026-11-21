@@ -29,7 +29,7 @@ AWG_MTU="${AWG_MTU:-1280}"
 AWG_PORT="${AWG_PORT:-}"            # пусто -> 443/udp (или случайный 20000-59999 если занят)
 AWG_SUBNET="${AWG_SUBNET:-}"        # пусто -> случайный 10.x.y.0/24
 AWG_ENDPOINT="${AWG_ENDPOINT:-}"    # пусто -> автоопределение внешнего IPv4
-AWG_API_PORT="${AWG_API_PORT:-8443}"# порт HTTP API подписок для контейнеров MikroTik
+AWG_API_PORT="${AWG_API_PORT:-8443}"  # порт HTTP API подписок для контейнеров MikroTik
 CRED_FILE="/root/awg-credentials.txt"
 BACKUP_DIR="/root/awg-backups"
 LOG_FILE="/var/log/awg-install.log"
@@ -539,6 +539,9 @@ do_update() {
   mkdir -p "$API_DIR"
   install -m 755 "$tmp_upd/api.py" "$API_DIR/api.py"
   setup_api_service
+
+  # Очистка устаревших временных путей если создавались ранее
+  rm -rf /etc/amnezia/awg-api /etc/amnezia/awg-tokens 2>/dev/null || true
 
   if [ -d "$BOT_DIR" ]; then
     install -m 755 "$tmp_upd/bot.py" "$BOT_DIR/bot.py"
