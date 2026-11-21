@@ -194,10 +194,10 @@ detect_public_ip() { # печатает внешний IPv4 (учитывает 
 }
 
 detect_wan_iface() {
-  local iface
-  iface="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  local iface=""
+  iface="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
   if [ -z "$iface" ]; then
-    iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
   fi
   printf '%s' "$iface"
 }
@@ -206,16 +206,16 @@ get_subnet_prefix() { # извлекает префикс 'A.B.C.' из awg0.con
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   if [ -f "$conf" ]; then
     local srv_addr
-    srv_addr="$(conf_get Address "$conf")"
-    printf '%s' "$srv_addr" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.'
+    srv_addr="$(conf_get Address "$conf" || true)"
+    printf '%s' "$srv_addr" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.' || true
   fi
 }
 
 detect_wan6_iface() {
-  local iface
-  iface="$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  local iface=""
+  iface="$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
   if [ -z "$iface" ]; then
-    iface="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    iface="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
   fi
   printf '%s' "$iface"
 }
@@ -230,7 +230,7 @@ detect_public_ipv6() {
     fi
   done
   # Fallback: локальный адрес дефолтного маршрута IPv6
-  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
   if [[ "$ip" =~ : ]] && [[ ! "$ip" =~ ^fe80 ]] && [[ ! "$ip" =~ ^fd ]]; then
     printf '%s' "$ip"
     return 0
@@ -299,7 +299,7 @@ get_ipv6_prefix() { # извлекает IPv6 префикс (например f
     local srv_addr
     srv_addr="$(conf_get Address "$conf")"
     local ip6
-    ip6="$(printf '%s' "$srv_addr" | tr ',' '\n' | grep -i ':' | head -n1 | tr -d '[:space:]')"
+    ip6="$(printf '%s' "$srv_addr" | tr ',' '\n' | grep -i ':' | head -n1 | tr -d '[:space:]' || true)"
     if [ -n "$ip6" ]; then
       ip6="${ip6%%/*}"
       printf '%s' "${ip6%1}"
@@ -828,8 +828,8 @@ ensure_dualstack_support() {
   sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null 2>&1 || true
 
   local wan_iface wan6_iface
-  wan_iface="$(detect_wan_iface)"
-  wan6_iface="$(detect_wan6_iface)"
+  wan_iface="$(detect_wan_iface || true)"
+  wan6_iface="$(detect_wan6_iface || true)"
   wan6_iface="${wan6_iface:-$wan_iface}"
 
   # 1. Если на сервере в Address нет IPv6
@@ -1930,9 +1930,12 @@ do_diagnose() {
     else
       d_fail "Нет MASQUERADE ${subnet} -> ${wan}. Перезапустите туннель"
     fi
+    local wan6_check
+    wan6_check="$(detect_wan6_iface || true)"
+    wan6_check="${wan6_check:-$wan}"
     local ip6_subnet="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
-    if ip6tables -w -t nat -C POSTROUTING -s "$ip6_subnet" -o "$wan" -j MASQUERADE 2>/dev/null; then
-      d_ok "IPv6 NAT MASQUERADE ${ip6_subnet} -> ${wan}"
+    if ip6tables -w -t nat -C POSTROUTING -s "$ip6_subnet" -o "$wan6_check" -j MASQUERADE 2>/dev/null; then
+      d_ok "IPv6 NAT MASQUERADE ${ip6_subnet} -> ${wan6_check}"
     fi
     if iptables -w -C FORWARD -i "$AWG_IFACE" -o "$wan" -j ACCEPT 2>/dev/null; then
       d_ok "FORWARD ${AWG_IFACE} -> ${wan} разрешён"
@@ -2181,7 +2184,7 @@ apply_tunnel_rotation() {
   srv_addr="$(conf_get Address "$conf")"
   mtu="$(conf_get MTU "$conf")"
   mtu="${mtu:-$AWG_MTU}"
-  wan_iface="$(detect_wan_iface)"
+  wan_iface="$(detect_wan_iface || true)"
 
   local public_ip
   public_ip="$(get_public_endpoint_host)"
@@ -2233,7 +2236,7 @@ apply_tunnel_rotation() {
     local subnet
     subnet="$(get_subnet_prefix)0/24"
     local wan6_iface
-    wan6_iface="$(detect_wan6_iface)"
+    wan6_iface="$(detect_wan6_iface || true)"
     wan6_iface="${wan6_iface:-$wan_iface}"
     local ip6_subnet="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
     local ip6_pfx
@@ -2411,7 +2414,7 @@ apply_tunnel_preset() {
       ;;
     dns)
       target_port=53
-      if [ -n "$(ss -Hlnu "sport = :53" 2>/dev/null | grep '0\.0\.0\.0:53')" ] && [ "$(conf_get ListenPort "$conf")" != "53" ]; then
+      if [ -n "$(ss -Hlnu "sport = :53" 2>/dev/null | grep '0\.0\.0\.0:53' || true)" ] && [ "$(conf_get ListenPort "$conf")" != "53" ]; then
         warn "Порт 53/udp занят (0.0.0.0:53), выбираю альтернативный 20000-59999"
         target_port="$(rand_range 20000 59999)"
       fi
