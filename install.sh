@@ -22,11 +22,11 @@ fi
 set -Eeuo pipefail
 
 #--- конфигурация --------------------------------------------------------------
-AWG_MANAGER_VERSION="3.2.5"
+AWG_MANAGER_VERSION="3.2.6"
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_DNS="${AWG_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
-AWG_MTU="${AWG_MTU:-1200}"
+AWG_MTU="${AWG_MTU:-1280}"
 AWG_PORT="${AWG_PORT:-}"            # пусто -> 443/udp (или случайный 20000-59999 если занят)
 AWG_SUBNET="${AWG_SUBNET:-}"        # пусто -> случайный 10.x.y.0/24
 AWG_IPV6_PREFIX="${AWG_IPV6_PREFIX:-fd42:42:42::}"
@@ -1323,6 +1323,18 @@ ensure_dualstack_support() {
     fi
   fi
 
+  # IPv6 требует MTU >= 1280 (RFC 8200 / Linux IPV6_MIN_MTU); при MTU < 1280 ядро сбрасывает IPv6 на интерфейсе
+  local srv_mtu
+  srv_mtu="$(conf_get MTU "$conf" 2>/dev/null || true)"
+  if [[ "$srv_mtu" =~ ^[0-9]+$ ]] && [ "$srv_mtu" -lt 1280 ]; then
+    step "Повышаем MTU сервера (${srv_mtu} -> 1280) для стабильной работы IPv6 (RFC 8200)..."
+    sed -i -E "s|^MTU[[:space:]]*=.*$|MTU = 1280|" "$conf"
+    if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
+      ip link set mtu 1280 up dev "$AWG_IFACE" 2>/dev/null || true
+      ip -6 addr add "${ip6_pfx}1/64" dev "$AWG_IFACE" 2>/dev/null || true
+    fi
+  fi
+
   # Добавляем ip6tables и TCP MSS Clamping в awg0.conf
   if ! grep -q 'TCPMSS' "$conf" || ! grep -q 'ip6tables' "$conf"; then
     python3 - "$conf" "$ip6_subnet" "$wan_iface" "$wan6_iface" <<'PY'
@@ -1415,10 +1427,16 @@ PY
     c_addr="$(conf_get Address "$cf" || true)"
     [ -n "$c_addr" ] || continue
 
-    # Гарантируем AllowedIPs, DNS и безопасный MTU=1200 в клиентском конфиге
+    # Гарантируем AllowedIPs, DNS и безопасный MTU >= 1280 (RFC 8200 min для IPv6) в клиентском конфиге
     sed -i -E "s|^AllowedIPs[[:space:]]*=.*$|AllowedIPs = ${target_allowed_ips}|" "$cf"
     sed -i -E "s|^DNS[[:space:]]*=.*$|DNS = ${target_dns}|" "$cf"
-    sed -i -E "s|^MTU[[:space:]]*=.*$|MTU = 1200|" "$cf"
+    local c_mtu
+    c_mtu="$(conf_get MTU "$cf" 2>/dev/null || true)"
+    if [ -z "$c_mtu" ]; then
+      sed -i -E "/^DNS[[:space:]]*=/a MTU = 1280" "$cf"
+    elif [[ "$c_mtu" =~ ^[0-9]+$ ]] && [ "$c_mtu" -lt 1280 ]; then
+      sed -i -E "s|^MTU[[:space:]]*=.*$|MTU = 1280|" "$cf"
+    fi
 
     local c_priv c_pub
     c_priv="$(conf_get PrivateKey "$cf" 2>/dev/null || true)"
@@ -1963,6 +1981,12 @@ do_add_client() {
   local cli_keepalive="${opt_keepalive:-25}"
 
   [[ "$cli_mtu" =~ ^[0-9]+$ ]] && [ "$cli_mtu" -ge 576 ] && [ "$cli_mtu" -le 9000 ] || die "некорректный MTU: $cli_mtu"
+  if [ "$cli_mtu" -lt 1280 ]; then
+    if [ -n "$opt_mtu" ]; then
+      warn "MTU ${cli_mtu} < 1280 несовместим с IPv6 (RFC 8200) — повышено до 1280"
+    fi
+    cli_mtu="1280"
+  fi
   [[ "$cli_keepalive" =~ ^[0-9]+$ ]] && [ "$cli_keepalive" -le 3600 ] || die "некорректный Keepalive: $cli_keepalive"
   case "$cli_dns$cli_allowed" in *$'\n'*|*$'\r'*) die "недопустимые символы переноса строки" ;; esac
 
@@ -2104,6 +2128,15 @@ do_edit_client() {
 
   if [ "$has_mtu" -eq 1 ]; then
     [[ "$opt_mtu" =~ ^[0-9]+$ ]] && [ "$opt_mtu" -ge 576 ] && [ "$opt_mtu" -le 9000 ] || die "некорректный MTU: $opt_mtu"
+    if [ "$opt_mtu" -lt 1280 ]; then
+      local cur_addr cur_alw
+      cur_addr="$(conf_get Address "$AWG_DIR/$name.conf" 2>/dev/null || true)"
+      cur_alw="${opt_allowed:-$(awk '/^\[Peer\]/{p=1;next} /^\[/{p=0} p && /^AllowedIPs[[:space:]]*=/{sub(/^AllowedIPs[[:space:]]*=[[:space:]]*/,""); print; exit}' "$AWG_DIR/$name.conf" 2>/dev/null || true)}"
+      if printf '%s %s' "$cur_addr" "$cur_alw" | grep -q ':'; then
+        warn "MTU ${opt_mtu} < 1280 несовместим с IPv6 (RFC 8200) — повышено до 1280"
+        opt_mtu="1280"
+      fi
+    fi
   fi
   if [ "$has_keepalive" -eq 1 ]; then
     [[ "$opt_keepalive" =~ ^[0-9]+$ ]] && [ "$opt_keepalive" -le 3600 ] || die "некорректный Keepalive: $opt_keepalive"
@@ -3266,6 +3299,9 @@ apply_tunnel_rotation() {
   srv_addr="$(conf_get Address "$conf")"
   mtu="$(conf_get MTU "$conf")"
   mtu="${mtu:-$AWG_MTU}"
+  if [[ "$mtu" =~ ^[0-9]+$ ]] && [ "$mtu" -lt 1280 ]; then
+    mtu="1280"
+  fi
   wan_iface="$(detect_wan_iface || true)"
   if [ -z "$wan_iface" ]; then
     wan_iface="$(grep '^PostUp' "$conf" 2>/dev/null | grep -oE '\-o [A-Za-z0-9_.:-]+ -j MASQUERADE' | head -n1 | awk '{print $2}' || true)"
@@ -3389,6 +3425,9 @@ EOF
         [ -n "$ex_mtu" ] && cli_mtu="$ex_mtu"
         [ -n "$ex_alw" ] && cli_allowed="$ex_alw"
         [ -n "$ex_ka" ] && cli_ka="$ex_ka"
+      fi
+      if [[ "$cli_mtu" =~ ^[0-9]+$ ]] && [ "$cli_mtu" -lt 1280 ]; then
+        cli_mtu="1280"
       fi
       if [ -z "$cli_priv" ]; then
         cli_priv="$(awg genkey)"
