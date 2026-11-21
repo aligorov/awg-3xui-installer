@@ -43,6 +43,7 @@ ADMIN_TOKEN_FILE="/etc/amnezia/amneziawg/admin_token"
 API_TLS_CERT="/etc/amnezia/amneziawg/api_tls.crt"
 API_TLS_KEY="/etc/amnezia/amneziawg/api_tls.key"
 ENDPOINT_MODE_FILE="/etc/amnezia/amneziawg/endpoint_mode.conf"
+MANUAL_IPV6_FILE="/etc/amnezia/amneziawg/manual_ipv6.conf"
 BOT_DIR="/opt/awg-bot"
 API_DIR="/opt/awg-api"
 BOT_ENV="/etc/amnezia/amneziawg/bot.env"
@@ -240,6 +241,20 @@ detect_public_ipv6() {
   if [ -n "${AWG_IPV6_ENDPOINT:-}" ]; then
     extract_host_from_endpoint "$AWG_IPV6_ENDPOINT"
     return 0
+  fi
+
+  # 1.5. Если задан IPv6 вручную через manual_ipv6.conf
+  if [ -s "$MANUAL_IPV6_FILE" ]; then
+    local man_ip
+    man_ip="$(cat "$MANUAL_IPV6_FILE" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$man_ip" ]; then
+      local w_dev; w_dev="$(detect_wan_iface || true)"; w_dev="${w_dev:-eth0}"
+      if [ -n "$w_dev" ]; then
+        ip -6 addr replace "${man_ip}/64" dev "$w_dev" 2>/dev/null || true
+      fi
+      printf '%s\n' "$man_ip"
+      return 0
+    fi
   fi
 
   # 2. Определение через curl -6 к надёжным внешним сервисам (быстрый таймаут 2с)
@@ -2912,8 +2927,136 @@ do_token() {
   printf 'Вставьте токен или ссылку подписки в веб-интерфейсе контейнера AmneziaWG на роутере.\n'
 }
 
-do_switch_endpoint() {
+#--- ручной ввод и активация IPv6 для Endpoint --------------------------------
+do_set_ipv6() {
   acquire_lock
+  local raw_ip="${1:-}"
+  local raw_gw="${2:-}"
+  local force_all=0
+  if [ "${3:-}" = "--all" ] || [ "${2:-}" = "--all" ]; then
+    force_all=1
+  fi
+
+  if [ -z "$raw_ip" ]; then
+    if [ "$IS_TTY" = 1 ]; then
+      printf '\n%b=== Ручная настройка внешнего IPv6 сервера для Endpoint ===%b\n' "$C_BOLD" "$C_RESET"
+      printf 'Укажите публичный IPv6, выделенный провайдером VPS в панели управления.\n'
+      read -r -p "IPv6 адрес (например: 2404:c140:1f00:32::6510): " raw_ip || { release_lock; return 0; }
+      read -r -p "Шлюз IPv6 (Enter для авто-расчёта ::1): " raw_gw || true
+    else
+      release_lock
+      die "укажите IPv6: awg-manager set-ipv6 <ipv6_адрес> [шлюз] [--all]"
+    fi
+  fi
+
+  raw_ip="$(printf '%s' "$raw_ip" | tr -d '[:space:]')"
+  [ -n "$raw_ip" ] || { release_lock; die "IPv6 адрес не указан"; }
+
+  # Валидация и расчёт шлюза через Python
+  local parsed
+  parsed="$(python3 - "$raw_ip" "${raw_gw:-}" <<'PY'
+import sys, ipaddress
+raw_ip = sys.argv[1].strip().strip('[]')
+raw_gw = sys.argv[2].strip().strip('[]') if len(sys.argv) > 2 and sys.argv[2].strip() else ""
+plen = 64
+if '/' in raw_ip:
+    raw_ip, p_str = raw_ip.split('/', 1)
+    if p_str.isdigit():
+        plen = int(p_str)
+try:
+    addr = ipaddress.IPv6Address(raw_ip)
+    if not (addr.is_global and not addr.is_multicast and not addr.is_private and not addr.is_link_local):
+        sys.exit(1)
+    ip_str = str(addr)
+    if raw_gw:
+        gw_addr = ipaddress.IPv6Address(raw_gw)
+        gw_str = str(gw_addr)
+    else:
+        net = ipaddress.IPv6Network(f"{ip_str}/{plen}", strict=False)
+        gw_str = str(net.network_address + 1)
+    print(f"{ip_str}|{plen}|{gw_str}")
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+)" 2>/dev/null || true
+
+  if [ -z "$parsed" ]; then
+    release_lock
+    die "Некорректный публичный IPv6 адрес: $raw_ip"
+  fi
+
+  local ip_v6 plen_v6 gw_v6
+  IFS='|' read -r ip_v6 plen_v6 gw_v6 <<< "$parsed"
+
+  local wan_dev
+  wan_dev="$(detect_wan_iface || true)"
+  wan_dev="${wan_dev:-eth0}"
+
+  step "Активация IPv6 ${ip_v6}/${plen_v6} на интерфейсе ${wan_dev}..."
+  ip -6 addr replace "${ip_v6}/${plen_v6}" dev "$wan_dev" 2>/dev/null || true
+  if [ -n "$gw_v6" ]; then
+    ip -6 route replace default via "$gw_v6" dev "$wan_dev" onlink 2>/dev/null || \
+    ip -6 route replace default via "$gw_v6" dev "$wan_dev" 2>/dev/null || true
+  fi
+
+  # Сохраняем в netplan для персистентности после перезагрузки сервера
+  if [ -d "/etc/netplan" ]; then
+    local np_file="/etc/netplan/60-awg-ipv6.yaml"
+    local routes_part=""
+    if [ -n "$gw_v6" ]; then
+      routes_part="      routes:\n        - to: default\n          via: ${gw_v6}\n          on-link: true\n"
+    fi
+    printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      addresses:\n        - %s/%s\n%b' \
+      "$wan_dev" "$ip_v6" "$plen_v6" "$routes_part" > "$np_file"
+    chmod 600 "$np_file" 2>/dev/null || true
+    netplan apply >/dev/null 2>&1 || true
+    ok "Конфигурация сохранена в $np_file"
+  fi
+
+  # Сохраняем в manual_ipv6.conf и endpoint_mode.conf
+  install -d -m 700 "$AWG_DIR"
+  printf '%s\n' "$ip_v6" > "$MANUAL_IPV6_FILE"
+  chmod 600 "$MANUAL_IPV6_FILE" 2>/dev/null || true
+  printf 'ipv6\n' > "$ENDPOINT_MODE_FILE"
+
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  local lport="443"
+  if [ -f "$conf" ]; then
+    lport="$(conf_get ListenPort "$conf" || echo "443")"
+  fi
+  local formatted_ep
+  formatted_ep="$(format_endpoint "$ip_v6" "$lport")"
+
+  local cf cname cmeta cmode count=0 skipped=0
+  for cf in "$AWG_DIR"/*.conf; do
+    [ -f "$cf" ] || continue
+    [ "$cf" != "$AWG_DIR/$AWG_IFACE.conf" ] || continue
+    cname="$(basename "$cf" .conf)"
+    cmeta="$(get_client_endpoint_meta "$cname")"
+    cmode="${cmeta%%|*}"
+    if [ "$force_all" -eq 0 ] && [ "$cmode" != "server" ] && [ -n "$cmode" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if [ "$force_all" -eq 1 ] && [ "$cmode" != "server" ]; then
+      set_client_endpoint_meta "$cname" "server" ""
+    fi
+    sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${formatted_ep}|" "$cf"
+    qrencode -o "${cf%.conf}.png" -s 6 -m 2 < "$cf" 2>/dev/null || true
+    chmod 600 "${cf%.conf}.png" 2>/dev/null || true
+    touch "$cf"
+    count=$((count + 1))
+  done
+
+  release_lock
+  ok "Внешний Endpoint сервера переключён на IPv6: ${formatted_ep}"
+  printf '  Клиентов обновлено: %s (индивидуальных override сохранено: %s)\n' "$count" "$skipped"
+  printf '  Интерфейс:          %s (%s/%s, gw: %s)\n' "$wan_dev" "$ip_v6" "$plen_v6" "${gw_v6:-авто}"
+  printf '  Роутеры с подпиской подтянут новый адрес автоматически.\n\n'
+}
+
+do_switch_endpoint() {
   local target="${1:-}"
   local force_all=0
   if [ "${2:-}" = "--all" ] || [ "${2:-}" = "--reset-overrides" ]; then
@@ -2933,21 +3076,49 @@ do_switch_endpoint() {
     if [ "$IS_TTY" = 1 ]; then
       printf '\n%b=== Настройка внешнего Endpoint подключения клиентов ===%b\n' "$C_BOLD" "$C_RESET"
       printf '  1) Внешний IPv4: %s\n' "${pub4:-не определен}"
-      printf '  2) Внешний IPv6: %s\n' "${pub6:-не определен}"
-      printf '  3) Ввести свой домен или IP вручную\n'
+      if [ -n "$pub6" ]; then
+        printf '  2) Внешний IPv6: %s (обнаружен)\n' "$pub6"
+      else
+        printf '  2) Внешний IPv6 (не обнаружен автоматически)\n'
+      fi
+      printf '  3) Ввести IPv6 вручную (настроить eth0 + шлюз + netplan)\n'
+      printf '  4) Ввести свой домен или IP вручную\n'
       printf '  0) Отмена\n'
       local ech
-      read -r -p "Выберите режим (1-3, 0 отмена): " ech || { release_lock; return 0; }
+      read -r -p "Выберите режим (1-4, 0 отмена): " ech || return 0
       case "$ech" in
         1) target="ipv4" ;;
-        2) target="ipv6" ;;
-        3) read -r -p "Введите внешний домен или IP: " target || { release_lock; return 0; } ;;
-        *) release_lock; return 0 ;;
+        2)
+          if [ -n "$pub6" ]; then
+            target="ipv6"
+          else
+            do_set_ipv6 "" "" $([ "$force_all" -eq 1 ] && echo "--all" || true)
+            return $?
+          fi
+          ;;
+        3)
+          do_set_ipv6 "" "" $([ "$force_all" -eq 1 ] && echo "--all" || true)
+          return $?
+          ;;
+        4)
+          read -r -p "Введите внешний домен или IP: " target || return 0
+          ;;
+        *) return 0 ;;
       esac
     else
       die "укажите режим: awg-manager endpoint [ipv4|ipv6|<хост>]"
     fi
   fi
+
+  # Если в качестве target передан IPv6 адрес, активируем через do_set_ipv6
+  local clean_target
+  clean_target="$(extract_host_from_endpoint "$target")"
+  if [[ "$clean_target" =~ : ]] && [[ ! "${clean_target,,}" =~ ^(fe80|fc|fd) ]]; then
+    do_set_ipv6 "$clean_target" "" $([ "$force_all" -eq 1 ] && echo "--all" || true)
+    return $?
+  fi
+
+  acquire_lock
 
   local target_host=""
   case "$target" in
@@ -2957,33 +3128,18 @@ do_switch_endpoint() {
       printf 'ipv4\n' > "$ENDPOINT_MODE_FILE"
       ;;
     ipv6|6)
-      [ -n "$pub6" ] || die "внешний IPv6 не обнаружен на сервере (провайдер VPS не назначил IPv6)"
+      if [ -z "$pub6" ]; then
+        release_lock
+        do_set_ipv6 "" "" $([ "$force_all" -eq 1 ] && echo "--all" || true)
+        return $?
+      fi
       target_host="$pub6"
       printf 'ipv6\n' > "$ENDPOINT_MODE_FILE"
       ;;
     *)
-      target_host="$(extract_host_from_endpoint "$target")"
+      target_host="$clean_target"
       [ -n "$target_host" ] || die "некорректный адрес: $target"
       printf '%s\n' "$target_host" > "$ENDPOINT_MODE_FILE"
-      # Если указан публичный IPv6 (2000::/3), поднимаем его на WAN интерфейсе
-      if [[ "$target_host" =~ : ]] && [[ ! "${target_host,,}" =~ ^(fe80|fc|fd) ]]; then
-        local w_dev; w_dev="$(detect_wan_iface || true)"; w_dev="${w_dev:-eth0}"
-        if [ -n "$w_dev" ]; then
-          ip -6 addr replace "${target_host}/64" dev "$w_dev" 2>/dev/null || true
-          local calc_gw
-          calc_gw="$(python3 -c "import ipaddress; n=ipaddress.IPv6Network('${target_host}/64', strict=False); print(n.network_address + 1)" 2>/dev/null || true)"
-          if [ -n "$calc_gw" ]; then
-            ip -6 route replace default via "$calc_gw" dev "$w_dev" onlink 2>/dev/null || true
-          fi
-          if [ -d "/etc/netplan" ]; then
-            local np_f="/etc/netplan/60-awg-ipv6.yaml"
-            printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      addresses:\n        - %s/64\n      routes:\n        - to: default\n          via: %s\n          on-link: true\n' "$w_dev" "$target_host" "${calc_gw:-fe80::1}" > "$np_f"
-            chmod 600 "$np_f" 2>/dev/null || true
-            netplan apply >/dev/null 2>&1 || true
-          fi
-          step "IPv6 ${target_host}/64 активирован на интерфейсе ${w_dev} со шлюзом ${calc_gw}"
-        fi
-      fi
       ;;
   esac
 
@@ -4073,6 +4229,7 @@ case "$ACTION" in
   token) do_token "${2:-}" ;;
   admin-token) do_admin_token "${2:-show}" ;;
   endpoint|ip-mode) do_switch_endpoint "${2:-}" "${3:-}" ;;
+  set-ipv6|ipv6) shift; do_set_ipv6 "$@" ;;
   api-status) do_api_status ;;
   api-restart) do_api_restart ;;
   add-client) shift; do_add_client "$@" ;;

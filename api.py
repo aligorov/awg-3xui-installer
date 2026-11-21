@@ -45,6 +45,7 @@ ADMIN_TOKEN_FILE = os.path.join(AWG_DIR, "admin_token")
 API_TLS_CERT = os.path.join(AWG_DIR, "api_tls.crt")
 API_TLS_KEY = os.path.join(AWG_DIR, "api_tls.key")
 ENDPOINT_MODE_FILE = os.path.join(AWG_DIR, "endpoint_mode.conf")
+MANUAL_IPV6_FILE = os.path.join(AWG_DIR, "manual_ipv6.conf")
 PRESET_FILE = os.path.join(AWG_DIR, "preset.conf")
 MANAGER_BIN = os.environ.get("AWG_MANAGER_BIN", "/usr/local/bin/awg-manager")
 API_HOST = os.environ.get("AWG_API_HOST", "0.0.0.0")
@@ -870,6 +871,17 @@ def _detect_public_ipv6_with_diag():
     if env_override:
         return env_override, [env_override], "ok"
 
+    if os.path.isfile(MANUAL_IPV6_FILE):
+        try:
+            man_v6 = normalize_public_ipv6(Path(MANUAL_IPV6_FILE).read_text(encoding="utf-8").strip())
+            if man_v6:
+                wan4 = _detect_default_devs("-4")
+                wan = wan4[0] if wan4 else "eth0"
+                _activate_discovered_ipv6(man_v6, 64, "", wan)
+                return man_v6, [man_v6], "manual_ipv6_conf"
+        except Exception:
+            pass
+
     recs = _collect_local_public_ipv6()
     local_ips = []
     for r in recs:
@@ -1406,6 +1418,9 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             if not target or "\n" in target or "\r" in target or len(target) > 128:
                 self.send_json(400, {"error": "Bad Request", "message": "Укажите target: ipv4, ipv6 или домен/IP."})
                 return
+            custom_ip6 = str(body.get("ipv6", "") or "").strip()
+            if custom_ip6 and target.lower() in ("ipv6", "6"):
+                target = custom_ip6
             args = ["endpoint", target]
             if body.get("all") or body.get("reset_overrides"):
                 args.append("--all")
