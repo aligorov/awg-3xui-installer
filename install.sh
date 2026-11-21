@@ -182,18 +182,18 @@ detect_public_ip() { # печатает внешний IPv4 (учитывает 
     printf '%s\n' "$AWG_ENDPOINT"
     return 0
   fi
-  for url in https://api.ipify.org https://icanhazip.com https://ifconfig.me https://checkip.amazonaws.com; do
-    ip="$(curl -4 -fsS --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! is_private_ipv4 "$ip"; then
-      printf '%s\n' "$ip"
-      return 0
-    fi
-  done
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
   if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! is_private_ipv4 "$ip"; then
     printf '%s\n' "$ip"
     return 0
   fi
+  for url in https://api.ipify.org https://icanhazip.com https://ifconfig.me https://checkip.amazonaws.com; do
+    ip="$(curl -4 -fsS --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! is_private_ipv4 "$ip"; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -225,20 +225,23 @@ detect_wan6_iface() {
 }
 
 detect_public_ipv6() {
-  local ip="" url
+  local ip="" url has_global6=""
+  # Быстрая проверка локального маршрута IPv6 (<2 мс, без ожидания таймаутов curl)
+  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  if [[ "$ip" =~ : ]] && [[ ! "${ip,,}" =~ ^(fe80|fc|fd|::1$) ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  has_global6="$(ip -6 -o addr show scope global 2>/dev/null | awk '!/temporary/ {print $4}' | head -n1 || true)"
+  [ -n "$has_global6" ] || return 1
+
   for url in https://api64.ipify.org https://icanhazip.com https://ifconfig.me; do
-    ip="$(curl -6 -fsS --max-time 4 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    ip="$(curl -6 -fsS --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
     if [[ "$ip" =~ : ]]; then
       printf '%s' "$ip"
       return 0
     fi
   done
-  # Fallback: локальный адрес дефолтного маршрута IPv6
-  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-  if [[ "$ip" =~ : ]] && [[ ! "$ip" =~ ^fe80 ]] && [[ ! "$ip" =~ ^fd ]]; then
-    printf '%s' "$ip"
-    return 0
-  fi
   return 1
 }
 
@@ -1637,10 +1640,13 @@ do_add_client() {
   set +x
   local k v
   local -A P=()
-  for k in MTU Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 HeaderProtectionKey ContentPaddingAddition ListenPort; do
-    v="$(conf_get "$k" "$conf")"
+  for k in MTU Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 ListenPort; do
+    v="$(conf_get "$k" "$conf" || true)"
     [ -n "$v" ] || die "в $conf нет параметра $k"
     P[$k]="$v"
+  done
+  for k in I1 HeaderProtectionKey ContentPaddingAddition; do
+    P[$k]="$(conf_get "$k" "$conf" || true)"
   done
 
   local cli_dns="${opt_dns:-$AWG_DNS}"
@@ -1720,10 +1726,10 @@ H1 = ${P[H1]}
 H2 = ${P[H2]}
 H3 = ${P[H3]}
 H4 = ${P[H4]}
-I1 = ${P[I1]}
-HeaderProtectionKey = ${P[HeaderProtectionKey]}
-ContentPaddingAddition = ${P[ContentPaddingAddition]}
-
+${P[I1]:+I1 = ${P[I1]}
+}${P[HeaderProtectionKey]:+HeaderProtectionKey = ${P[HeaderProtectionKey]}
+}${P[ContentPaddingAddition]:+ContentPaddingAddition = ${P[ContentPaddingAddition]}
+}
 [Peer]
 PublicKey = ${srv_pub}
 Endpoint = $(format_endpoint "$endpoint" "${P[ListenPort]}")
