@@ -533,7 +533,7 @@ upgrade_awg_packages() { # обновление старых пакетов из
   apt-get install "${APT[@]}" --allow-downgrades amneziawg amneziawg-dkms amneziawg-tools \
     || die "не удалось установить amneziawg из PPA"
   systemctl stop 'awg-quick@*' >/dev/null 2>&1 || true
-  if lsmod | grep -q '^amneziawg '; then
+  if [ -d /sys/module/amneziawg ] || lsmod 2>/dev/null | grep -E '^amneziawg ' >/dev/null; then
     rmmod amneziawg || die "модуль amneziawg занят — перезагрузите сервер"
   fi
   modprobe amneziawg || die "модуль amneziawg не загрузился"
@@ -1865,7 +1865,7 @@ do_diagnose() {
   d_info "Интерфейс: ${AWG_IFACE}, порт: ${port:-?}/udp, подсеть: ${subnet}, WAN: ${wan:-?}"
 
   step "1/8 Модуль ядра и профиль обфускации 3.1"
-  if lsmod 2>/dev/null | grep -q '^amneziawg '; then
+  if [ -d /sys/module/amneziawg ] || lsmod 2>/dev/null | grep -E '^amneziawg ' >/dev/null; then
     d_ok "Модуль amneziawg загружен"
   else
     d_fail "Модуль amneziawg не загружен. Проверьте: dkms status; sudo modprobe amneziawg"
