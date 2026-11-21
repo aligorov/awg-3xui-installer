@@ -22,7 +22,7 @@ fi
 set -Eeuo pipefail
 
 #--- конфигурация --------------------------------------------------------------
-AWG_MANAGER_VERSION="3.2.2"
+AWG_MANAGER_VERSION="3.2.3"
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_DNS="${AWG_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
@@ -862,7 +862,7 @@ fetch_bot_script() {
     return 0
   fi
   tmp_bot="$(mktemp)"
-  if curl -fsSL "${RAW_BASE_URL}/bot.py" -o "$tmp_bot" 2>/dev/null \
+  if curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/bot.py?_=$(date +%s)" -o "$tmp_bot" 2>/dev/null \
     && [ -s "$tmp_bot" ] && python3 -m py_compile "$tmp_bot" 2>/dev/null; then
     install -m 755 "$tmp_bot" "$BOT_DIR/bot.py"
     rm -f "$tmp_bot"
@@ -1220,7 +1220,7 @@ fetch_api_script() {
     return 0
   fi
   tmp_api="$(mktemp)"
-  if curl -fsSL "${RAW_BASE_URL}/api.py" -o "$tmp_api" 2>/dev/null \
+  if curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/api.py?_=$(date +%s)" -o "$tmp_api" 2>/dev/null \
     && [ -s "$tmp_api" ] && python3 -m py_compile "$tmp_api" 2>/dev/null; then
     install -m 755 "$tmp_api" "$API_DIR/api.py"
     rm -f "$tmp_api"
@@ -1426,9 +1426,10 @@ do_update() {
 
   step "Загрузка актуальных скриптов с GitHub..."
   local dl_err=0
-  curl -fsSL "${RAW_BASE_URL}/install.sh" -o "$tmp_upd/install.sh" || dl_err=1
-  curl -fsSL "${RAW_BASE_URL}/api.py" -o "$tmp_upd/api.py" || dl_err=1
-  curl -fsSL "${RAW_BASE_URL}/bot.py" -o "$tmp_upd/bot.py" || dl_err=1
+  local cb="?_=$(date +%s)"
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/install.sh${cb}" -o "$tmp_upd/install.sh" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/api.py${cb}" -o "$tmp_upd/api.py" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/bot.py${cb}" -o "$tmp_upd/bot.py" || dl_err=1
 
   if [ "$dl_err" -ne 0 ] || [ ! -s "$tmp_upd/install.sh" ]; then
     release_lock
@@ -1778,7 +1779,7 @@ EOF
   else
     local tmp_mgr
     tmp_mgr="$(mktemp)"
-    curl -fsSL "${RAW_BASE_URL}/install.sh" -o "$tmp_mgr" || { rm -f "$tmp_mgr"; die "не удалось скачать install.sh"; }
+    curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/install.sh?_=$(date +%s)" -o "$tmp_mgr" || { rm -f "$tmp_mgr"; die "не удалось скачать install.sh"; }
     bash -n "$tmp_mgr" || { rm -f "$tmp_mgr"; die "скачанный install.sh повреждён"; }
     install -m 755 "$tmp_mgr" /usr/local/bin/awg-manager
     rm -f "$tmp_mgr"
@@ -4005,7 +4006,7 @@ show_menu() {
           printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ И ПОДПИСКАМИ:%b\n' "$C_BOLD" "$C_RESET"
         elif [ "$i" -eq 5 ]; then
           printf '  %bСЕРВЕР, МАСКИРОВКА И РОТАЦИЯ:%b\n' "$C_BOLD" "$C_RESET"
-        elif [ "$i" -eq 11 ]; then
+        elif [ "$i" -eq 12 ]; then
           printf '  %bДИАГНОСТИКА И ОБСЛУЖИВАНИЕ:%b\n' "$C_BOLD" "$C_RESET"
         elif [ "$i" -eq "$exit_idx" ]; then
           printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"

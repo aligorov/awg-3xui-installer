@@ -25,7 +25,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   die "Этот скрипт должен быть запущен с правами root (sudo bash $0)"
 fi
 
-VERSION="3.2.2"
+VERSION="3.2.3"
 REPO_URL="${RAW_BASE_URL:-https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main}"
 
 printf '%b' "$C_CYAN$C_BOLD"
@@ -48,7 +48,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 step "Загрузка актуального установщика с GitHub ($REPO_URL)..."
-curl -fsSL "${REPO_URL}/install.sh" -o "$TMP_DIR/install.sh" || die "Не удалось скачать install.sh"
+curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${REPO_URL}/install.sh?_=$(date +%s)" -o "$TMP_DIR/install.sh" || die "Не удалось скачать install.sh"
 
 bash -n "$TMP_DIR/install.sh" || die "Синтаксическая ошибка в install.sh!"
 
