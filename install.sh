@@ -22,7 +22,7 @@ fi
 set -Eeuo pipefail
 
 #--- конфигурация --------------------------------------------------------------
-AWG_MANAGER_VERSION="3.2.1"
+AWG_MANAGER_VERSION="3.2.2"
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_DNS="${AWG_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
@@ -69,6 +69,7 @@ fi
 
 #--- вспомогательные функции ----------------------------------------------------
 step() { printf '\n%b==> [%s] %s%b\n' "$C_CYAN" "$(date '+%F %T')" "$*" "$C_RESET"; }
+ok()   { printf '%b[OK]%b %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%bВНИМАНИЕ: %s%b\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
 die()  { printf '\n%bОШИБКА: %s%b\nЛог: %s\n' "$C_RED" "$*" "$C_RESET" "$LOG_FILE" >&2; exit 1; }
 
@@ -3929,6 +3930,7 @@ show_menu() {
     "Admin-токен API (для управления с роутера)"
     "Сменить профиль маскировки (Stealth Presets)"
     "Сменить внешний Endpoint (IPv4 / IPv6)"
+    "Задать внешний IPv6 вручную (eth0 / netplan)"
     "Ротация сервера сейчас (смена порта, ключей и обфускации)"
     "Настроить авто-ротацию сервера по расписанию (шедулер)"
     "Настроить Telegram-бота"
@@ -4114,13 +4116,14 @@ show_menu() {
       4) do_admin_token "show" ;;
       5) do_preset "" ;;
       6) do_switch_endpoint "" ;;
-      7)
+      7) do_set_ipv6 "" ;;
+      8)
         if confirm_yes "Выполнить полную ротацию серверного туннеля прямо сейчас (смена порта, ключей сервера и параметров обфускации)?"; then
           do_rotate ""
         fi
         ;;
-      8) do_schedule "" ;;
-      9)
+      9) do_schedule "" ;;
+      10)
         printf '\n%bНастройка Telegram-бота:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Настроить токен и запустить бота\n'
         printf '  2) Статус бота\n'
@@ -4134,12 +4137,12 @@ show_menu() {
           3) do_bot_restart ;;
         esac
         ;;
-      10) do_status ;;
-      11) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
-      12) do_diagnose ;;
-      13) diag_live_capture ;;
-      14) do_update ;;
-      15)
+      11) do_status ;;
+      12) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
+      13) do_diagnose ;;
+      14) diag_live_capture ;;
+      15) do_update ;;
+      16)
         printf '\n%bРезервная копия и восстановление:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Создать бэкап сейчас\n'
         printf '  2) Восстановить из файла архива\n'
@@ -4153,17 +4156,17 @@ show_menu() {
           do_restore "$bkp"
         fi
         ;;
-      16)
+      17)
         if confirm_yes "Переустановить AmneziaWG начисто (текущие конфиги сохранятся в бэкап, ключи обновятся)?"; then
           do_reinstall
         fi
         ;;
-      17)
+      18)
         if confirm_yes "Полностью удалить AmneziaWG с сервера?"; then
           do_uninstall
         fi
         ;;
-      18)
+      19)
         break
         ;;
     esac
