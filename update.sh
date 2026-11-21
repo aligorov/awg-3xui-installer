@@ -25,6 +25,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   die "Этот скрипт должен быть запущен с правами root (sudo bash $0)"
 fi
 
+VERSION="3.2.0"
 REPO_URL="${RAW_BASE_URL:-https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main}"
 
 printf '%b' "$C_CYAN$C_BOLD"
@@ -38,7 +39,7 @@ cat << 'BANNER'
 BANNER
 printf '%b\n' "$C_RESET"
 
-step "Запуск обновления AmneziaWG Manager..."
+step "Запуск обновления AmneziaWG Manager до v${VERSION}..."
 
 TMP_DIR="$(mktemp -d /tmp/awg-update.XXXXXX)"
 cleanup() {

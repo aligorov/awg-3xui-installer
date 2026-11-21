@@ -22,6 +22,7 @@ fi
 set -Eeuo pipefail
 
 #--- конфигурация --------------------------------------------------------------
+AWG_MANAGER_VERSION="3.2.0"
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_DNS="${AWG_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
@@ -1482,6 +1483,19 @@ do_update() {
   printf '  API подписок/упр.:  awg-api.service (порт %s/tcp HTTP+HTTPS, активен)\n' "${AWG_API_PORT:-8443}"
   printf '  Admin API токен:    sudo awg-manager admin-token\n'
   printf '  Туннель и клиенты:  продолжают работать без перезапуска.\n\n'
+
+  # Принудительное определение и подъём IPv6 прямо во время обновления
+  local up_v6
+  up_v6="$(detect_public_ipv6 || true)"
+  if [ -n "$up_v6" ]; then
+    printf '  Обнаружен IPv6:     %b%s%b (активирован)\n\n' "$C_GREEN" "$up_v6" "$C_RESET"
+  fi
+
+  if [ "${IS_TTY:-0}" -eq 1 ] && [ "${ACTION:-}" = "menu" ]; then
+    printf '%bПерезапуск меню с обновлёнными функциями...%b\n' "$C_GREEN" "$C_RESET"
+    sleep 1
+    exec /usr/local/bin/awg-manager menu
+  fi
 }
 
 cleanup() {
@@ -2539,14 +2553,19 @@ do_bot_restart() {
   systemctl restart awg-bot && step "Telegram-бот перезапущен"
 }
 
+do_version() {
+  printf 'awg-manager v%s (AmneziaWG 3.1 Dual-Stack)\n' "$AWG_MANAGER_VERSION"
+}
+
 #--- статус сервера -----------------------------------------------------------
 do_status() {
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   [ -f "$conf" ] || die "туннель не установлен"
 
   printf '\n%b============================================================%b\n' "$C_CYAN" "$C_RESET"
-  printf '  %bAmneziaWG 3.1 — Состояние сервера%b\n' "$C_BOLD" "$C_RESET"
+  printf '  %bAmneziaWG 3.1 — Состояние сервера [ v%s ]%b\n' "$C_BOLD" "$AWG_MANAGER_VERSION" "$C_RESET"
   printf '%b============================================================%b\n' "$C_CYAN" "$C_RESET"
+  printf '  Версия менеджера:  %bv%s%b\n' "$C_BOLD" "$AWG_MANAGER_VERSION" "$C_RESET"
   local active
   active="$(systemctl is-active "awg-quick@${AWG_IFACE}" 2>/dev/null || true)"
   if [ "$active" = "active" ]; then
@@ -3789,7 +3808,7 @@ show_menu() {
     fi
 
     printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
-    printf '  %bAmneziaWG 3.1 — Панель управления сервером%b\n' "$C_BOLD" "$C_RESET"
+    printf '  %bAmneziaWG 3.1 — Панель управления [ v%s ]%b\n' "$C_BOLD" "$AWG_MANAGER_VERSION" "$C_RESET"
     printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
     printf '  Туннель awg0:  %s (%s/udp, %s, клиентов: %s)\n' "$srv_status" "$port" "$subnet" "$count"
     printf '  Маскировка:    %b%s%b\n' "$C_GREEN" "$(preset_title "$cur_preset" "$port")" "$C_RESET"
@@ -3997,6 +4016,11 @@ if [ -z "$ACTION" ]; then
   fi
 fi
 
+if [ "$ACTION" = "version" ] || [ "$ACTION" = "-v" ] || [ "$ACTION" = "--version" ]; then
+  do_version
+  exit 0
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "Запустите от root: sudo bash install.sh ${ACTION}" >&2
   exit 1
@@ -4042,6 +4066,7 @@ case "$ACTION" in
   status) do_status ;;
   diagnose) do_diagnose ;;
   diagnose-live) diag_live_capture ;;
+  version|-v|--version) do_version ;;
   update|self-update) do_update ;;
   backup) do_backup ;;
   restore) do_restore "${2:-}" ;;

@@ -37,6 +37,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+API_VERSION = "3.2.0"
 AWG_DIR = os.environ.get("AWG_DIR", "/etc/amnezia/amneziawg")
 AWG_IFACE = os.environ.get("AWG_IFACE", "awg0")
 TOKENS_FILE = os.path.join(AWG_DIR, "tokens.json")
@@ -1164,6 +1165,7 @@ def build_state_snapshot(include_configs=False, target_client=None, tls_enabled=
     server_etag = hashlib.sha256(etag_src).hexdigest()[:16]
 
     server = {
+        "version": API_VERSION,
         "listen_port": listen_port,
         "preset": preset_id,
         "endpoint_mode": ep_mode,
@@ -1208,7 +1210,7 @@ def run_manager(args, skip_api_restart=False):
 
 
 class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "AWG-API-Server/2.0"
+    server_version = f"AWG-API-Server/{API_VERSION}"
 
     def _client_ip(self):
         return _normalize_peer_ip(self.client_address[0]) if self.client_address else "unknown"
