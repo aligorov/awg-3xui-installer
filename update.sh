@@ -26,7 +26,16 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
 fi
 
 VERSION="3.2.3"
-REPO_URL="${RAW_BASE_URL:-https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main}"
+resolve_repo_url() {
+  local target_sha
+  target_sha="$(curl -fsSL --connect-timeout 4 https://api.github.com/repos/aligorov/awg-3xui-installer/commits/main 2>/dev/null | grep -m 1 '"sha":' | cut -d '"' -f 4 || true)"
+  if [ -n "$target_sha" ] && [ "${#target_sha}" -ge 40 ]; then
+    printf 'https://raw.githubusercontent.com/aligorov/awg-3xui-installer/%s' "$target_sha"
+  else
+    printf '%s' "${RAW_BASE_URL:-https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main}"
+  fi
+}
+REPO_URL="$(resolve_repo_url)"
 
 printf '%b' "$C_CYAN$C_BOLD"
 cat << 'BANNER'

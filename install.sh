@@ -1425,11 +1425,16 @@ do_update() {
   trap 'rm -rf "$tmp_upd"' RETURN
 
   step "Загрузка актуальных скриптов с GitHub..."
+  local fetch_base="${RAW_BASE_URL}"
+  local target_sha
+  target_sha="$(curl -fsSL --connect-timeout 4 https://api.github.com/repos/aligorov/awg-3xui-installer/commits/main 2>/dev/null | grep -m 1 '"sha":' | cut -d '"' -f 4 || true)"
+  if [ -n "$target_sha" ] && [ "${#target_sha}" -ge 40 ]; then
+    fetch_base="https://raw.githubusercontent.com/aligorov/awg-3xui-installer/${target_sha}"
+  fi
   local dl_err=0
-  local cb="?_=$(date +%s)"
-  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/install.sh${cb}" -o "$tmp_upd/install.sh" || dl_err=1
-  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/api.py${cb}" -o "$tmp_upd/api.py" || dl_err=1
-  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/bot.py${cb}" -o "$tmp_upd/bot.py" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/install.sh" -o "$tmp_upd/install.sh" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/api.py" -o "$tmp_upd/api.py" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/bot.py" -o "$tmp_upd/bot.py" || dl_err=1
 
   if [ "$dl_err" -ne 0 ] || [ ! -s "$tmp_upd/install.sh" ]; then
     release_lock
