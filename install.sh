@@ -227,15 +227,89 @@ apt_update() {
   return 1
 }
 
-#--- обфускация AmneziaWG 3.1 (анти-ТСПУ) --------------------------------------
-cps_i1() { # маскирующий пакет I1 в форме QUIC v1 Initial (RFC 9000, с рандомным DCID и длиной)
+#--- профили маскировки AmneziaWG 3.1 (анти-ТСПУ Stealth Presets) -------------
+# 1) HTTP/3 (QUIC): 443/udp, RFC 9000 QUIC v1 Initial (<b 0xc10000000108><r 8><b 0x00004120><r 288>)
+# 2) WebRTC / STUN: 3478/udp, RFC 5389 Binding Request (<b 0x000100002112a442><r 12>)
+# 3) WebRTC Alt Port: 20000-50000/udp со STUN Magic Cookie (<b 0x000100002112a442><r 12>)
+# 4) DNS Query (EDNS0): 53/udp, RFC 6891 EDNS0 ya.ru (<r 2><b 0x0100000100000000000102796102727500000100010000291000000000000000>)
+# 5) Steam Game (A2S): 27015/udp, Valve Source Engine Query (<b 0xffffffff54536f7572636520456e67696e6520517565727900>)
+
+cps_i1_quic() {
   local first_b plen varint_hex out
   first_b="$(printf 'c%x' "$(rand_range 0 15)")"
   plen="$(rand_range 200 340)"
   varint_hex="$(printf '%04x' "$((0x4000 + plen))")"
   out="$(printf '<b 0x%s0000000108><r 8><b 0x0000%s><r %s>' "$first_b" "$varint_hex" "$plen")"
-  [[ "$out" =~ ^\<b\ 0xc[0-9a-f]0000000108\>\<r\ 8\>\<b\ 0x00004[0-9a-f]{3}\>\<r\ [0-9]{3}\>$ ]] || return 1
   printf '%s\n' "$out"
+}
+
+cps_i1_stun() {
+  printf '<b 0x000100002112a442><r 12>\n'
+}
+
+cps_i1_dns() {
+  printf '<r 2><b 0x0100000100000000000102796102727500000100010000291000000000000000>\n'
+}
+
+cps_i1_steam() {
+  printf '<b 0xffffffff54536f7572636520456e67696e6520517565727900>\n'
+}
+
+get_current_preset() {
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  if [ -f "$AWG_DIR/preset.conf" ]; then
+    local p
+    p="$(cat "$AWG_DIR/preset.conf" 2>/dev/null | tr -d ' \r\n' || true)"
+    if [ -n "$p" ]; then
+      printf '%s\n' "$p"
+      return
+    fi
+  fi
+  if [ ! -f "$conf" ]; then
+    printf 'quic\n'
+    return
+  fi
+  local i1 port
+  i1="$(conf_get I1 "$conf" 2>/dev/null || true)"
+  port="$(conf_get ListenPort "$conf" 2>/dev/null || true)"
+  if printf '%s' "$i1" | grep -q '2112a442'; then
+    if [ "$port" = "3478" ]; then
+      printf 'stun\n'
+    else
+      printf 'stun-alt\n'
+    fi
+  elif printf '%s' "$i1" | grep -q '027961027275'; then
+    printf 'dns\n'
+  elif printf '%s' "$i1" | grep -q '54536f75726365'; then
+    printf 'steam\n'
+  elif printf '%s' "$i1" | grep -q '0000000108'; then
+    printf 'quic\n'
+  else
+    printf 'quic\n'
+  fi
+}
+
+preset_title() {
+  case "$1" in
+    quic)     printf 'HTTP/3 (QUIC) — 443/udp (маскировка под YouTube / HTTPS)' ;;
+    stun)     printf 'WebRTC / STUN — 3478/udp (маскировка под Telegram / WhatsApp звонки)' ;;
+    stun-alt) printf 'WebRTC / STUN (Alt) — 20000-50000/udp со STUN Magic Cookie' ;;
+    dns)      printf 'DNS (EDNS0) — 53/udp (маскировка под DNS-запросы ya.ru)' ;;
+    steam)    printf 'Игровой (Steam) — 27015/udp (опрос серверов CS2/Steam A2S)' ;;
+    custom)   printf 'Пользовательский (ручной порт и I1)' ;;
+    *)        printf 'HTTP/3 (QUIC) — 443/udp' ;;
+  esac
+}
+
+cps_i1() {
+  local p
+  p="$(get_current_preset)"
+  case "$p" in
+    stun|stun-alt) cps_i1_stun ;;
+    dns) cps_i1_dns ;;
+    steam) cps_i1_steam ;;
+    *) cps_i1_quic ;;
+  esac
 }
 
 s4_collides() { # проверка коллизий длин для модуля ядра
@@ -1295,6 +1369,7 @@ do_status() {
     printf '  Сервис awg-quick:  %b🔴 Остановлен%b\n' "$C_RED" "$C_RESET"
   fi
   printf '  ListenPort:        %s/udp\n' "$(conf_get ListenPort "$conf")"
+  printf '  Маскировка:        %b%s%b\n' "$C_CYAN" "$(preset_title "$(get_current_preset)")" "$C_RESET"
   printf '  Подсеть туннеля:   %s\n' "$(get_subnet_prefix)0/24"
   printf '  Клиентов в базе:   %s\n' "$(grep -c '^\[Peer\]' "$conf" || true)"
 
@@ -1590,24 +1665,23 @@ do_token() {
   printf 'Вставьте токен или ссылку подписки в веб-интерфейсе контейнера AmneziaWG на роутере.\n'
 }
 
-do_rotate() {
-  acquire_lock
+#--- ротация всего туннеля сервера и смена маскировки -----------------------
+apply_tunnel_rotation() {
+  local p_name="$1"
+  local new_port="$2"
+  local i1="$3"
+  local jc="$4"
+  local jmin="$5"
+  local jmax="$6"
+  local cpa="$7"
+  local rotate_keys="$8" # true или false
+
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   [ -f "$conf" ] || die "туннель не установлен"
 
-  step "Ротация AmneziaWG 3.1: смена порта, ключей и параметров обфускации"
-  local old_port new_port="" try_p
+  local old_port
   old_port="$(conf_get ListenPort "$conf")"
-
-  for _ in $(seq 1 40); do
-    try_p="$(rand_range 20000 59999)"
-    if [ "$try_p" != "$old_port" ] && [ -z "$(ss -Hlnu "sport = :${try_p}" 2>/dev/null)" ]; then
-      new_port="$try_p"
-      break
-    fi
-  done
-  [ -n "$new_port" ] || die "не удалось найти новый свободный UDP-порт"
-  step "UDP-порт: ${old_port} -> ${new_port}"
+  step "Смена порта серверного туннеля: ${old_port}/udp -> ${new_port}/udp"
 
   local srv_addr mtu wan_iface
   srv_addr="$(conf_get Address "$conf")"
@@ -1631,18 +1705,22 @@ do_rotate() {
     END { if (name && ip) print name "|" ip }
   ' "$conf")"
 
-  [ -n "$clients_raw" ] || die "в $conf не найдено клиентов для ротации"
+  [ -n "$clients_raw" ] || die "в $conf не найдено клиентов"
 
   ( umask 077
     set +x
     local srv_priv srv_pub
-    srv_priv="$(awg genkey)"
-    srv_pub="$(printf '%s\n' "$srv_priv" | awg pubkey)"
+    if [ "$rotate_keys" = "true" ]; then
+      srv_priv="$(awg genkey)"
+      srv_pub="$(printf '%s\n' "$srv_priv" | awg pubkey)"
+      step "Сгенерированы новые ключи сервера (полная ротация туннеля)"
+    else
+      srv_priv="$(conf_get PrivateKey "$conf")"
+      [ -n "$srv_priv" ] || srv_priv="$(awg genkey)"
+      srv_pub="$(printf '%s\n' "$srv_priv" | awg pubkey)"
+    fi
 
-    local jc jmin jmax s1 s2 s3 s4 s4_free=() h1 h2 h3 h4 i1 hpk cpa dc_line=""
-    jc=$(rand_range 3 5)
-    jmin=$(rand_range 40 79)
-    jmax=$((jmin + $(rand_range 50 160)))
+    local s1 s2 s3 s4 s4_free=() h1 h2 h3 h4 hpk dc_line=""
     s1=$(rand_range 15 150)
     s2=$(rand_range 15 150)
     while [ $((s1 + 56)) -eq "$s2" ]; do s2=$(rand_range 15 150); done
@@ -1656,9 +1734,7 @@ do_rotate() {
     [ "${#s4_free[@]}" -gt 0 ] || die "ошибка расчёта параметров S4"
     s4="${s4_free[$(rand_range 0 $((${#s4_free[@]} - 1)))]}"
     h1=1; h2=2; h3=3; h4=4
-    i1="$(cps_i1)" || die "ошибка генерации I1"
     hpk="$(awg genkey)"
-    cpa='32-128'
     if grep -q '^DisableCookies[[:space:]]*=[[:space:]]*on' "$conf"; then
       dc_line=$'DisableCookies = on\n'
     fi
@@ -1699,7 +1775,14 @@ EOF
       [ -n "$c_name" ] && [ -n "$c_ip" ] || continue
       is_valid_client_name "$c_name" || continue
 
-      cli_priv="$(awg genkey)"
+      if [ -f "$AWG_DIR/${c_name}.conf" ]; then
+        cli_priv="$(conf_get PrivateKey "$AWG_DIR/${c_name}.conf" 2>/dev/null || true)"
+      else
+        cli_priv=""
+      fi
+      if [ -z "$cli_priv" ]; then
+        cli_priv="$(awg genkey)"
+      fi
       cli_pub="$(printf '%s\n' "$cli_priv" | awg pubkey)"
 
       cat >> "$tmp_conf" <<EOF
@@ -1747,10 +1830,12 @@ EOF
 
     mv "$tmp_conf" "$conf"
     chmod 600 "$conf"
-    step "Обновлены ключи и параметры для ${c_count} клиентов (токены сохранены)"
+    printf '%s\n' "$p_name" > "$AWG_DIR/preset.conf"
+    chmod 600 "$AWG_DIR/preset.conf" 2>/dev/null || true
+    step "Обновлены параметры для ${c_count} клиентов (токены и IP сохранены)"
   )
 
-  if [ -n "$old_port" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  if [ -n "$old_port" ] && [ "$old_port" != "$new_port" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw delete allow "${old_port}/udp" >/dev/null 2>&1 || true
     ufw allow "${new_port}/udp" >/dev/null 2>&1 || true
     step "ufw: закрыт порт ${old_port}/udp, открыт ${new_port}/udp"
@@ -1770,15 +1855,16 @@ try:
     sys.path.insert(0, '$BOT_DIR')
     from bot import load_env, ADMIN_IDS, send_message
     env = load_env()
+    title = '$(preset_title "$p_name")'
     for uid in ADMIN_IDS:
         try:
             send_message(
                 uid,
-                '🔄 <b>Выполнена ротация AmneziaWG 3.1!</b>\n\n'
-                f'• Новый порт: <code>${new_port}/udp</code>\n'
-                '• Профиль 3.1: обновлены HPK, CPS I1, S1–S4 и ключи\n'
+                '🎭 <b>Обновление серверного туннеля AmneziaWG 3.1!</b>\n\n'
+                f'• Профиль: <b>{html.escape(title)}</b>\n'
+                f'• Слушающий порт: <code>${new_port}/udp</code>\n'
+                '• Обфускация: новые I1, S1–S4, HPK, Jc, Jmin/max\n'
                 '• Клиенты с токенами (MikroTik контейнеры) обновятся автоматически.\n'
-                '• Для ручных клиентов (смартфоны) запросите новые QR через /clients'
             )
         except Exception:
             pass
@@ -1787,12 +1873,209 @@ except Exception:
 " 2>/dev/null || true
   fi
 
-  release_lock
   printf '\n%b============================================================%b\n' "$C_GREEN" "$C_RESET"
-  printf '  %bРотация AmneziaWG успешно завершена!%b\n' "$C_BOLD" "$C_RESET"
-  printf '  Новый UDP-порт:  %s/udp\n' "$new_port"
+  printf '  %bСерверный туннель AmneziaWG успешно обновлен!%b\n' "$C_BOLD" "$C_RESET"
+  printf '  Профиль маскировки:  %s\n' "$(preset_title "$p_name")"
+  printf '  Слушающий UDP-порт:  %s/udp\n' "$new_port"
   printf '  Все клиенты с токенами подхватят новый конфиг автоматически.\n'
   printf '%b============================================================%b\n\n' "$C_GREEN" "$C_RESET"
+}
+
+apply_tunnel_preset() {
+  local p_name="$1"
+  local custom_p="${2:-}"
+  local custom_i1="${3:-}"
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
+  local target_port="" target_i1="" target_jc="" target_jmin="" target_jmax="" target_cpa=""
+
+  case "$p_name" in
+    quic)
+      target_port=443
+      if [ -n "$(ss -Hlnu "sport = :443" 2>/dev/null)" ] && [ "$(conf_get ListenPort "$conf")" != "443" ]; then
+        warn "Порт 443/udp занят другим процессом, выбираю свободный 20000-59999/udp"
+        target_port="$(rand_range 20000 59999)"
+      fi
+      target_i1="$(cps_i1_quic)"
+      target_jc="$(rand_range 3 5)"
+      target_jmin="$(rand_range 40 70)"
+      target_jmax=$((target_jmin + $(rand_range 50 120)))
+      target_cpa='32-128'
+      ;;
+    stun)
+      target_port=3478
+      if [ -n "$(ss -Hlnu "sport = :3478" 2>/dev/null)" ] && [ "$(conf_get ListenPort "$conf")" != "3478" ]; then
+        warn "Порт 3478/udp занят, выбираю альтернативный 20000-50000"
+        target_port="$(rand_range 20000 50000)"
+      fi
+      target_i1="$(cps_i1_stun)"
+      target_jc=3
+      target_jmin=20
+      target_jmax=60
+      target_cpa='20-80'
+      ;;
+    stun-alt)
+      target_port="$(rand_range 20000 50000)"
+      target_i1="$(cps_i1_stun)"
+      target_jc=3
+      target_jmin=20
+      target_jmax=60
+      target_cpa='20-80'
+      ;;
+    dns)
+      target_port=53
+      if [ -n "$(ss -Hlnu "sport = :53" 2>/dev/null | grep '0\.0\.0\.0:53')" ] && [ "$(conf_get ListenPort "$conf")" != "53" ]; then
+        warn "Порт 53/udp занят (0.0.0.0:53), выбираю альтернативный 20000-59999"
+        target_port="$(rand_range 20000 59999)"
+      fi
+      target_i1="$(cps_i1_dns)"
+      target_jc=2
+      target_jmin=30
+      target_jmax=80
+      target_cpa='32-64'
+      ;;
+    steam)
+      target_port=27015
+      if [ -n "$(ss -Hlnu "sport = :27015" 2>/dev/null)" ] && [ "$(conf_get ListenPort "$conf")" != "27015" ]; then
+        target_port=3074
+      fi
+      target_i1="$(cps_i1_steam)"
+      target_jc=4
+      target_jmin=40
+      target_jmax=90
+      target_cpa='16-64'
+      ;;
+    custom)
+      target_port="${custom_p:-$(rand_range 20000 59999)}"
+      target_i1="${custom_i1:-$(cps_i1_quic)}"
+      target_jc=4
+      target_jmin=40
+      target_jmax=100
+      target_cpa='32-128'
+      ;;
+    *)
+      die "Неизвестный профиль '$p_name'. Допустимы: quic, stun, stun-alt, dns, steam, custom"
+      ;;
+  esac
+
+  apply_tunnel_rotation "$p_name" "$target_port" "$target_i1" "$target_jc" "$target_jmin" "$target_jmax" "$target_cpa" false
+}
+
+do_preset() {
+  local p_arg="${1:-}"
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
+  acquire_lock
+
+  if [ -z "$p_arg" ]; then
+    printf '\n%b=== Смена профиля маскировки туннеля (Stealth Presets) ===%b\n' "$C_CYAN$C_BOLD" "$C_RESET"
+    local cur_p
+    cur_p="$(get_current_preset)"
+    printf 'Текущий активный профиль сервера: %b%s%b\n\n' "$C_GREEN$C_BOLD" "$(preset_title "$cur_p")" "$C_RESET"
+    printf 'Выберите профиль маскировки трафика:\n'
+    printf '  1) HTTP/3 (QUIC)      — 443/udp   (маскировка под YouTube / HTTPS) [По умолчанию]\n'
+    printf '  2) WebRTC / STUN      — 3478/udp  (маскировка под Telegram / WhatsApp звонки)\n'
+    printf '  3) WebRTC (Alt Port)  — 20000-50000/udp со STUN Magic Cookie\n'
+    printf '  4) DNS (EDNS0)        — 53/udp    (маскировка под DNS-запросы ya.ru)\n'
+    printf '  5) Игровой (Steam)    — 27015/udp (маскировка под опрос серверов CS2/Steam)\n'
+    printf '  6) Пользовательский   — ручной ввод порта и произвольный I1\n'
+    printf '  0) Назад\n\n'
+    local choice=""
+    read -r -p "Выберите профиль (1-6, 0 для отмены): " choice || { release_lock; return 0; }
+    case "$choice" in
+      1) p_arg="quic" ;;
+      2) p_arg="stun" ;;
+      3) p_arg="stun-alt" ;;
+      4) p_arg="dns" ;;
+      5) p_arg="steam" ;;
+      6) p_arg="custom" ;;
+      0|q|quit|exit) release_lock; return 0 ;;
+      *) release_lock; die "Неверный выбор '$choice'" ;;
+    esac
+  fi
+
+  local custom_p="" custom_i1=""
+  if [ "$p_arg" = "custom" ]; then
+    read -r -p "Введите UDP-порт сервера (1-65535): " custom_p || { release_lock; die "ввод прерван"; }
+    read -r -p "Введите строку I1 (байткод AmneziaWG): " custom_i1 || { release_lock; die "ввод прерван"; }
+  fi
+
+  step "Применение профиля маскировки: $(preset_title "$p_arg")"
+  apply_tunnel_preset "$p_arg" "$custom_p" "$custom_i1"
+  release_lock
+}
+
+do_rotate() {
+  acquire_lock
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
+  local p_arg="${1:-}"
+  if [ -z "$p_arg" ]; then
+    p_arg="$(get_current_preset)"
+  fi
+
+  step "Полная ротация туннеля сервера: смена порта, ключей сервера и параметров обфускации"
+  local old_port new_port="" try_p
+  old_port="$(conf_get ListenPort "$conf")"
+
+  if [ "$p_arg" = "quic" ]; then
+    new_port=443
+    if [ "$old_port" = "443" ] || [ -n "$(ss -Hlnu "sport = :443" 2>/dev/null)" ]; then
+      for _ in $(seq 1 40); do
+        try_p="$(rand_range 20000 59999)"
+        if [ "$try_p" != "$old_port" ] && [ -z "$(ss -Hlnu "sport = :${try_p}" 2>/dev/null)" ]; then
+          new_port="$try_p"
+          break
+        fi
+      done
+    fi
+  elif [ "$p_arg" = "stun" ]; then
+    new_port=3478
+  elif [ "$p_arg" = "dns" ]; then
+    new_port=53
+  elif [ "$p_arg" = "steam" ]; then
+    new_port=27015
+  else
+    for _ in $(seq 1 40); do
+      try_p="$(rand_range 20000 59999)"
+      if [ "$try_p" != "$old_port" ] && [ -z "$(ss -Hlnu "sport = :${try_p}" 2>/dev/null)" ]; then
+        new_port="$try_p"
+        break
+      fi
+    done
+  fi
+
+  [ -n "$new_port" ] || new_port="$(rand_range 20000 59999)"
+
+  local target_i1 target_jc target_jmin target_jmax target_cpa
+  case "$p_arg" in
+    stun|stun-alt)
+      target_i1="$(cps_i1_stun)"
+      target_jc=3; target_jmin=20; target_jmax=60; target_cpa='20-80'
+      ;;
+    dns)
+      target_i1="$(cps_i1_dns)"
+      target_jc=2; target_jmin=30; target_jmax=80; target_cpa='32-64'
+      ;;
+    steam)
+      target_i1="$(cps_i1_steam)"
+      target_jc=4; target_jmin=40; target_jmax=90; target_cpa='16-64'
+      ;;
+    *)
+      p_arg="quic"
+      target_i1="$(cps_i1_quic)"
+      target_jc="$(rand_range 3 5)"
+      target_jmin="$(rand_range 40 70)"
+      target_jmax=$((target_jmin + $(rand_range 50 120)))
+      target_cpa='32-128'
+      ;;
+  esac
+
+  apply_tunnel_rotation "$p_arg" "$new_port" "$target_i1" "$target_jc" "$target_jmin" "$target_jmax" "$target_cpa" true
+  release_lock
 }
 
 do_schedule() {
@@ -2044,8 +2327,9 @@ show_menu() {
     "Добавить нового клиента"
     "Удалить клиента"
     "Токен и ссылка подписки для клиента"
+    "Сменить профиль маскировки (Stealth Presets)"
     "Ротация сервера сейчас (смена порта, ключей и обфускации)"
-    "Настроить авто-ротацию по расписанию (шедулер)"
+    "Настроить авто-ротацию сервера по расписанию (шедулер)"
     "Настроить Telegram-бота"
     "Детальный статус и статистика"
     "Перезапустить туннель"
@@ -2082,11 +2366,12 @@ show_menu() {
     fi
 
     local conf="$AWG_DIR/$AWG_IFACE.conf"
-    local port="-" subnet="-" count="0"
+    local port="-" subnet="-" count="0" cur_preset="QUIC"
     if [ -f "$conf" ]; then
       port="$(conf_get ListenPort "$conf")"
       subnet="$(get_subnet_prefix)0/24"
       count="$(grep -c '^\[Peer\]' "$conf" || true)"
+      cur_preset="$(get_current_preset)"
     fi
 
     if [ "$is_interactive" -eq 1 ]; then
@@ -2099,6 +2384,7 @@ show_menu() {
     printf '  %bAmneziaWG 3.1 — Панель управления сервером%b\n' "$C_BOLD" "$C_RESET"
     printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
     printf '  Туннель awg0:  %s (%s/udp, %s, клиентов: %s)\n' "$srv_status" "$port" "$subnet" "$count"
+    printf '  Маскировка:    %b%s%b\n' "$C_GREEN" "$(preset_title "$cur_preset")" "$C_RESET"
     printf '  Telegram-бот:  %b%s%b\n' "$C_CYAN" "$bot_status" "$C_RESET"
     printf '  API подписок:  %b%s%b\n' "$C_CYAN" "$api_status" "$C_RESET"
     printf '  Шедулер:       %b%s%b\n' "$C_CYAN" "$sched_status" "$C_RESET"
@@ -2114,15 +2400,15 @@ show_menu() {
         if [ "$i" -eq 0 ]; then
           printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ И ПОДПИСКАМИ:%b\n' "$C_BOLD" "$C_RESET"
         elif [ "$i" -eq 4 ]; then
-          printf '  %bСЕРВИС, РОТАЦИЯ И ШЕДУЛЕР:%b\n' "$C_BOLD" "$C_RESET"
-        elif [ "$i" -eq 9 ]; then
+          printf '  %bСЕРВЕР, МАСКИРОВКА И РОТАЦИЯ:%b\n' "$C_BOLD" "$C_RESET"
+        elif [ "$i" -eq 10 ]; then
           printf '  %bДИАГНОСТИКА И ОБСЛУЖИВАНИЕ:%b\n' "$C_BOLD" "$C_RESET"
-        elif [ "$i" -eq 15 ]; then
+        elif [ "$i" -eq 16 ]; then
           printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
         fi
 
         local num_str=""
-        if [ "$i" -eq 15 ]; then
+        if [ "$i" -eq 16 ]; then
           num_str=" 0"
         else
           printf -v num_str "%2d" "$((i+1))"
@@ -2151,7 +2437,7 @@ show_menu() {
           break
           ;;
         0)
-          selected=15
+          selected=16
           ;;
         [1-9])
           if [ "$key" -le "$num_items" ]; then
@@ -2181,10 +2467,11 @@ show_menu() {
       printf ' 13) %s\n' "${items[12]}"
       printf ' 14) %s\n' "${items[13]}"
       printf ' 15) %s\n' "${items[14]}"
-      printf '  0) %s\n' "${items[15]}"
+      printf ' 16) %s\n' "${items[15]}"
+      printf '  0) %s\n' "${items[16]}"
       printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
       local choice=""
-      read -r -p "Выберите пункт (1-15, 0 для выхода): " choice || break
+      read -r -p "Выберите пункт (1-16, 0 для выхода): " choice || break
       case "$choice" in
         1) selected=0 ;;
         2) selected=1 ;;
@@ -2201,6 +2488,7 @@ show_menu() {
         13) selected=12 ;;
         14) selected=13 ;;
         15) selected=14 ;;
+        16) selected=15 ;;
         0|q|quit|exit) break ;;
         *) printf 'Неизвестный пункт: %s\n' "$choice"; continue ;;
       esac
@@ -2242,13 +2530,14 @@ show_menu() {
       1) do_add_client "" ;;
       2) do_remove_client "" ;;
       3) do_token "" ;;
-      4)
-        if confirm_yes "Выполнить ротацию сервера AmneziaWG 3.1 прямо сейчас (смена порта, ключей и обфускации)?"; then
-          do_rotate
+      4) do_preset "" ;;
+      5)
+        if confirm_yes "Выполнить полную ротацию серверного туннеля прямо сейчас (смена порта, ключей сервера и параметров обфускации)?"; then
+          do_rotate ""
         fi
         ;;
-      5) do_schedule "" ;;
-      6)
+      6) do_schedule "" ;;
+      7)
         printf '\n%bНастройка Telegram-бота:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Настроить токен и запустить бота\n'
         printf '  2) Статус бота\n'
@@ -2262,12 +2551,12 @@ show_menu() {
           3) do_bot_restart ;;
         esac
         ;;
-      7) do_status ;;
-      8) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
-      9) do_diagnose ;;
-      10) diag_live_capture ;;
-      11) do_update ;;
-      12)
+      8) do_status ;;
+      9) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
+      10) do_diagnose ;;
+      11) diag_live_capture ;;
+      12) do_update ;;
+      13)
         printf '\n%bРезервная копия и восстановление:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Создать бэкап сейчас\n'
         printf '  2) Восстановить из файла архива\n'
@@ -2281,17 +2570,17 @@ show_menu() {
           do_restore "$bkp"
         fi
         ;;
-      13)
+      14)
         if confirm_yes "Переустановить AmneziaWG начисто (текущие конфиги сохранятся в бэкап, ключи обновятся)?"; then
           do_reinstall
         fi
         ;;
-      14)
+      15)
         if confirm_yes "Полностью удалить AmneziaWG с сервера?"; then
           do_uninstall
         fi
         ;;
-      15)
+      16)
         break
         ;;
     esac
@@ -2334,7 +2623,8 @@ case "$ACTION" in
   menu) show_menu ;;
   install) do_install ;;
   reinstall) do_reinstall ;;
-  rotate) do_rotate ;;
+  preset|mask) do_preset "${2:-}" "${3:-}" "${4:-}" ;;
+  rotate) do_rotate "${2:-}" ;;
   schedule) do_schedule "${2:-}" ;;
   token) do_token "${2:-}" ;;
   api-status) do_api_status ;;
@@ -2361,7 +2651,8 @@ case "$ACTION" in
   update        Обновить awg-manager и API подписок до последней версии
   install       Установка или идемпотентная проверка сервера
   reinstall     Полная переустановка ключей и туннеля (с бэкапом)
-  rotate        Ротация сервера (смена порта, ключей и обфускации)
+  preset        Сменить профиль маскировки туннеля (quic|stun|stun-alt|dns|steam|custom)
+  rotate        Полная ротация туннеля сервера (смена порта, ключей и обфускации)
   schedule      Настройка авто-ротации по расписанию (3days|weekly|daily|off|status)
   token         Показать токен и ссылку подписки для клиента
   api-status    Статус API-сервиса подписок клиентов

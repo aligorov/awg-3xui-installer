@@ -436,11 +436,41 @@ def get_server_stats():
     if has_dc:
         proto_str += " + DisableCookies"
 
+    preset_name = "QUIC (443/udp)"
+    try:
+        preset_file = f"{AWG_DIR}/preset.conf"
+        if os.path.exists(preset_file):
+            with open(preset_file, "r", encoding="utf-8") as pf:
+                p_code = pf.read().strip()
+                p_map = {
+                    "quic": "HTTP/3 (QUIC) — 443/udp",
+                    "stun": "WebRTC / STUN — 3478/udp",
+                    "stun-alt": "WebRTC Alt — 20000-50000/udp",
+                    "dns": "DNS (EDNS0) — 53/udp",
+                    "steam": "Steam (A2S) — 27015/udp",
+                    "custom": "Пользовательский",
+                }
+                preset_name = p_map.get(p_code, p_code)
+        elif os.path.exists(conf_file):
+            with open(conf_file, "r", encoding="utf-8") as cf:
+                c_content = cf.read()
+            if "2112a442" in c_content:
+                preset_name = "WebRTC / STUN (3478/udp)" if port == "3478" else "WebRTC Alt"
+            elif "027961027275" in c_content:
+                preset_name = "DNS (EDNS0) — 53/udp"
+            elif "54536f75726365" in c_content:
+                preset_name = "Steam (A2S) — 27015/udp"
+            elif "0000000108" in c_content:
+                preset_name = "HTTP/3 (QUIC) — 443/udp"
+    except Exception:
+        pass
+
     return (
         f"📊 <b>Состояние туннеля</b>\n"
         f"• Сервис: {status_icon}\n"
         f"• Интерфейс: <code>{html.escape(AWG_IFACE)}</code> ({html.escape(port)}/udp)\n"
         f"• Профиль: <code>{html.escape(proto_str)}</code>\n"
+        f"• Маскировка: 🎭 <b>{html.escape(preset_name)}</b>\n"
         f"• Авто-ротация: <b>{html.escape(sched_str)}</b>\n"
         f"• API подписок: <code>:{html.escape(API_PORT)}</code>\n"
         f"• Клиенты: <b>{len(clients)}</b> (🟢 <b>{online_count} онлайн</b>)\n"
@@ -485,13 +515,14 @@ def handle_start(chat_id, from_id=None, thread_id=None):
             [{"text": "➕ Добавить клиента", "callback_data": "menu_add"}],
             [{"text": "👥 Список клиентов", "callback_data": "menu_list"}],
             [
+                {"text": "🎭 Сменить маскировку", "callback_data": "menu_stealth"},
                 {"text": "🔄 Ротация сервера", "callback_data": "menu_rotate"},
-                {"text": "⏱ Авто-шедулер", "callback_data": "menu_schedule"},
             ],
             [
-                {"text": "📊 Статус", "callback_data": "menu_status"},
+                {"text": "⏱ Авто-шедулер", "callback_data": "menu_schedule"},
                 {"text": "🩺 Диагностика", "callback_data": "menu_diagnose"},
             ],
+            [{"text": "📊 Статус сервера", "callback_data": "menu_status"}],
         ]
     }
     send_message(chat_id, text, markup, message_thread_id=thread_id)
@@ -709,6 +740,39 @@ def handle_diagnose(chat_id, thread_id=None):
     send_message(chat_id, f"{prefix}<pre>{snippet}</pre>", markup, message_thread_id=thread_id)
 
 
+def handle_stealth_menu(chat_id, thread_id=None):
+    text = (
+        "🎭 <b>Профили маскировки трафика (Stealth Presets)</b>\n\n"
+        "Смена профиля меняет порт, CPS байт-код I1, джиттер и паддинг пакетов "
+        "для <b>всего туннеля сервера</b>. Клиенты с токенами (MikroTik контейнеры) "
+        "подхватят изменения автоматически без разрыва связи.\n\n"
+        "Выберите желаемый профиль маскировки:"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "🌐 HTTP/3 (QUIC) — 443/udp", "callback_data": "preset_quic"}],
+            [{"text": "📞 WebRTC / STUN — 3478/udp", "callback_data": "preset_stun"}],
+            [{"text": "📡 WebRTC Alt — 20000-50000/udp", "callback_data": "preset_stun-alt"}],
+            [{"text": "🔍 DNS (EDNS0) — 53/udp", "callback_data": "preset_dns"}],
+            [{"text": "🎮 Steam (A2S) — 27015/udp", "callback_data": "preset_steam"}],
+            [{"text": "« Главное меню", "callback_data": "menu_main"}],
+        ]
+    }
+    send_message(chat_id, text, markup, message_thread_id=thread_id)
+
+
+def handle_stealth_set(chat_id, preset_key, thread_id=None):
+    send_message(chat_id, f"⏳ Применяю профиль маскировки <b>{html.escape(preset_key)}</b> для туннеля сервера...", message_thread_id=thread_id)
+    ok, out = run_manager_cmd("preset", preset_key)
+    snippet = html.escape(out[-3000:]) if out else "Нет вывода"
+    if ok:
+        prefix = f"✅ <b>Профиль маскировки {html.escape(preset_key)} успешно применён!</b>\n"
+    else:
+        prefix = f"❌ <b>Ошибка переключения маскировки:</b>\n"
+    markup = {"inline_keyboard": [[{"text": "« Главное меню", "callback_data": "menu_main"}]]}
+    send_message(chat_id, f"{prefix}<pre>{snippet}</pre>", markup, message_thread_id=thread_id)
+
+
 def handle_rotate_prompt(chat_id, thread_id=None):
     text = (
         "⚠️ <b>Перегенерация сервера AmneziaWG 3.1</b>\n\n"
@@ -857,6 +921,11 @@ def main_loop():
                         handle_list_clients(chat_id, thread_id=thread_id)
                     elif cmd_head == "/status":
                         send_message(chat_id, get_server_stats(), message_thread_id=thread_id)
+                    elif cmd_head in ("/stealth", "/preset"):
+                        if arg:
+                            handle_stealth_set(chat_id, arg, thread_id=thread_id)
+                        else:
+                            handle_stealth_menu(chat_id, thread_id=thread_id)
                     elif cmd_head == "/diagnose":
                         handle_diagnose(chat_id, thread_id=thread_id)
                     elif cmd_head == "/rotate":
@@ -900,6 +969,10 @@ def main_loop():
 
                     if data == "menu_main":
                         handle_start(chat_id, from_id=from_id, thread_id=thread_id)
+                    elif data == "menu_stealth":
+                        handle_stealth_menu(chat_id, thread_id=thread_id)
+                    elif data.startswith("preset_"):
+                        handle_stealth_set(chat_id, data[7:], thread_id=thread_id)
                     elif data == "menu_list":
                         handle_list_clients(chat_id, thread_id=thread_id)
                     elif data == "menu_add":
