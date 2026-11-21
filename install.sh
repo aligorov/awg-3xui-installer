@@ -38,6 +38,7 @@ LOG_FILE="/var/log/awg-install.log"
 DBG_FILE="/var/log/awg-install.debug.log"
 LOCK_FILE="/run/lock/awg-manager.lock"
 TOKENS_FILE="/etc/amnezia/amneziawg/tokens.json"
+ENDPOINT_MODE_FILE="/etc/amnezia/amneziawg/endpoint_mode.conf"
 BOT_DIR="/opt/awg-bot"
 API_DIR="/opt/awg-api"
 BOT_ENV="/etc/amnezia/amneziawg/bot.env"
@@ -228,7 +229,68 @@ detect_public_ipv6() {
       return 0
     fi
   done
+  # Fallback: локальный адрес дефолтного маршрута IPv6
+  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  if [[ "$ip" =~ : ]] && [[ ! "$ip" =~ ^fe80 ]] && [[ ! "$ip" =~ ^fd ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
   return 1
+}
+
+get_public_endpoint_host() {
+  # 1. Если явно задан AWG_ENDPOINT в окружении
+  if [ -n "${AWG_ENDPOINT:-}" ]; then
+    extract_host_from_endpoint "$AWG_ENDPOINT"
+    return 0
+  fi
+
+  # 2. Если сохранен режим в endpoint_mode.conf
+  local mode=""
+  if [ -f "$ENDPOINT_MODE_FILE" ]; then
+    mode="$(cat "$ENDPOINT_MODE_FILE" 2>/dev/null | tr -d '[:space:]')"
+  fi
+
+  if [ "$mode" = "ipv6" ]; then
+    local ip6
+    ip6="$(detect_public_ipv6 || true)"
+    if [ -n "$ip6" ]; then
+      printf '%s' "$ip6"
+      return 0
+    fi
+  elif [ -n "$mode" ] && [ "$mode" != "ipv4" ]; then
+    local h
+    h="$(extract_host_from_endpoint "$mode")"
+    if [ -n "$h" ]; then
+      printf '%s' "$h"
+      return 0
+    fi
+  fi
+
+  # 3. Если в существующих конфигах уже используется IPv6
+  local cur_ep=""
+  if [ -f "$AWG_DIR/client1.conf" ]; then
+    cur_ep="$(conf_get Endpoint "$AWG_DIR/client1.conf" || true)"
+  fi
+  if [[ "$cur_ep" =~ : ]] && [[ ! "$cur_ep" =~ ^[0-9]+\.[0-9]+ ]]; then
+    local h
+    h="$(extract_host_from_endpoint "$cur_ep")"
+    if [ -n "$h" ]; then
+      printf '%s' "$h"
+      return 0
+    fi
+  fi
+
+  # 4. По умолчанию - публичный IPv4
+  local ip4
+  ip4="$(detect_public_ip || true)"
+  if [ -n "$ip4" ]; then
+    printf '%s' "$ip4"
+    return 0
+  fi
+
+  # 5. Если IPv4 нет, пробуем IPv6
+  detect_public_ipv6 || true
 }
 
 get_ipv6_prefix() { # извлекает IPv6 префикс (например fd42:42:42::) из awg0.conf
@@ -1321,11 +1383,8 @@ do_add_client() {
   local srv_pub endpoint priv pubk
   srv_pub="$(conf_get PrivateKey "$conf" | awg pubkey)" || die "ошибка pubkey сервера"
 
-  local ep_host=""
-  if [ -f "$AWG_DIR/client1.conf" ]; then
-    ep_host="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/client1.conf")")"
-  fi
-  endpoint="${ep_host:-$(detect_public_ip || true)}"
+  local endpoint
+  endpoint="$(get_public_endpoint_host)"
   [ -n "$endpoint" ] || die "не удалось определить внешний IP сервера"
 
   ( umask 077
@@ -1468,8 +1527,8 @@ do_list_clients() {
   [ -f "$conf" ] || die "туннель не установлен"
 
   printf '\n%b=== Список клиентов AmneziaWG ===%b\n' "$C_BOLD" "$C_RESET"
-  printf '%-4s %-18s %-16s %-10s %-18s %s\n' "№" "ИМЯ" "IP АДРЕС" "СТАТУС" "HANDSHAKE" "ТРАФИК (↓TX / ↑RX)"
-  printf '%s\n' "----------------------------------------------------------------------------------"
+  printf '%-4s %-16s %-34s %-10s %-14s %s\n' "№" "ИМЯ" "IP АДРЕС (IPv4 + IPv6)" "СТАТУС" "HANDSHAKE" "ТРАФИК (↓TX / ↑RX)"
+  printf '%s\n' "------------------------------------------------------------------------------------------------"
 
   local dump=""
   if awg show "$AWG_IFACE" >/dev/null 2>&1; then
@@ -1553,9 +1612,11 @@ for i, c in enumerate(clients, 1):
         status = "\033[0;32mOnline\033[0m" if online else "\033[0;37mOffline\033[0m"
         st_fmt = f"{status:<19}"
     name = c.get("name") or "client"
-    ip = c.get("ip", "").split("/")[0]
+    raw_ip = c.get("ip", "")
+    ip_parts = [x.strip().split("/")[0] for x in raw_ip.split(",") if x.strip()]
+    ip_display = " + ".join(ip_parts) if ip_parts else "-"
     traf = f"↓{fmt_bytes(st['tx'])} / ↑{fmt_bytes(st['rx'])}"
-    print(f"{i:<4} {name:<18} {ip:<16} {st_fmt} {fmt_time(hs):<18} {traf}")
+    print(f"{i:<4} {name:<16} {ip_display:<34} {st_fmt} {fmt_time(hs):<14} {traf}")
 PY
   printf '\n'
 }
@@ -1683,8 +1744,27 @@ do_status() {
   fi
   printf '  ListenPort:        %s/udp\n' "$(conf_get ListenPort "$conf")"
   printf '  Маскировка:        %b%s%b\n' "$C_CYAN" "$(preset_title "$(get_current_preset)")" "$C_RESET"
-  printf '  Подсеть туннеля:   %s\n' "$(get_subnet_prefix)0/24"
+  local srv_addr
+  srv_addr="$(conf_get Address "$conf")"
+  if printf '%s' "$srv_addr" | grep -q ':'; then
+    local ip6_pfx
+    ip6_pfx="$(get_ipv6_prefix)"
+    printf '  Подсеть туннеля:   %s (IPv4) + %s/64 (Dual-Stack IPv6)\n' "$(get_subnet_prefix)0/24" "$ip6_pfx"
+  else
+    printf '  Подсеть туннеля:   %s\n' "$(get_subnet_prefix)0/24"
+  fi
   printf '  Клиентов в базе:   %s\n' "$(grep -c '^\[Peer\]' "$conf" || true)"
+
+  local cur_ep=""
+  if [ -f "$AWG_DIR/client1.conf" ]; then
+    cur_ep="$(conf_get Endpoint "$AWG_DIR/client1.conf" || true)"
+  fi
+  local pub4 pub6
+  pub4="$(detect_public_ip || true)"
+  pub6="$(detect_public_ipv6 || true)"
+  printf '  Внешний IPv4:      %s\n' "${pub4:-нет}"
+  printf '  Внешний IPv6:      %s\n' "${pub6:-нет}"
+  printf '  Внешний Endpoint:  %b%s%b\n' "$C_BOLD" "${cur_ep:-не задан}" "$C_RESET"
 
   local bot_act
   bot_act="$(systemctl is-active awg-bot 2>/dev/null || true)"
@@ -1971,21 +2051,90 @@ do_token() {
   sanitize_existing_client_endpoints || true
 
   local pub_ip=""
-  if [ -f "$AWG_DIR/${name}.conf" ]; then
-    pub_ip="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/${name}.conf")")"
-  elif [ -f "$AWG_DIR/client1.conf" ]; then
-    pub_ip="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/client1.conf")")"
-  fi
+  pub_ip="$(get_public_endpoint_host)"
   pub_ip="${pub_ip:-$(detect_public_ip || true)}"
+  local api_url_host="$pub_ip"
+  if [[ "$api_url_host" =~ : ]] && [[ ! "$api_url_host" =~ ^\[ ]]; then
+    api_url_host="[${api_url_host}]"
+  fi
 
   printf '\n%b=== Данные подписки клиента: %s ===%b\n' "$C_BOLD" "$name" "$C_RESET"
   printf '  Клиент:                  %s\n' "$name"
   printf '  Токен для вебки:         %b%s%b\n' "$C_CYAN" "$token" "$C_RESET"
-  printf '  URL сервера API:         http://%s:%s\n' "$pub_ip" "$AWG_API_PORT"
-  printf '  Ссылка подписки (.conf): http://%s:%s/sub/%s\n' "$pub_ip" "$AWG_API_PORT" "$token"
-  printf '  Ссылка Amnezia (vpn://): http://%s:%s/vpn/%s\n' "$pub_ip" "$AWG_API_PORT" "$token"
-  printf '  RouterOS скрипт (.rsc):  http://%s:%s/rsc/%s\n\n' "$pub_ip" "$AWG_API_PORT" "$token"
+  printf '  URL сервера API:         http://%s:%s\n' "$api_url_host" "$AWG_API_PORT"
+  printf '  Ссылка подписки (.conf): http://%s:%s/sub/%s\n' "$api_url_host" "$AWG_API_PORT" "$token"
+  printf '  Ссылка Amnezia (vpn://): http://%s:%s/vpn/%s\n' "$api_url_host" "$AWG_API_PORT" "$token"
+  printf '  RouterOS скрипт (.rsc):  http://%s:%s/rsc/%s\n\n' "$api_url_host" "$AWG_API_PORT" "$token"
   printf 'Вставьте токен или ссылку подписки в веб-интерфейсе контейнера AmneziaWG на роутере.\n'
+}
+
+do_switch_endpoint() {
+  local target="${1:-}"
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+  local lport
+  lport="$(conf_get ListenPort "$conf" || true)"
+  [ -n "$lport" ] || die "не удалось определить ListenPort"
+
+  local pub4 pub6
+  pub4="$(detect_public_ip || true)"
+  pub6="$(detect_public_ipv6 || true)"
+
+  if [ -z "$target" ]; then
+    if [ "$IS_TTY" = 1 ]; then
+      printf '\n%b=== Настройка внешнего Endpoint подключения клиентов ===%b\n' "$C_BOLD" "$C_RESET"
+      printf '  1) Внешний IPv4: %s\n' "${pub4:-не определен}"
+      printf '  2) Внешний IPv6: %s\n' "${pub6:-не определен}"
+      printf '  3) Ввести свой домен или IP вручную\n'
+      printf '  0) Отмена\n'
+      local ech
+      read -r -p "Выберите режим (1-3, 0 отмена): " ech || return 0
+      case "$ech" in
+        1) target="ipv4" ;;
+        2) target="ipv6" ;;
+        3) read -r -p "Введите внешний домен или IP: " target || return 0 ;;
+        *) return 0 ;;
+      esac
+    else
+      die "укажите режим: awg-manager endpoint [ipv4|ipv6|<хост>]"
+    fi
+  fi
+
+  local target_host=""
+  case "$target" in
+    ipv4|4)
+      [ -n "$pub4" ] || die "внешний IPv4 не обнаружен на сервере"
+      target_host="$pub4"
+      printf 'ipv4\n' > "$ENDPOINT_MODE_FILE"
+      ;;
+    ipv6|6)
+      [ -n "$pub6" ] || die "внешний IPv6 не обнаружен на сервере (провайдер VPS не назначил IPv6)"
+      target_host="$pub6"
+      printf 'ipv6\n' > "$ENDPOINT_MODE_FILE"
+      ;;
+    *)
+      target_host="$(extract_host_from_endpoint "$target")"
+      [ -n "$target_host" ] || die "некорректный адрес: $target"
+      printf '%s\n' "$target_host" > "$ENDPOINT_MODE_FILE"
+      ;;
+  esac
+
+  local formatted_ep
+  formatted_ep="$(format_endpoint "$target_host" "$lport")"
+  step "Переключение Endpoint всех клиентов на: $formatted_ep"
+
+  local cf count=0
+  for cf in "$AWG_DIR"/*.conf; do
+    [ -f "$cf" ] || continue
+    [ "$cf" != "$AWG_DIR/$AWG_IFACE.conf" ] || continue
+    sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${formatted_ep}|" "$cf"
+    touch "$cf"
+    count=$((count + 1))
+  done
+
+  step "Обновлен Endpoint для ${count} клиентов."
+  printf '  Новый внешний Endpoint: %b%s%b\n' "$C_GREEN" "$formatted_ep" "$C_RESET"
+  printf '  Роутеры с токенами подписки автоматически подтянут новый адрес при следующем опросе.\n\n'
 }
 
 #--- ротация всего туннеля сервера и смена маскировки -----------------------
@@ -2012,11 +2161,8 @@ apply_tunnel_rotation() {
   mtu="${mtu:-$AWG_MTU}"
   wan_iface="$(detect_wan_iface)"
 
-  local ep_host="" public_ip
-  if [ -f "$AWG_DIR/client1.conf" ]; then
-    ep_host="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/client1.conf")")"
-  fi
-  public_ip="${ep_host:-$(detect_public_ip || true)}"
+  local public_ip
+  public_ip="$(get_public_endpoint_host)"
   [ -n "$public_ip" ] || die "не удалось определить публичный IP сервера"
 
   local clients_raw
@@ -2646,6 +2792,7 @@ show_menu() {
     "Удалить клиента"
     "Токен и ссылка подписки для клиента"
     "Сменить профиль маскировки (Stealth Presets)"
+    "Сменить внешний Endpoint (IPv4 / IPv6)"
     "Ротация сервера сейчас (смена порта, ключей и обфускации)"
     "Настроить авто-ротацию сервера по расписанию (шедулер)"
     "Настроить Telegram-бота"
@@ -2786,10 +2933,11 @@ show_menu() {
       printf ' 14) %s\n' "${items[13]}"
       printf ' 15) %s\n' "${items[14]}"
       printf ' 16) %s\n' "${items[15]}"
-      printf '  0) %s\n' "${items[16]}"
+      printf ' 17) %s\n' "${items[16]}"
+      printf '  0) %s\n' "${items[17]}"
       printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
       local choice=""
-      read -r -p "Выберите пункт (1-16, 0 для выхода): " choice || break
+      read -r -p "Выберите пункт (1-17, 0 для выхода): " choice || break
       case "$choice" in
         1) selected=0 ;;
         2) selected=1 ;;
@@ -2807,6 +2955,7 @@ show_menu() {
         14) selected=13 ;;
         15) selected=14 ;;
         16) selected=15 ;;
+        17) selected=16 ;;
         0|q|quit|exit) break ;;
         *) printf 'Неизвестный пункт: %s\n' "$choice"; continue ;;
       esac
@@ -2849,13 +2998,14 @@ show_menu() {
       2) do_remove_client "" ;;
       3) do_token "" ;;
       4) do_preset "" ;;
-      5)
+      5) do_switch_endpoint "" ;;
+      6)
         if confirm_yes "Выполнить полную ротацию серверного туннеля прямо сейчас (смена порта, ключей сервера и параметров обфускации)?"; then
           do_rotate ""
         fi
         ;;
-      6) do_schedule "" ;;
-      7)
+      7) do_schedule "" ;;
+      8)
         printf '\n%bНастройка Telegram-бота:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Настроить токен и запустить бота\n'
         printf '  2) Статус бота\n'
@@ -2869,12 +3019,12 @@ show_menu() {
           3) do_bot_restart ;;
         esac
         ;;
-      8) do_status ;;
-      9) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
-      10) do_diagnose ;;
-      11) diag_live_capture ;;
-      12) do_update ;;
-      13)
+      9) do_status ;;
+      10) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
+      11) do_diagnose ;;
+      12) diag_live_capture ;;
+      13) do_update ;;
+      14)
         printf '\n%bРезервная копия и восстановление:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Создать бэкап сейчас\n'
         printf '  2) Восстановить из файла архива\n'
@@ -2888,17 +3038,17 @@ show_menu() {
           do_restore "$bkp"
         fi
         ;;
-      14)
+      15)
         if confirm_yes "Переустановить AmneziaWG начисто (текущие конфиги сохранятся в бэкап, ключи обновятся)?"; then
           do_reinstall
         fi
         ;;
-      15)
+      16)
         if confirm_yes "Полностью удалить AmneziaWG с сервера?"; then
           do_uninstall
         fi
         ;;
-      16)
+      17)
         break
         ;;
     esac
@@ -2945,6 +3095,7 @@ case "$ACTION" in
   rotate) do_rotate "${2:-}" ;;
   schedule) do_schedule "${2:-}" ;;
   token) do_token "${2:-}" ;;
+  endpoint|ip-mode) do_switch_endpoint "${2:-}" ;;
   api-status) do_api_status ;;
   api-restart) do_api_restart ;;
   add-client) do_add_client "${2:-}" ;;
