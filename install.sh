@@ -22,7 +22,7 @@ fi
 set -Eeuo pipefail
 
 #--- конфигурация --------------------------------------------------------------
-AWG_MANAGER_VERSION="3.2.3"
+AWG_MANAGER_VERSION="3.2.4"
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_DNS="${AWG_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
@@ -1295,13 +1295,18 @@ ensure_dualstack_support() {
   local ip6_subnet="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
 
   apply_sysctl_hardening || true
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
   sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null 2>&1 || true
 
   local wan_iface wan6_iface
   wan_iface="$(detect_wan_iface || true)"
+  wan_iface="${wan_iface:-eth0}"
   wan6_iface="$(detect_wan6_iface || true)"
   wan6_iface="${wan6_iface:-$wan_iface}"
+
+  sysctl -w "net.ipv6.conf.${wan_iface}.forwarding=1" >/dev/null 2>&1 || true
+  sysctl -w "net.ipv6.conf.${wan_iface}.accept_ra=2" >/dev/null 2>&1 || true
 
   # 1. Если на сервере в Address нет IPv6
   if ! printf '%s' "$srv_addr" | grep -q ':'; then
@@ -1312,27 +1317,50 @@ ensure_dualstack_support() {
     if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
       ip -6 addr add "${ip6_pfx}1/64" dev "$AWG_IFACE" 2>/dev/null || true
     fi
+  fi
 
-    if ! grep -q 'ip6tables' "$conf"; then
-      python3 - "$conf" "$ip6_subnet" "$wan6_iface" <<'PY'
+  # Добавляем ip6tables и TCP MSS Clamping в awg0.conf
+  if ! grep -q 'TCPMSS' "$conf" || ! grep -q 'ip6tables' "$conf"; then
+    python3 - "$conf" "$ip6_subnet" "$wan_iface" "$wan6_iface" <<'PY'
 import sys
 conf = sys.argv[1]
 ip6_subnet = sys.argv[2]
-wan6_iface = sys.argv[3]
+wan_iface = sys.argv[3]
+wan6_iface = sys.argv[4]
 
-ip6_postup = f"; ip6tables -w -t nat -C POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+extra_up = ""
+if "ip6tables" not in open(conf).read():
+    extra_up += (
+        f"; ip6tables -w -t nat -C POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || true"
+        f"; ip6tables -w -C FORWARD -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || true"
+        f"; ip6tables -w -C FORWARD -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+    )
+extra_up += (
+    f"; iptables -w -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o {wan_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o {wan_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+    f"; ip6tables -w -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o {wan6_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o {wan6_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+)
 
-ip6_postdown = f"; ip6tables -w -t nat -D POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+extra_down = ""
+if "ip6tables" not in open(conf).read():
+    extra_down += (
+        f"; ip6tables -w -t nat -D POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || true"
+        f"; ip6tables -w -D FORWARD -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || true"
+        f"; ip6tables -w -D FORWARD -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+    )
+extra_down += (
+    f"; iptables -w -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o {wan_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+    f"; ip6tables -w -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o {wan6_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+)
 
 try:
     with open(conf, 'r') as f:
         lines = f.readlines()
     out = []
     for line in lines:
-        if line.strip().startswith('PostUp') and '=' in line and 'ip6tables' not in line:
-            out.append(f"{line.rstrip()}{ip6_postup}\n")
-        elif line.strip().startswith('PostDown') and '=' in line and 'ip6tables' not in line:
-            out.append(f"{line.rstrip()}{ip6_postdown}\n")
+        if line.strip().startswith('PostUp') and '=' in line and 'TCPMSS' not in line:
+            out.append(f"{line.rstrip()}{extra_up}\n")
+        elif line.strip().startswith('PostDown') and '=' in line and 'TCPMSS' not in line:
+            out.append(f"{line.rstrip()}{extra_down}\n")
         else:
             out.append(line)
     with open(conf, 'w') as f:
@@ -1340,14 +1368,38 @@ try:
 except Exception:
     pass
 PY
-    fi
   fi
 
-  # Активируем правила ip6tables в ядре немедленно
+  # Активируем правила iptables и ip6tables в ядре немедленно
+  if [ -n "$wan_iface" ]; then
+    local v4_subnet
+    v4_subnet="$(get_subnet_prefix)0/24"
+    iptables -w -t nat -C POSTROUTING -s "${v4_subnet}" -o "${wan_iface}" -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s "${v4_subnet}" -o "${wan_iface}" -j MASQUERADE 2>/dev/null || true
+    iptables -w -C FORWARD -i "$AWG_IFACE" -o "${wan_iface}" -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i "$AWG_IFACE" -o "${wan_iface}" -j ACCEPT 2>/dev/null || true
+    iptables -w -C FORWARD -i "${wan_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i "${wan_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -w -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o "$wan_iface" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o "$wan_iface" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  fi
+
   if [ -n "$wan6_iface" ]; then
     ip6tables -w -t nat -C POSTROUTING -s "${ip6_subnet}" -o "${wan6_iface}" -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s "${ip6_subnet}" -o "${wan6_iface}" -j MASQUERADE 2>/dev/null || true
     ip6tables -w -C FORWARD -i "$AWG_IFACE" -o "${wan6_iface}" -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i "$AWG_IFACE" -o "${wan6_iface}" -j ACCEPT 2>/dev/null || true
     ip6tables -w -C FORWARD -i "${wan6_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i "${wan6_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    ip6tables -w -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o "$wan6_iface" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o "$wan6_iface" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  fi
+
+  # Проверяем реальную связность с глобальным IPv6-интернетом
+  local has_v6_internet=0
+  if ping6 -c 1 -W 2 2606:4700:4700::1111 >/dev/null 2>&1 || ping6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1; then
+    has_v6_internet=1
+  fi
+
+  local target_allowed_ips="0.0.0.0/0, ::/0"
+  local target_dns="${AWG_DNS}"
+  if [ "$has_v6_internet" -eq 0 ]; then
+    # Если провайдер VPS не маршрутизирует исходящий IPv6 интернет, направляем клиентский трафик через IPv4,
+    # сохраняя IPv6 в качестве внешнего Endpoint туннеля для обхода блокировок.
+    target_allowed_ips="0.0.0.0/0"
+    target_dns="1.1.1.1, 1.0.0.1"
   fi
 
   # 2. Обновляем конфиги клиентов
@@ -1360,8 +1412,8 @@ PY
     [ -n "$c_addr" ] || continue
 
     # Гарантируем AllowedIPs и DNS в клиентском конфиге
-    sed -i -E "s|^AllowedIPs[[:space:]]*=.*$|AllowedIPs = 0.0.0.0/0, ::/0|" "$cf"
-    sed -i -E "s|^DNS[[:space:]]*=.*$|DNS = ${AWG_DNS}|" "$cf"
+    sed -i -E "s|^AllowedIPs[[:space:]]*=.*$|AllowedIPs = ${target_allowed_ips}|" "$cf"
+    sed -i -E "s|^DNS[[:space:]]*=.*$|DNS = ${target_dns}|" "$cf"
 
     local c_priv c_pub
     c_priv="$(conf_get PrivateKey "$cf" 2>/dev/null || true)"
@@ -1722,8 +1774,8 @@ H4 = ${h4}
 I1 = ${i1}
 HeaderProtectionKey = ${hpk}
 ContentPaddingAddition = ${cpa}
-${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; ip6tables -w -t nat -C POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-PostDown = iptables -w -t nat -D POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WAN_IFACE} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WAN_IFACE} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t nat -C POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WAN_IFACE} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WAN_IFACE} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+PostDown = iptables -w -t nat -D POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WAN_IFACE} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WAN_IFACE} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 [Peer]
 # client1
@@ -3056,6 +3108,9 @@ PY
     count=$((count + 1))
   done
 
+  # Гарантируем включение форвардинга, NAT и TCP MSS Clamping для всех протоколов
+  ensure_dualstack_support || true
+
   release_lock
   ok "Внешний Endpoint сервера переключён на IPv6: ${formatted_ep}"
   printf '  Клиентов обновлено: %s (индивидуальных override сохранено: %s)\n' "$count" "$skipped"
@@ -3175,6 +3230,9 @@ do_switch_endpoint() {
     count=$((count + 1))
   done
 
+  # Гарантируем форвардинг, NAT и TCP MSS Clamping
+  ensure_dualstack_support || true
+
   release_lock
   step "Обновлен Endpoint для ${count} клиентов (индивидуальных override сохранено: ${skipped})."
   printf '  Новый внешний Endpoint: %b%s%b\n' "$C_GREEN" "$formatted_ep" "$C_RESET"
@@ -3293,8 +3351,8 @@ H4 = ${h4}
 I1 = ${i1}
 HeaderProtectionKey = ${hpk}
 ContentPaddingAddition = ${cpa}
-${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${wan_iface} -j ACCEPT; iptables -w -C FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; ip6tables -w -t nat -C POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-PostDown = iptables -w -t nat -D POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${wan_iface} -j ACCEPT; iptables -w -C FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${wan_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${wan_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t nat -C POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${wan6_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${wan6_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+PostDown = iptables -w -t nat -D POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${wan_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${wan6_iface} -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 EOF
 
     local c_name c_ip cli_priv cli_pub cli_dns cli_mtu cli_allowed cli_ka cli_ep_host c_count=0

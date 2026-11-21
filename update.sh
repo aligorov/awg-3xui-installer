@@ -25,7 +25,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   die "Этот скрипт должен быть запущен с правами root (sudo bash $0)"
 fi
 
-VERSION="3.2.3"
+VERSION="3.2.4"
 resolve_repo_url() {
   local target_sha
   target_sha="$(curl -fsSL --connect-timeout 4 https://api.github.com/repos/aligorov/awg-3xui-installer/commits/main 2>/dev/null | grep -m 1 '"sha":' | cut -d '"' -f 4 || true)"

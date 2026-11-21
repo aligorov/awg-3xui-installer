@@ -37,7 +37,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-API_VERSION = "3.2.3"
+API_VERSION = "3.2.4"
 AWG_DIR = os.environ.get("AWG_DIR", "/etc/amnezia/amneziawg")
 AWG_IFACE = os.environ.get("AWG_IFACE", "awg0")
 TOKENS_FILE = os.path.join(AWG_DIR, "tokens.json")
