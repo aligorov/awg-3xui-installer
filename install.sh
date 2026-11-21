@@ -1928,8 +1928,62 @@ do_uninstall() {
 }
 
 #--- интерактивное меню (TUI) --------------------------------------------------
+read_menu_key() {
+  local key=""
+  IFS= read -rsn1 key 2>/dev/null || return 1
+  if [ "$key" = $'\x1b' ]; then
+    local seq=""
+    IFS= read -rsn2 -t 0.05 seq 2>/dev/null || true
+    case "$seq" in
+      "[A"|"OA") echo "UP" ;;
+      "[B"|"OB") echo "DOWN" ;;
+      "[C"|"OC") echo "RIGHT" ;;
+      "[D"|"OD") echo "LEFT" ;;
+      "") echo "ESC" ;;
+      *) echo "OTHER" ;;
+    esac
+  elif [ "$key" = "" ]; then
+    echo "ENTER"
+  elif [ "$key" = "k" ] || [ "$key" = "K" ]; then
+    echo "UP"
+  elif [ "$key" = "j" ] || [ "$key" = "J" ]; then
+    echo "DOWN"
+  elif [ "$key" = "q" ] || [ "$key" = "Q" ]; then
+    echo "QUIT"
+  else
+    echo "$key"
+  fi
+}
+
 show_menu() {
-  local choice
+  local is_interactive=0
+  if [ -t 0 ] && [ -t 1 ] && [ "${AWGM_PLAIN:-0}" != "1" ]; then
+    is_interactive=1
+  fi
+
+  local items=(
+    "Список клиентов, статус и QR-коды"
+    "Добавить нового клиента"
+    "Удалить клиента"
+    "Токен и ссылка подписки для клиента"
+    "Ротация сервера сейчас (смена порта, ключей и обфускации)"
+    "Настроить авто-ротацию по расписанию (шедулер)"
+    "Настроить Telegram-бота"
+    "Детальный статус и статистика"
+    "Перезапустить туннель"
+    "Самодиагностика — почему не подключается"
+    "Перехват входящих пакетов 15с (diagnose-live)"
+    "Резервная копия (бэкап) / Восстановление"
+    "Переустановить AmneziaWG начисто (с бэкапом)"
+    "Полное удаление AmneziaWG"
+    "Выход"
+  )
+  local num_items=${#items[@]}
+  local selected=0
+
+  # Восстановление курсора при выходе или сигнале
+  trap 'printf "\033[?25h" 2>/dev/null || true' EXIT INT TERM
+
   while :; do
     local srv_status="🔴"
     if systemctl is-active --quiet "awg-quick@${AWG_IFACE}" 2>/dev/null; then
@@ -1938,6 +1992,14 @@ show_menu() {
     local bot_status="⚪ Отключён"
     if systemctl is-active --quiet awg-bot 2>/dev/null; then
       bot_status="🟢 Работает"
+    fi
+    local api_status="⚪ Отключён"
+    if systemctl is-active --quiet awg-api 2>/dev/null; then
+      api_status="🟢 Порт ${AWG_API_PORT:-8443}/tcp"
+    fi
+    local sched_status="⚪ Выключен"
+    if systemctl is-active --quiet awg-rotate.timer 2>/dev/null; then
+      sched_status="🟢 Включён"
     fi
 
     local conf="$AWG_DIR/$AWG_IFACE.conf"
@@ -1948,36 +2010,127 @@ show_menu() {
       count="$(grep -c '^\[Peer\]' "$conf" || true)"
     fi
 
-    printf '\n%b============================================================%b\n' "$C_BLUE" "$C_RESET"
+    if [ "$is_interactive" -eq 1 ]; then
+      # Скрываем курсор при отрисовке стрелочного меню
+      printf '\033[?25l'
+      clear 2>/dev/null || printf '\033[H\033[J'
+    fi
+
+    printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
     printf '  %bAmneziaWG 3.1 — Панель управления сервером%b\n' "$C_BOLD" "$C_RESET"
     printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
     printf '  Туннель awg0:  %s (%s/udp, %s, клиентов: %s)\n' "$srv_status" "$port" "$subnet" "$count"
     printf '  Telegram-бот:  %b%s%b\n' "$C_CYAN" "$bot_status" "$C_RESET"
+    printf '  API подписок:  %b%s%b\n' "$C_CYAN" "$api_status" "$C_RESET"
+    printf '  Шедулер:       %b%s%b\n' "$C_CYAN" "$sched_status" "$C_RESET"
     printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
-    printf '  %bНе подключается? Пункт 10 — самодиагностика (ТСПУ/порт/NAT)%b\n' "$C_YELLOW" "$C_RESET"
-    printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ И ПОДПИСКАМИ:%b\n' "$C_BOLD" "$C_RESET"
-    printf '    1) Список клиентов, статус и QR-коды\n'
-    printf '    2) Добавить нового клиента\n'
-    printf '    3) Удалить клиента\n'
-    printf '    4) Показать токен и ссылку подписки для клиента\n'
-    printf '  %bСЕРВИС, РОТАЦИЯ И ШЕДУЛЕР:%b\n' "$C_BOLD" "$C_RESET"
-    printf '    5) Ротация сервера сейчас (смена порта, ключей и обфускации)\n'
-    printf '    6) Настроить авто-ротацию по расписанию (шедулер)\n'
-    printf '    7) Настроить Telegram-бота (управление через ТГ)\n'
-    printf '    8) Детальный статус и статистика\n'
-    printf '    9) Перезапустить туннель\n'
-    printf '  %bОБСЛУЖИВАНИЕ:%b\n' "$C_BOLD" "$C_RESET"
-    printf '   10) Резервная копия (бэкап) / Восстановление\n'
-    printf '   11) Переустановить AmneziaWG начисто (с бэкапом)\n'
-    printf '   12) Полное удаление AmneziaWG\n'
-    printf '   13) Самодиагностика — почему не подключается\n'
-    printf '   14) Перехват входящих пакетов 15с (diagnose-live)\n'
-    printf '    0) Выход\n'
-    printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
-    read -r -p "Выберите пункт меню: " choice || { printf '\n'; break; }
 
-    case "$choice" in
-      1)
+    if [ "$is_interactive" -eq 1 ]; then
+      printf '  %bУправление:%b %b↑ / ↓%b или %bj / k%b • %bEnter%b Выбрать • %bq%b Выход\n' \
+        "$C_YELLOW" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+      printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
+
+      local i
+      for ((i=0; i<num_items; i++)); do
+        if [ "$i" -eq 0 ]; then
+          printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ И ПОДПИСКАМИ:%b\n' "$C_BOLD" "$C_RESET"
+        elif [ "$i" -eq 4 ]; then
+          printf '  %bСЕРВИС, РОТАЦИЯ И ШЕДУЛЕР:%b\n' "$C_BOLD" "$C_RESET"
+        elif [ "$i" -eq 9 ]; then
+          printf '  %bДИАГНОСТИКА И ОБСЛУЖИВАНИЕ:%b\n' "$C_BOLD" "$C_RESET"
+        elif [ "$i" -eq 14 ]; then
+          printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
+        fi
+
+        local num_str=""
+        if [ "$i" -eq 14 ]; then
+          num_str=" 0"
+        else
+          printf -v num_str "%2d" "$((i+1))"
+        fi
+
+        if [ "$i" -eq "$selected" ]; then
+          printf '  %b❯ \033[7m [%s] %-48s \033[0m%b\n' "$C_CYAN$C_BOLD" "$num_str" "${items[i]}" "$C_RESET"
+        else
+          printf '    [%s] %-50s\n' "$num_str" "${items[i]}"
+        fi
+      done
+      printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
+
+      local key
+      key="$(read_menu_key)" || break
+      case "$key" in
+        UP)
+          selected=$(( (selected - 1 + num_items) % num_items ))
+          continue
+          ;;
+        DOWN)
+          selected=$(( (selected + 1) % num_items ))
+          continue
+          ;;
+        QUIT|ESC)
+          break
+          ;;
+        0)
+          selected=14
+          ;;
+        [1-9])
+          if [ "$key" -le "$num_items" ]; then
+            selected=$((key - 1))
+          fi
+          ;;
+        ENTER)
+          ;;
+        *)
+          continue
+          ;;
+      esac
+    else
+      # Неинтерактивный режим (скрипт или plain pipe)
+      printf '  1) %s\n' "${items[0]}"
+      printf '  2) %s\n' "${items[1]}"
+      printf '  3) %s\n' "${items[2]}"
+      printf '  4) %s\n' "${items[3]}"
+      printf '  5) %s\n' "${items[4]}"
+      printf '  6) %s\n' "${items[5]}"
+      printf '  7) %s\n' "${items[6]}"
+      printf '  8) %s\n' "${items[7]}"
+      printf '  9) %s\n' "${items[8]}"
+      printf ' 10) %s\n' "${items[9]}"
+      printf ' 11) %s\n' "${items[10]}"
+      printf ' 12) %s\n' "${items[11]}"
+      printf ' 13) %s\n' "${items[12]}"
+      printf ' 14) %s\n' "${items[13]}"
+      printf '  0) %s\n' "${items[14]}"
+      printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
+      local choice=""
+      read -r -p "Выберите пункт (1-14, 0 для выхода): " choice || break
+      case "$choice" in
+        1) selected=0 ;;
+        2) selected=1 ;;
+        3) selected=2 ;;
+        4) selected=3 ;;
+        5) selected=4 ;;
+        6) selected=5 ;;
+        7) selected=6 ;;
+        8) selected=7 ;;
+        9) selected=8 ;;
+        10) selected=9 ;;
+        11) selected=10 ;;
+        12) selected=11 ;;
+        13) selected=12 ;;
+        14) selected=13 ;;
+        0|q|quit|exit) break ;;
+        *) printf 'Неизвестный пункт: %s\n' "$choice"; continue ;;
+      esac
+    fi
+
+    # Возвращаем нормальный курсор для вывода запущенного действия
+    printf '\033[?25h'
+    printf '\n'
+
+    case "$selected" in
+      0)
         do_list_clients
         local subch
         read -r -p "Введите номер или имя клиента для вывода QR [или Enter назад]: " subch || true
@@ -2000,58 +2153,75 @@ show_menu() {
           if [ -n "$cname" ] && is_valid_client_name "$cname" && [ -f "$AWG_DIR/$cname.conf" ]; then
             printf '\nQR-код (%s.conf):\n\n' "$cname"
             qrencode -t ansiutf8 < "$AWG_DIR/$cname.conf" || true
-            read -r -p "Нажмите Enter для возврата..." _ || true
           else
             printf 'Клиент %s не найден.\n' "$subch"
           fi
         fi
         ;;
-      2) do_add_client "" ;;
-      3) do_remove_client "" ;;
-      4) do_token "" ;;
-      5)
+      1) do_add_client "" ;;
+      2) do_remove_client "" ;;
+      3) do_token "" ;;
+      4)
         if confirm_yes "Выполнить ротацию сервера AmneziaWG 3.1 прямо сейчас (смена порта, ключей и обфускации)?"; then
           do_rotate
         fi
         ;;
-      6) do_schedule "" ;;
-      7)
-        printf '\n1) Настроить токен и запустить бота\n2) Статус бота\n3) Перезапустить бота\n'
+      5) do_schedule "" ;;
+      6)
+        printf '\n%bНастройка Telegram-бота:%b\n' "$C_BOLD" "$C_RESET"
+        printf '  1) Настроить токен и запустить бота\n'
+        printf '  2) Статус бота\n'
+        printf '  3) Перезапустить бота\n'
+        printf '  0) Назад в главное меню\n'
         local bch
-        read -r -p "Выбор: " bch || true
+        read -r -p "Выберите действие (1-3, 0 назад): " bch || true
         case "$bch" in
           1) do_bot_setup ;;
           2) do_bot_status ;;
           3) do_bot_restart ;;
         esac
         ;;
-      8) do_status ;;
-      9) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
-      10)
-        printf '\n1) Создать бэкап\n2) Восстановить из файла\n'
+      7) do_status ;;
+      8) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
+      9) do_diagnose ;;
+      10) diag_live_capture ;;
+      11)
+        printf '\n%bРезервная копия и восстановление:%b\n' "$C_BOLD" "$C_RESET"
+        printf '  1) Создать бэкап сейчас\n'
+        printf '  2) Восстановить из файла архива\n'
+        printf '  0) Назад в главное меню\n'
         local bkch
-        read -r -p "Выбор: " bkch || true
-        if [ "$bkch" = "1" ]; then do_backup; elif [ "$bkch" = "2" ]; then
+        read -r -p "Выберите действие (1-2, 0 назад): " bkch || true
+        if [ "$bkch" = "1" ]; then
+          do_backup
+        elif [ "$bkch" = "2" ]; then
           read -r -p "Путь к tar.gz архиву: " bkp || true
           do_restore "$bkp"
         fi
         ;;
-      11)
+      12)
         if confirm_yes "Переустановить AmneziaWG начисто (текущие конфиги сохранятся в бэкап, ключи обновятся)?"; then
           do_reinstall
         fi
         ;;
-      12)
+      13)
         if confirm_yes "Полностью удалить AmneziaWG с сервера?"; then
           do_uninstall
         fi
         ;;
-      13) do_diagnose ;;
-      14) diag_live_capture ;;
-      0|q|quit|exit) break ;;
-      *) printf 'Неизвестный пункт: %s\n' "$choice" ;;
+      14)
+        break
+        ;;
     esac
+
+    if [ "$is_interactive" -eq 1 ]; then
+      printf '\n%bНажмите Enter для возврата в меню...%b' "$C_CYAN" "$C_RESET"
+      read -r _ || true
+    fi
   done
+
+  printf '\033[?25h' 2>/dev/null || true
+  printf '\nВыход из панели управления AmneziaWG.\n'
 }
 
 #--- диспетчер команд ---------------------------------------------------------
