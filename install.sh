@@ -38,6 +38,9 @@ LOG_FILE="/var/log/awg-install.log"
 DBG_FILE="/var/log/awg-install.debug.log"
 LOCK_FILE="/run/lock/awg-manager.lock"
 TOKENS_FILE="/etc/amnezia/amneziawg/tokens.json"
+ADMIN_TOKEN_FILE="/etc/amnezia/amneziawg/admin_token"
+API_TLS_CERT="/etc/amnezia/amneziawg/api_tls.crt"
+API_TLS_KEY="/etc/amnezia/amneziawg/api_tls.key"
 ENDPOINT_MODE_FILE="/etc/amnezia/amneziawg/endpoint_mode.conf"
 BOT_DIR="/opt/awg-bot"
 API_DIR="/opt/awg-api"
@@ -380,10 +383,17 @@ apt_update() {
 
 #--- профили маскировки AmneziaWG 3.1 (анти-ТСПУ Stealth Presets) -------------
 # 1) HTTP/3 (QUIC): 443/udp, RFC 9000 QUIC v1 Initial (<b 0xc10000000108><r 8><b 0x00004120><r 288>)
-# 2) WebRTC / STUN: 3478/udp, RFC 5389 Binding Request (<b 0x000100002112a442><r 12>)
-# 3) WebRTC Alt Port: 20000-50000/udp со STUN Magic Cookie (<b 0x000100002112a442><r 12>)
-# 4) DNS Query (EDNS0): 53/udp, RFC 6891 EDNS0 ya.ru (<r 2><b 0x0100000100000000000102796102727500000100010000291000000000000000>)
-# 5) Steam Game (A2S): 27015/udp, Valve Source Engine Query (<b 0xffffffff54536f7572636520456e67696e6520517565727900>)
+# 2) HTTP/3 (QUIC Alt): 20000-59999/udp, RFC 9000 QUIC v1 Initial на высоком порту
+# 3) WebRTC / STUN: 3478/udp, RFC 5389 Binding Request (<b 0x000100002112a442><r 12>)
+# 4) WebRTC Alt Port: 20000-50000/udp со STUN Magic Cookie (<b 0x000100002112a442><r 12>)
+# 5) DTLS 1.2 (Zoom / VoIP / AnyConnect): 8801/udp, RFC 6347 ClientHello
+# 6) DNS Query (EDNS0): 53/udp, RFC 6891 EDNS0 ya.ru
+# 7) NTP v4 (Синхронизация времени): 123/udp, RFC 5905 Client Request (48 байт)
+# 8) SIP (IP-телефония / VoIP): 5060/udp, RFC 3261 OPTIONS
+# 9) Steam Game (A2S): 27015/udp, Valve Source Engine Query
+# 10) Minecraft Bedrock (RakNet): 19132/udp, RakNet Unconnected Ping
+# 11) Discord Voice (UDP): 50001/udp, Discord IP Discovery Request (74 байта)
+# 12) BitTorrent DHT (BEP-5): 6881/udp, DHT Ping Query
 
 cps_i1_quic() {
   local first_b plen varint_hex out
@@ -398,12 +408,36 @@ cps_i1_stun() {
   printf '<b 0x000100002112a442><r 12>\n'
 }
 
+cps_i1_dtls() {
+  printf '<b 0x16fefd0000000000000000005c010000500000000000000050fefd><r 32><b 0x00000004c02fc03001000022><r 34>\n'
+}
+
 cps_i1_dns() {
   printf '<r 2><b 0x0100000100000000000102796102727500000100010000291000000000000000>\n'
 }
 
+cps_i1_ntp() {
+  printf '<b 0x23000000000000000000000000000000000000000000000000000000000000000000000000000000><r 8>\n'
+}
+
+cps_i1_sip() {
+  printf '<b 0x4f5054494f4e53207369703a766f69702e6c6f63616c205349502f322e300d0a5669613a205349502f322e302f5544502031302e302e302e313a353036303b6272616e63683d7a39684734624b><rc 10><b 0x0d0a4d61782d466f7277617264733a2037300d0a436f6e74656e742d4c656e6774683a20300d0a0d0a>\n'
+}
+
 cps_i1_steam() {
   printf '<b 0xffffffff54536f7572636520456e67696e6520517565727900>\n'
+}
+
+cps_i1_minecraft() {
+  printf '<b 0x01><r 8><b 0x00ffff00fefefefefdfdfdfd12345678><r 8>\n'
+}
+
+cps_i1_discord() {
+  printf '<b 0x00010046><r 4><b 0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000>\n'
+}
+
+cps_i1_dht() {
+  printf '<b 0x64313a6164323a696432303a><r 20><b 0x65313a71343a70696e67313a74323a><r 2><b 0x313a79313a7165>\n'
 }
 
 get_current_preset() {
@@ -424,17 +458,25 @@ get_current_preset() {
   i1="$(conf_get I1 "$conf" 2>/dev/null || true)"
   port="$(conf_get ListenPort "$conf" 2>/dev/null || true)"
   if printf '%s' "$i1" | grep -q '2112a442'; then
-    if [ "$port" = "3478" ]; then
-      printf 'stun\n'
-    else
-      printf 'stun-alt\n'
-    fi
+    if [ "$port" = "3478" ]; then printf 'stun\n'; else printf 'stun-alt\n'; fi
+  elif printf '%s' "$i1" | grep -q '16fefd0000'; then
+    printf 'dtls\n'
   elif printf '%s' "$i1" | grep -q '027961027275'; then
     printf 'dns\n'
+  elif printf '%s' "$i1" | grep -q '2300000000000000'; then
+    printf 'ntp\n'
+  elif printf '%s' "$i1" | grep -q '4f5054494f4e5320'; then
+    printf 'sip\n'
   elif printf '%s' "$i1" | grep -q '54536f75726365'; then
     printf 'steam\n'
+  elif printf '%s' "$i1" | grep -q '00ffff00fefefefe'; then
+    printf 'minecraft\n'
+  elif printf '%s' "$i1" | grep -q '00010046'; then
+    printf 'discord\n'
+  elif printf '%s' "$i1" | grep -q '64313a6164323a696432303a'; then
+    printf 'dht\n'
   elif printf '%s' "$i1" | grep -q '0000000108'; then
-    printf 'quic\n'
+    if [ "$port" = "443" ]; then printf 'quic\n'; else printf 'quic-alt\n'; fi
   else
     printf 'quic\n'
   fi
@@ -443,13 +485,20 @@ get_current_preset() {
 preset_title() {
   local p="${1:-quic}" actual_port="${2:-}" def_port="" desc="" alt_desc=""
   case "$p" in
-    quic)     def_port="443";   desc="HTTP/3 (QUIC) — 443/udp (маскировка под YouTube / HTTPS)"; alt_desc="HTTP/3 (QUIC) — %s/udp (QUIC-маскировка; базовый порт 443/udp)" ;;
-    stun)     def_port="3478";  desc="WebRTC / STUN — 3478/udp (маскировка под Telegram / WhatsApp звонки)"; alt_desc="WebRTC / STUN — %s/udp (STUN-маскировка; базовый порт 3478/udp)" ;;
-    stun-alt) def_port="";      desc="WebRTC / STUN (Alt) — 20000-50000/udp со STUN Magic Cookie"; alt_desc="WebRTC / STUN (Alt) — %s/udp со STUN Magic Cookie" ;;
-    dns)      def_port="53";    desc="DNS (EDNS0) — 53/udp (маскировка под DNS-запросы ya.ru)"; alt_desc="DNS (EDNS0) — %s/udp (DNS-маскировка; базовый порт 53/udp)" ;;
-    steam)    def_port="27015"; desc="Игровой (Steam) — 27015/udp (опрос серверов CS2/Steam A2S)"; alt_desc="Игровой (Steam) — %s/udp (Steam A2S; базовый 27015/udp)" ;;
-    custom)   def_port="";      desc="Пользовательский (ручной порт и I1)"; alt_desc="Пользовательский — %s/udp (ручной порт и I1)" ;;
-    *)        def_port="443";   desc="HTTP/3 (QUIC) — 443/udp"; alt_desc="HTTP/3 (QUIC) — %s/udp" ;;
+    quic)      def_port="443";   desc="HTTP/3 (QUIC) — 443/udp (YouTube / HTTPS)"; alt_desc="HTTP/3 (QUIC) — %s/udp (QUIC-маскировка; базовый 443/udp)" ;;
+    quic-alt)  def_port="";      desc="HTTP/3 (QUIC Alt) — 20000-59999/udp (QUIC на высоком порту)"; alt_desc="HTTP/3 (QUIC Alt) — %s/udp (QUIC на высоком порту)" ;;
+    stun)      def_port="3478";  desc="WebRTC / STUN — 3478/udp (Telegram / WhatsApp звонки)"; alt_desc="WebRTC / STUN — %s/udp (STUN; базовый 3478/udp)" ;;
+    stun-alt)  def_port="";      desc="WebRTC / STUN (Alt) — 20000-50000/udp со STUN Magic Cookie"; alt_desc="WebRTC / STUN (Alt) — %s/udp со STUN Magic Cookie" ;;
+    dtls)      def_port="8801";  desc="DTLS 1.2 (Zoom / VoIP) — 8801/udp (RFC 6347 ClientHello)"; alt_desc="DTLS 1.2 (Zoom / VoIP) — %s/udp (базовый 8801/udp)" ;;
+    dns)       def_port="53";    desc="DNS (EDNS0) — 53/udp (маскировка под DNS ya.ru)"; alt_desc="DNS (EDNS0) — %s/udp (базовый 53/udp)" ;;
+    ntp)       def_port="123";   desc="NTP v4 (Время) — 123/udp (RFC 5905)"; alt_desc="NTP v4 (Время) — %s/udp (базовый 123/udp)" ;;
+    sip)       def_port="5060";  desc="SIP (VoIP / Телефония) — 5060/udp (RFC 3261 OPTIONS)"; alt_desc="SIP (VoIP) — %s/udp (базовый 5060/udp)" ;;
+    steam)     def_port="27015"; desc="Игровой (Steam A2S) — 27015/udp (Source Engine Query)"; alt_desc="Игровой (Steam A2S) — %s/udp (базовый 27015/udp)" ;;
+    minecraft) def_port="19132"; desc="Игровой (Minecraft / RakNet) — 19132/udp"; alt_desc="Игровой (Minecraft / RakNet) — %s/udp (базовый 19132/udp)" ;;
+    discord)   def_port="50001"; desc="Discord Voice (UDP) — 50001/udp (IP Discovery)"; alt_desc="Discord Voice (UDP) — %s/udp (базовый 50001/udp)" ;;
+    dht)       def_port="6881";  desc="BitTorrent DHT (BEP-5) — 6881/udp (DHT Ping)"; alt_desc="BitTorrent DHT (BEP-5) — %s/udp (базовый 6881/udp)" ;;
+    custom)    def_port="";      desc="Пользовательский (ручной порт и I1)"; alt_desc="Пользовательский — %s/udp (ручной порт и I1)" ;;
+    *)         def_port="443";   desc="HTTP/3 (QUIC) — 443/udp"; alt_desc="HTTP/3 (QUIC) — %s/udp" ;;
   esac
   if [ -n "$actual_port" ] && [ "$actual_port" != "-" ] && [ "$actual_port" != "$def_port" ]; then
     printf "$alt_desc" "$actual_port"
@@ -463,8 +512,14 @@ cps_i1() {
   p="$(get_current_preset)"
   case "$p" in
     stun|stun-alt) cps_i1_stun ;;
+    dtls) cps_i1_dtls ;;
     dns) cps_i1_dns ;;
+    ntp) cps_i1_ntp ;;
+    sip) cps_i1_sip ;;
     steam) cps_i1_steam ;;
+    minecraft) cps_i1_minecraft ;;
+    discord) cps_i1_discord ;;
+    dht) cps_i1_dht ;;
     *) cps_i1_quic ;;
   esac
 }
@@ -661,6 +716,181 @@ except Exception:
 PY
 }
 
+ensure_admin_token() {
+  install -d -m 700 "$AWG_DIR"
+  if [ -f "$ADMIN_TOKEN_FILE" ]; then
+    local existing
+    existing="$(tr -d ' \t\r\n' < "$ADMIN_TOKEN_FILE" 2>/dev/null || true)"
+    if [[ "$existing" =~ ^awg_adm_[a-f0-9]{32,128}$ ]]; then
+      printf '%s\n' "$existing"
+      return 0
+    fi
+  fi
+  local tok
+  tok="$(python3 -c 'import secrets; print("awg_adm_" + secrets.token_hex(32))')"
+  ( umask 077 && printf '%s\n' "$tok" > "$ADMIN_TOKEN_FILE" )
+  chmod 600 "$ADMIN_TOKEN_FILE"
+  printf '%s\n' "$tok"
+}
+
+rotate_admin_token() {
+  install -d -m 700 "$AWG_DIR"
+  local tok
+  tok="$(python3 -c 'import secrets; print("awg_adm_" + secrets.token_hex(32))')"
+  ( umask 077 && printf '%s\n' "$tok" > "$ADMIN_TOKEN_FILE" )
+  chmod 600 "$ADMIN_TOKEN_FILE"
+  printf '%s\n' "$tok"
+}
+
+ensure_api_tls_cert() {
+  install -d -m 700 "$AWG_DIR"
+  if [ -s "$API_TLS_CERT" ] && [ -s "$API_TLS_KEY" ]; then
+    chmod 600 "$API_TLS_CERT" "$API_TLS_KEY" 2>/dev/null || true
+    return 0
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    warn "openssl не найден — TLS для Admin API отключён"
+    return 1
+  fi
+  local pub4 pub6 san="DNS:localhost,IP:127.0.0.1"
+  pub4="$(detect_public_ip || true)"
+  pub6="$(detect_public_ipv6 || true)"
+  [ -n "$pub4" ] && san="${san},IP:${pub4}"
+  [ -n "$pub6" ] && san="${san},IP:${pub6}"
+  ( umask 077
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout "$API_TLS_KEY" -out "$API_TLS_CERT" -days 3650 -nodes \
+      -subj "/CN=awg-api" \
+      -addext "subjectAltName=${san}" >/dev/null 2>&1 \
+    || openssl req -x509 -newkey rsa:2048 \
+      -keyout "$API_TLS_KEY" -out "$API_TLS_CERT" -days 3650 -nodes \
+      -subj "/CN=awg-api" >/dev/null 2>&1
+  ) || return 1
+  chmod 600 "$API_TLS_CERT" "$API_TLS_KEY" 2>/dev/null || true
+  return 0
+}
+
+get_api_tls_fingerprint() {
+  [ -s "$API_TLS_CERT" ] && command -v openssl >/dev/null 2>&1 || return 0
+  openssl x509 -in "$API_TLS_CERT" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || true
+}
+
+get_client_endpoint_meta() {
+  local name="$1"
+  [ -f "$TOKENS_FILE" ] || { printf 'server|\n'; return 0; }
+  python3 - "$name" "$TOKENS_FILE" <<'PY'
+import sys, json
+name, tfile = sys.argv[1], sys.argv[2]
+try:
+    with open(tfile, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    entry = data.get(name) if isinstance(data, dict) else None
+    if isinstance(entry, dict):
+        mode = str(entry.get("endpoint_mode", "server") or "server").strip()
+        host = str(entry.get("endpoint_host", "") or "").strip()
+        print(f"{mode}|{host}")
+        sys.exit(0)
+except Exception:
+    pass
+print("server|")
+PY
+}
+
+set_client_endpoint_meta() {
+  local name="$1"
+  local mode="$2"
+  local host="${3:-}"
+  ensure_client_token "$name" >/dev/null
+  python3 - "$name" "$mode" "$host" "$TOKENS_FILE" <<'PY'
+import sys, json, os
+name, mode, host, tfile = sys.argv[1:5]
+data = {}
+try:
+    with open(tfile, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+entry = data.get(name)
+if isinstance(entry, str):
+    entry = {"token": entry}
+elif not isinstance(entry, dict):
+    entry = {}
+entry["endpoint_mode"] = mode or "server"
+if mode == "custom" and host:
+    entry["endpoint_host"] = host
+else:
+    entry.pop("endpoint_host", None)
+data[name] = entry
+with open(tfile, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+os.chmod(tfile, 0o600)
+PY
+}
+
+resolve_client_endpoint_host() {
+  local name="$1"
+  local fallback_host="${2:-}"
+  local meta mode host
+  meta="$(get_client_endpoint_meta "$name")"
+  mode="${meta%%|*}"
+  host="${meta#*|}"
+  case "$mode" in
+    ipv4)
+      local pub4
+      pub4="$(detect_public_ip || true)"
+      [ -n "$pub4" ] && { printf '%s' "$pub4"; return 0; }
+      ;;
+    ipv6)
+      local pub6
+      pub6="$(detect_public_ipv6 || true)"
+      [ -n "$pub6" ] && { printf '%s' "$pub6"; return 0; }
+      ;;
+    custom)
+      [ -n "$host" ] && { printf '%s' "$host"; return 0; }
+      ;;
+  esac
+  if [ -n "$fallback_host" ]; then
+    printf '%s' "$fallback_host"
+  else
+    get_public_endpoint_host
+  fi
+}
+
+do_admin_token() {
+  local sub="${1:-show}"
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+
+  local tok
+  if [ "$sub" = "rotate" ] || [ "$sub" = "--rotate" ]; then
+    tok="$(rotate_admin_token)"
+    step "Admin-токен API перевыпущен! Обновите его в WebUI контейнера на роутере."
+  else
+    tok="$(ensure_admin_token)"
+  fi
+  ensure_api_tls_cert || true
+
+  local pub_ip api_host fp
+  pub_ip="$(get_public_endpoint_host)"
+  pub_ip="${pub_ip:-$(detect_public_ip || true)}"
+  api_host="$pub_ip"
+  if [[ "$api_host" =~ : ]] && [[ ! "$api_host" =~ ^\[ ]]; then
+    api_host="[${api_host}]"
+  fi
+  fp="$(get_api_tls_fingerprint)"
+
+  printf '\n%b=== Admin API токен управления клиентами (для контейнера MikroTik) ===%b\n' "$C_BOLD" "$C_RESET"
+  printf '  Admin-токен:         %b%s%b\n' "$C_CYAN" "$tok" "$C_RESET"
+  printf '  URL управления:      https://%s:%s/api/v1/clients\n' "$api_host" "$AWG_API_PORT"
+  if [ -n "$fp" ]; then
+    printf '  TLS SHA256 отпечаток: %s\n' "$fp"
+  fi
+  printf '\nВставьте этот токен в разделе «Генератор / QR» → «Серверы VPS» на роутере.\n'
+  printf 'Для перевыпуска токена: sudo awg-manager admin-token rotate\n\n'
+}
+
 notify_rotation_tg() {
   local p_name="$1"
   local new_port="$2"
@@ -763,12 +993,14 @@ fetch_api_script() {
 }
 
 setup_api_service() {
-  step "Настройка API-сервиса подписок клиентов (порт ${AWG_API_PORT}/tcp)"
+  step "Настройка API-сервиса подписок и управления клиентами (порт ${AWG_API_PORT}/tcp)"
   fetch_api_script || warn "не удалось установить api.py"
+  ensure_admin_token >/dev/null || true
+  ensure_api_tls_cert || true
 
   cat > /etc/systemd/system/awg-api.service <<EOF
 [Unit]
-Description=AmneziaWG Client Subscription and Token API
+Description=AmneziaWG Client Subscription and Management API
 After=network-online.target
 Wants=network-online.target
 
@@ -778,6 +1010,7 @@ User=root
 WorkingDirectory=${API_DIR}
 Environment=AWG_DIR=${AWG_DIR}
 Environment=AWG_API_PORT=${AWG_API_PORT}
+Environment=AWG_MANAGER_BIN=/usr/local/bin/awg-manager
 ExecStart=/usr/bin/python3 ${API_DIR}/api.py
 Restart=always
 RestartSec=3
@@ -787,7 +1020,7 @@ ProtectHome=yes
 ProtectKernelModules=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 
 [Install]
 WantedBy=multi-user.target
@@ -1025,7 +1258,8 @@ do_update() {
   release_lock
   step "awg-manager успешно обновлён до актуальной версии!"
   printf '  CLI утилита:        /usr/local/bin/awg-manager (обновлена)\n'
-  printf '  API подписок:       awg-api.service (порт %s/tcp, активен)\n' "${AWG_API_PORT:-8443}"
+  printf '  API подписок/упр.:  awg-api.service (порт %s/tcp HTTP+HTTPS, активен)\n' "${AWG_API_PORT:-8443}"
+  printf '  Admin API токен:    sudo awg-manager admin-token\n'
   printf '  Туннель и клиенты:  продолжают работать без перезапуска.\n\n'
 }
 
@@ -1345,7 +1579,22 @@ EOF
 #--- управление клиентами ------------------------------------------------------
 do_add_client() {
   acquire_lock
-  local name="${1:-}"
+  local name="" opt_dns="" opt_mtu="" opt_allowed="" opt_keepalive="" opt_endpoint=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dns) opt_dns="${2:-}"; shift 2 ;;
+      --mtu) opt_mtu="${2:-}"; shift 2 ;;
+      --allowed-ips) opt_allowed="${2:-}"; shift 2 ;;
+      --keepalive) opt_keepalive="${2:-}"; shift 2 ;;
+      --endpoint) opt_endpoint="${2:-}"; shift 2 ;;
+      --*) die "неизвестный флаг для add-client: $1" ;;
+      *)
+        if [ -z "$name" ]; then name="$1"; fi
+        shift
+        ;;
+    esac
+  done
+
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   [ -f "$conf" ] || die "туннель не установлен"
 
@@ -1386,11 +1635,40 @@ do_add_client() {
     P[$k]="$v"
   done
 
-  local srv_pub endpoint priv pubk
+  local cli_dns="${opt_dns:-$AWG_DNS}"
+  local cli_mtu="${opt_mtu:-${P[MTU]}}"
+  local cli_allowed="${opt_allowed:-0.0.0.0/0, ::/0}"
+  local cli_keepalive="${opt_keepalive:-25}"
+
+  [[ "$cli_mtu" =~ ^[0-9]+$ ]] && [ "$cli_mtu" -ge 576 ] && [ "$cli_mtu" -le 9000 ] || die "некорректный MTU: $cli_mtu"
+  [[ "$cli_keepalive" =~ ^[0-9]+$ ]] && [ "$cli_keepalive" -le 3600 ] || die "некорректный Keepalive: $cli_keepalive"
+  case "$cli_dns$cli_allowed" in *$'\n'*|*$'\r'*) die "недопустимые символы переноса строки" ;; esac
+
+  local srv_pub endpoint priv pubk ep_mode="server" ep_custom_host=""
   srv_pub="$(conf_get PrivateKey "$conf" | awg pubkey)" || die "ошибка pubkey сервера"
 
-  local endpoint
-  endpoint="$(get_public_endpoint_host)"
+  case "${opt_endpoint:-server}" in
+    server|default|"")
+      ep_mode="server"
+      endpoint="$(get_public_endpoint_host)"
+      ;;
+    ipv4|4)
+      ep_mode="ipv4"
+      endpoint="$(detect_public_ip || true)"
+      [ -n "$endpoint" ] || die "внешний IPv4 не обнаружен на сервере"
+      ;;
+    ipv6|6)
+      ep_mode="ipv6"
+      endpoint="$(detect_public_ipv6 || true)"
+      [ -n "$endpoint" ] || die "внешний IPv6 не обнаружен на сервере"
+      ;;
+    *)
+      ep_mode="custom"
+      ep_custom_host="$(extract_host_from_endpoint "$opt_endpoint")"
+      [ -n "$ep_custom_host" ] || die "некорректный endpoint: $opt_endpoint"
+      endpoint="$ep_custom_host"
+      ;;
+  esac
   [ -n "$endpoint" ] || die "не удалось определить внешний IP сервера"
 
   ( umask 077
@@ -1421,8 +1699,8 @@ EOF
 [Interface]
 PrivateKey = ${priv}
 Address = ${client_full_addr}
-DNS = ${AWG_DNS}
-MTU = ${P[MTU]}
+DNS = ${cli_dns}
+MTU = ${cli_mtu}
 Jc = ${P[Jc]}
 Jmin = ${P[Jmin]}
 Jmax = ${P[Jmax]}
@@ -1441,8 +1719,8 @@ ContentPaddingAddition = ${P[ContentPaddingAddition]}
 [Peer]
 PublicKey = ${srv_pub}
 Endpoint = $(format_endpoint "$endpoint" "${P[ListenPort]}")
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
+AllowedIPs = ${cli_allowed}
+PersistentKeepalive = ${cli_keepalive}
 EOF
     chmod 600 "$AWG_DIR/$name.conf" "$conf"
     qrencode -o "$AWG_DIR/$name.png" -s 6 -m 2 < "$AWG_DIR/$name.conf" || true
@@ -1451,6 +1729,9 @@ EOF
 
   local tok
   tok="$(ensure_client_token "$name")"
+  if [ "$ep_mode" != "server" ]; then
+    set_client_endpoint_meta "$name" "$ep_mode" "$ep_custom_host"
+  fi
   local ep_pub="${endpoint:-$(detect_public_ip || true)}"
   local api_ep_host="$ep_pub"
   if [[ "$api_ep_host" =~ : ]] && [[ ! "$api_ep_host" =~ ^\[ ]]; then
@@ -1460,13 +1741,305 @@ EOF
 
   release_lock
   step "Клиент '$name' ($ip) успешно создан!"
-  printf '  Файл конфига (0.0.0.0/0): %s/%s.conf\n' "$AWG_DIR" "$name"
+  printf '  Файл конфига:             %s/%s.conf\n' "$AWG_DIR" "$name"
   printf '  QR-код:                   %s/%s.png\n' "$AWG_DIR" "$name"
   printf '  Токен для контейнера:     %b%s%b\n' "$C_CYAN" "$tok" "$C_RESET"
   printf '  Ссылка подписки (.conf):  %s\n\n' "$sub_url"
   if [ "$IS_TTY" = 1 ]; then
     qrencode -t ansiutf8 < "$AWG_DIR/$name.conf" || true
   fi
+}
+
+do_edit_client() {
+  acquire_lock
+  local name="" new_name="" opt_dns="" has_dns=0 opt_mtu="" has_mtu=0
+  local opt_allowed="" has_allowed=0 opt_keepalive="" has_keepalive=0
+  local opt_endpoint="" has_endpoint=0 do_rekey=0 do_rotate_tok=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --rename) new_name="${2:-}"; shift 2 ;;
+      --dns) opt_dns="${2:-}"; has_dns=1; shift 2 ;;
+      --mtu) opt_mtu="${2:-}"; has_mtu=1; shift 2 ;;
+      --allowed-ips) opt_allowed="${2:-}"; has_allowed=1; shift 2 ;;
+      --keepalive) opt_keepalive="${2:-}"; has_keepalive=1; shift 2 ;;
+      --endpoint) opt_endpoint="${2:-}"; has_endpoint=1; shift 2 ;;
+      --rekey) do_rekey=1; shift ;;
+      --rotate-token) do_rotate_tok=1; shift ;;
+      --*) die "неизвестный флаг для edit-client: $1" ;;
+      *)
+        if [ -z "$name" ]; then name="$1"; fi
+        shift
+        ;;
+    esac
+  done
+
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || die "туннель не установлен"
+  [ -n "$name" ] || die "укажите имя: awg-manager edit-client <name> [опции]"
+  is_valid_client_name "$name" || die "некорректное имя клиента '$name'"
+  [ -f "$AWG_DIR/$name.conf" ] || die "конфиг клиента '$name' не найден"
+
+  if [ "$has_mtu" -eq 1 ]; then
+    [[ "$opt_mtu" =~ ^[0-9]+$ ]] && [ "$opt_mtu" -ge 576 ] && [ "$opt_mtu" -le 9000 ] || die "некорректный MTU: $opt_mtu"
+  fi
+  if [ "$has_keepalive" -eq 1 ]; then
+    [[ "$opt_keepalive" =~ ^[0-9]+$ ]] && [ "$opt_keepalive" -le 3600 ] || die "некорректный Keepalive: $opt_keepalive"
+  fi
+  case "$opt_dns$opt_allowed" in *$'\n'*|*$'\r'*) die "недопустимые символы переноса строки" ;; esac
+
+  # 1. Переименование клиента
+  if [ -n "$new_name" ] && [ "$new_name" != "$name" ]; then
+    is_valid_client_name "$new_name" || die "некорректное новое имя '$new_name'"
+    if [ -f "$AWG_DIR/$new_name.conf" ] || grep -q "^# ${new_name}$" "$conf"; then
+      die "клиент '$new_name' уже существует"
+    fi
+    python3 - "$conf" "$name" "$new_name" <<'PY'
+import sys, os
+conf_path, old_n, new_n = sys.argv[1:4]
+lines = open(conf_path, "r", encoding="utf-8").read().splitlines()
+out = []
+in_peer = False
+renamed = False
+for ln in lines:
+    s = ln.strip()
+    if s == "[Peer]":
+        in_peer = True
+        out.append(ln)
+    elif s.startswith("["):
+        in_peer = False
+        out.append(ln)
+    elif in_peer and not renamed and s.startswith("#") and s[1:].strip() == old_n:
+        out.append(f"# {new_n}")
+        renamed = True
+    else:
+        out.append(ln)
+tmp = conf_path + ".rename.tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, conf_path)
+PY
+    mv "$AWG_DIR/$name.conf" "$AWG_DIR/$new_name.conf"
+    [ -f "$AWG_DIR/$name.png" ] && mv "$AWG_DIR/$name.png" "$AWG_DIR/$new_name.png" || true
+    if [ -f "$TOKENS_FILE" ]; then
+      python3 - "$TOKENS_FILE" "$name" "$new_name" <<'PY'
+import sys, json, os
+tf, old_n, new_n = sys.argv[1:4]
+try:
+    data = json.load(open(tf, "r", encoding="utf-8"))
+    if isinstance(data, dict) and old_n in data:
+        data[new_n] = data.pop(old_n)
+        with open(tf, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(tf, 0o600)
+except Exception:
+    pass
+PY
+    fi
+    name="$new_name"
+  fi
+
+  local cconf="$AWG_DIR/$name.conf"
+  ensure_client_token "$name" >/dev/null
+
+  # 2. Перегенерация ключевой пары клиента (--rekey)
+  if [ "$do_rekey" -eq 1 ]; then
+    set +x
+    local old_pub peer_allowed new_priv new_pub
+    old_pub="$(awk -v want="$name" '/^\[Peer\]/{c=""} /^#/{c=$0; sub(/^#[ \t]*/,"",c); next} /^PublicKey/{if(c==want){v=$0; sub(/^PublicKey[ \t]*=[ \t]*/,"",v); print v; exit}}' "$conf")"
+    peer_allowed="$(awk -v want="$name" '/^\[Peer\]/{c=""} /^#/{c=$0; sub(/^#[ \t]*/,"",c); next} /^AllowedIPs/{if(c==want){v=$0; sub(/^AllowedIPs[ \t]*=[ \t]*/,"",v); print v; exit}}' "$conf")"
+    [ -n "$old_pub" ] && [ -n "$peer_allowed" ] || die "peer '$name' не найден в $conf"
+
+    new_priv="$(awg genkey)"
+    new_pub="$(printf '%s\n' "$new_priv" | awg pubkey)"
+
+    if awg show "$AWG_IFACE" >/dev/null 2>&1; then
+      awg set "$AWG_IFACE" peer "$old_pub" remove 2>/dev/null || true
+      awg set "$AWG_IFACE" peer "$new_pub" allowed-ips "$peer_allowed" \
+        || die "ядро не приняло обновлённый peer (awg set)"
+    fi
+
+    python3 - "$conf" "$old_pub" "$new_pub" <<'PY'
+import sys, os
+conf_path, old_p, new_p = sys.argv[1:4]
+lines = open(conf_path, "r", encoding="utf-8").read().splitlines()
+out = []
+for ln in lines:
+    if ln.strip().startswith("PublicKey") and "=" in ln:
+        k, v = ln.split("=", 1)
+        if v.strip() == old_p:
+            out.append(f"PublicKey = {new_p}")
+            continue
+    out.append(ln)
+tmp = conf_path + ".rekey.tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, conf_path)
+PY
+
+    python3 - "$cconf" "$new_priv" <<'PY'
+import sys, os
+cconf, new_priv = sys.argv[1:3]
+lines = open(cconf, "r", encoding="utf-8").read().splitlines()
+out = []
+sec = ""
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("[") and s.endswith("]"):
+        sec = s[1:-1].lower()
+        out.append(ln)
+        continue
+    if sec == "interface" and s.startswith("PrivateKey") and "=" in ln:
+        out.append(f"PrivateKey = {new_priv}")
+    else:
+        out.append(ln)
+tmp = cconf + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, cconf)
+PY
+  fi
+
+  # 3. Индивидуальный Endpoint клиента (--endpoint)
+  local new_ep_formatted=""
+  if [ "$has_endpoint" -eq 1 ]; then
+    local lport ep_mode="server" ep_host="" resolved_host=""
+    lport="$(conf_get ListenPort "$conf" || true)"
+    [ -n "$lport" ] || die "не удалось определить ListenPort"
+    case "${opt_endpoint:-server}" in
+      server|default|"")
+        ep_mode="server"
+        resolved_host="$(get_public_endpoint_host)"
+        ;;
+      ipv4|4)
+        ep_mode="ipv4"
+        resolved_host="$(detect_public_ip || true)"
+        [ -n "$resolved_host" ] || die "внешний IPv4 не обнаружен на сервере"
+        ;;
+      ipv6|6)
+        ep_mode="ipv6"
+        resolved_host="$(detect_public_ipv6 || true)"
+        [ -n "$resolved_host" ] || die "внешний IPv6 не обнаружен на сервере"
+        ;;
+      *)
+        ep_mode="custom"
+        ep_host="$(extract_host_from_endpoint "$opt_endpoint")"
+        [ -n "$ep_host" ] || die "некорректный endpoint: $opt_endpoint"
+        resolved_host="$ep_host"
+        ;;
+    esac
+    [ -n "$resolved_host" ] || die "не удалось определить внешний адрес сервера"
+    set_client_endpoint_meta "$name" "$ep_mode" "$ep_host"
+    new_ep_formatted="$(format_endpoint "$resolved_host" "$lport")"
+  fi
+
+  # 4. Обновление DNS / MTU / AllowedIPs / Keepalive / Endpoint в <name>.conf
+  if [ "$has_dns" -eq 1 ] || [ "$has_mtu" -eq 1 ] || [ "$has_allowed" -eq 1 ] || [ "$has_keepalive" -eq 1 ] || [ -n "$new_ep_formatted" ]; then
+    python3 - "$cconf" "$has_dns" "$opt_dns" "$has_mtu" "$opt_mtu" "$has_allowed" "$opt_allowed" "$has_keepalive" "$opt_keepalive" "$new_ep_formatted" <<'PY'
+import sys, os
+cconf = sys.argv[1]
+has_dns, dns_v = int(sys.argv[2]), sys.argv[3]
+has_mtu, mtu_v = int(sys.argv[4]), sys.argv[5]
+has_alw, alw_v = int(sys.argv[6]), sys.argv[7]
+has_ka, ka_v = int(sys.argv[8]), sys.argv[9]
+new_ep = sys.argv[10]
+
+lines = open(cconf, "r", encoding="utf-8").read().splitlines()
+out = []
+sec = ""
+seen_dns = seen_mtu = seen_alw = seen_ka = seen_ep = False
+
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("[") and s.endswith("]"):
+        # Перед переходом в [Peer] добавим отсутствующие [Interface] поля
+        if sec == "interface":
+            if has_dns and not seen_dns and dns_v:
+                out.append(f"DNS = {dns_v}"); seen_dns = True
+            if has_mtu and not seen_mtu and mtu_v:
+                out.append(f"MTU = {mtu_v}"); seen_mtu = True
+        sec = s[1:-1].lower()
+        out.append(ln)
+        continue
+    if "=" in ln:
+        k = ln.split("=", 1)[0].strip()
+        if sec == "interface" and k == "DNS" and has_dns:
+            if dns_v:
+                out.append(f"DNS = {dns_v}")
+            seen_dns = True
+            continue
+        if sec == "interface" and k == "MTU" and has_mtu:
+            out.append(f"MTU = {mtu_v}")
+            seen_mtu = True
+            continue
+        if sec == "peer" and k == "AllowedIPs" and has_alw:
+            out.append(f"AllowedIPs = {alw_v}")
+            seen_alw = True
+            continue
+        if sec == "peer" and k == "PersistentKeepalive" and has_ka:
+            if ka_v != "0":
+                out.append(f"PersistentKeepalive = {ka_v}")
+            seen_ka = True
+            continue
+        if sec == "peer" and k == "Endpoint" and new_ep:
+            out.append(f"Endpoint = {new_ep}")
+            seen_ep = True
+            continue
+    out.append(ln)
+
+if sec == "peer":
+    if has_alw and not seen_alw and alw_v:
+        out.append(f"AllowedIPs = {alw_v}")
+    if has_ka and not seen_ka and ka_v and ka_v != "0":
+        out.append(f"PersistentKeepalive = {ka_v}")
+    if new_ep and not seen_ep:
+        out.append(f"Endpoint = {new_ep}")
+
+tmp = cconf + ".edit.tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, cconf)
+PY
+  fi
+
+  # 5. Ротация клиентского токена подписки (--rotate-token)
+  if [ "$do_rotate_tok" -eq 1 ]; then
+    python3 - "$name" "$TOKENS_FILE" <<'PY'
+import sys, json, os, secrets, time
+name, tf = sys.argv[1:3]
+data = {}
+try:
+    data = json.load(open(tf, "r", encoding="utf-8"))
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+entry = data.get(name)
+if isinstance(entry, str):
+    entry = {}
+elif not isinstance(entry, dict):
+    entry = {}
+entry["token"] = f"awg_tok_{secrets.token_hex(16)}"
+entry.setdefault("created_at", int(time.time()))
+entry["rotated_at"] = int(time.time())
+data[name] = entry
+with open(tf, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+os.chmod(tf, 0o600)
+PY
+  fi
+
+  chmod 600 "$cconf" 2>/dev/null || true
+  qrencode -o "$AWG_DIR/$name.png" -s 6 -m 2 < "$cconf" 2>/dev/null || true
+  chmod 600 "$AWG_DIR/$name.png" 2>/dev/null || true
+  touch "$cconf"
+
+  release_lock
+  step "Клиент '$name' успешно обновлён"
 }
 
 do_remove_client() {
@@ -2092,7 +2665,12 @@ do_token() {
 }
 
 do_switch_endpoint() {
+  acquire_lock
   local target="${1:-}"
+  local force_all=0
+  if [ "${2:-}" = "--all" ] || [ "${2:-}" = "--reset-overrides" ]; then
+    force_all=1
+  fi
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   [ -f "$conf" ] || die "туннель не установлен"
   local lport
@@ -2111,12 +2689,12 @@ do_switch_endpoint() {
       printf '  3) Ввести свой домен или IP вручную\n'
       printf '  0) Отмена\n'
       local ech
-      read -r -p "Выберите режим (1-3, 0 отмена): " ech || return 0
+      read -r -p "Выберите режим (1-3, 0 отмена): " ech || { release_lock; return 0; }
       case "$ech" in
         1) target="ipv4" ;;
         2) target="ipv6" ;;
-        3) read -r -p "Введите внешний домен или IP: " target || return 0 ;;
-        *) return 0 ;;
+        3) read -r -p "Введите внешний домен или IP: " target || { release_lock; return 0; } ;;
+        *) release_lock; return 0 ;;
       esac
     else
       die "укажите режим: awg-manager endpoint [ipv4|ipv6|<хост>]"
@@ -2144,12 +2722,22 @@ do_switch_endpoint() {
 
   local formatted_ep
   formatted_ep="$(format_endpoint "$target_host" "$lport")"
-  step "Переключение Endpoint всех клиентов на: $formatted_ep"
+  step "Переключение Endpoint сервера на: $formatted_ep"
 
-  local cf count=0
+  local cf cname cmeta cmode count=0 skipped=0
   for cf in "$AWG_DIR"/*.conf; do
     [ -f "$cf" ] || continue
     [ "$cf" != "$AWG_DIR/$AWG_IFACE.conf" ] || continue
+    cname="$(basename "$cf" .conf)"
+    cmeta="$(get_client_endpoint_meta "$cname")"
+    cmode="${cmeta%%|*}"
+    if [ "$force_all" -eq 0 ] && [ "$cmode" != "server" ] && [ -n "$cmode" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if [ "$force_all" -eq 1 ] && [ "$cmode" != "server" ]; then
+      set_client_endpoint_meta "$cname" "server" ""
+    fi
     sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${formatted_ep}|" "$cf"
     qrencode -o "${cf%.conf}.png" -s 6 -m 2 < "$cf" 2>/dev/null || true
     chmod 600 "${cf%.conf}.png" 2>/dev/null || true
@@ -2157,7 +2745,8 @@ do_switch_endpoint() {
     count=$((count + 1))
   done
 
-  step "Обновлен Endpoint для ${count} клиентов."
+  release_lock
+  step "Обновлен Endpoint для ${count} клиентов (индивидуальных override сохранено: ${skipped})."
   printf '  Новый внешний Endpoint: %b%s%b\n' "$C_GREEN" "$formatted_ep" "$C_RESET"
   printf '  Роутеры с токенами подписки автоматически подтянут новый адрес при следующем опросе.\n\n'
 }
@@ -2274,7 +2863,7 @@ ${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${subnet} -o ${wan_iface
 PostDown = iptables -w -t nat -D POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 EOF
 
-    local c_name c_ip cli_priv cli_pub c_count=0
+    local c_name c_ip cli_priv cli_pub cli_dns cli_mtu cli_allowed cli_ka cli_ep_host c_count=0
     while IFS='|' read -r c_name c_ip; do
       [ -n "$c_name" ] && [ -n "$c_ip" ] || continue
       is_valid_client_name "$c_name" || continue
@@ -2287,15 +2876,29 @@ EOF
         c_full_addr="${c_ip}, ${ip6_pfx}${last_oct}/128"
       fi
 
+      cli_priv=""
+      cli_dns="$AWG_DNS"
+      cli_mtu="$mtu"
+      cli_allowed="0.0.0.0/0, ::/0"
+      cli_ka="25"
       if [ -f "$AWG_DIR/${c_name}.conf" ]; then
         cli_priv="$(conf_get PrivateKey "$AWG_DIR/${c_name}.conf" 2>/dev/null || true)"
-      else
-        cli_priv=""
+        local ex_dns ex_mtu ex_alw ex_ka
+        ex_dns="$(conf_get DNS "$AWG_DIR/${c_name}.conf" 2>/dev/null || true)"
+        ex_mtu="$(conf_get MTU "$AWG_DIR/${c_name}.conf" 2>/dev/null || true)"
+        ex_alw="$(awk '/^\[Peer\]/{p=1;next} /^\[/{p=0} p && /^AllowedIPs[[:space:]]*=/{sub(/^AllowedIPs[[:space:]]*=[[:space:]]*/,""); print; exit}' "$AWG_DIR/${c_name}.conf" 2>/dev/null || true)"
+        ex_ka="$(conf_get PersistentKeepalive "$AWG_DIR/${c_name}.conf" 2>/dev/null || true)"
+        [ -n "$ex_dns" ] && cli_dns="$ex_dns"
+        [ -n "$ex_mtu" ] && cli_mtu="$ex_mtu"
+        [ -n "$ex_alw" ] && cli_allowed="$ex_alw"
+        [ -n "$ex_ka" ] && cli_ka="$ex_ka"
       fi
       if [ -z "$cli_priv" ]; then
         cli_priv="$(awg genkey)"
       fi
       cli_pub="$(printf '%s\n' "$cli_priv" | awg pubkey)"
+      cli_ep_host="$(resolve_client_endpoint_host "$c_name" "$public_ip")"
+      cli_ep_host="${cli_ep_host:-$public_ip}"
 
       cat >> "$tmp_conf" <<EOF
 
@@ -2309,8 +2912,8 @@ EOF
 [Interface]
 PrivateKey = ${cli_priv}
 Address = ${c_full_addr}
-DNS = ${AWG_DNS}
-MTU = ${mtu}
+DNS = ${cli_dns}
+MTU = ${cli_mtu}
 Jc = ${jc}
 Jmin = ${jmin}
 Jmax = ${jmax}
@@ -2328,9 +2931,9 @@ ContentPaddingAddition = ${cpa}
 
 [Peer]
 PublicKey = ${srv_pub}
-Endpoint = $(format_endpoint "$public_ip" "$new_port")
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
+Endpoint = $(format_endpoint "$cli_ep_host" "$new_port")
+AllowedIPs = ${cli_allowed}
+PersistentKeepalive = ${cli_ka}
 EOF
       chmod 600 "$AWG_DIR/${c_name}.conf"
       qrencode -o "$AWG_DIR/${c_name}.png" -s 6 -m 2 < "$AWG_DIR/${c_name}.conf" || true
@@ -2344,7 +2947,7 @@ EOF
     chmod 600 "$conf"
     printf '%s\n' "$p_name" > "$AWG_DIR/preset.conf"
     chmod 600 "$AWG_DIR/preset.conf" 2>/dev/null || true
-    step "Обновлены параметры для ${c_count} клиентов (токены и IP сохранены)"
+    step "Обновлены параметры для ${c_count} клиентов (токены, IP и индивидуальные настройки сохранены)"
   )
 
   if [ -n "$old_port" ] && [ "$old_port" != "$new_port" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
@@ -2356,7 +2959,7 @@ EOF
   systemctl restart "awg-quick@${AWG_IFACE}" || die "не удалось перезапустить туннель"
   step "Туннель awg0 успешно перезапущен на порту ${new_port}/udp"
 
-  if systemctl is-active --quiet awg-api 2>/dev/null; then
+  if [ "${AWG_SKIP_API_RESTART:-0}" != "1" ] && systemctl is-active --quiet awg-api 2>/dev/null; then
     systemctl restart awg-api 2>/dev/null || true
   fi
 
@@ -2377,15 +2980,30 @@ apply_tunnel_preset() {
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   [ -f "$conf" ] || die "туннель не установлен"
 
-  local target_port="" target_i1="" target_jc="" target_jmin="" target_jmax="" target_cpa=""
+  local cur_port target_port="" target_i1="" target_jc="" target_jmin="" target_jmax="" target_cpa=""
+  cur_port="$(conf_get ListenPort "$conf" || true)"
+
+  _pick_port_or_alt() {
+    local want="$1" lo="${2:-20000}" hi="${3:-59999}"
+    if [ "$cur_port" != "$want" ] && [ -n "$(ss -Hlnu "sport = :${want}" 2>/dev/null || true)" ]; then
+      warn "Порт ${want}/udp занят другим процессом, выбираю свободный ${lo}-${hi}/udp"
+      rand_range "$lo" "$hi"
+    else
+      printf '%s' "$want"
+    fi
+  }
 
   case "$p_name" in
     quic)
-      target_port=443
-      if [ -n "$(ss -Hlnu "sport = :443" 2>/dev/null)" ] && [ "$(conf_get ListenPort "$conf")" != "443" ]; then
-        warn "Порт 443/udp занят другим процессом, выбираю свободный 20000-59999/udp"
-        target_port="$(rand_range 20000 59999)"
-      fi
+      target_port="$(_pick_port_or_alt 443 20000 59999)"
+      target_i1="$(cps_i1_quic)"
+      target_jc="$(rand_range 3 5)"
+      target_jmin="$(rand_range 40 70)"
+      target_jmax=$((target_jmin + $(rand_range 50 120)))
+      target_cpa='32-128'
+      ;;
+    quic-alt)
+      target_port="$(rand_range 20000 59999)"
       target_i1="$(cps_i1_quic)"
       target_jc="$(rand_range 3 5)"
       target_jmin="$(rand_range 40 70)"
@@ -2393,58 +3011,71 @@ apply_tunnel_preset() {
       target_cpa='32-128'
       ;;
     stun)
-      target_port=3478
-      if [ -n "$(ss -Hlnu "sport = :3478" 2>/dev/null)" ] && [ "$(conf_get ListenPort "$conf")" != "3478" ]; then
-        warn "Порт 3478/udp занят, выбираю альтернативный 20000-50000"
-        target_port="$(rand_range 20000 50000)"
-      fi
+      target_port="$(_pick_port_or_alt 3478 20000 50000)"
       target_i1="$(cps_i1_stun)"
-      target_jc=3
-      target_jmin=20
-      target_jmax=60
-      target_cpa='20-80'
+      target_jc=3; target_jmin=20; target_jmax=60; target_cpa='20-80'
       ;;
     stun-alt)
       target_port="$(rand_range 20000 50000)"
       target_i1="$(cps_i1_stun)"
-      target_jc=3
-      target_jmin=20
-      target_jmax=60
-      target_cpa='20-80'
+      target_jc=3; target_jmin=20; target_jmax=60; target_cpa='20-80'
+      ;;
+    dtls)
+      target_port="$(_pick_port_or_alt 8801 20000 59999)"
+      target_i1="$(cps_i1_dtls)"
+      target_jc=4; target_jmin=40; target_jmax=110; target_cpa='32-128'
       ;;
     dns)
-      target_port=53
-      if [ -n "$(ss -Hlnu "sport = :53" 2>/dev/null | grep '0\.0\.0\.0:53' || true)" ] && [ "$(conf_get ListenPort "$conf")" != "53" ]; then
+      if [ "$cur_port" != "53" ] && [ -n "$(ss -Hlnu "sport = :53" 2>/dev/null | grep '0\.0\.0\.0:53' || true)" ]; then
         warn "Порт 53/udp занят (0.0.0.0:53), выбираю альтернативный 20000-59999"
         target_port="$(rand_range 20000 59999)"
+      else
+        target_port=53
       fi
       target_i1="$(cps_i1_dns)"
-      target_jc=2
-      target_jmin=30
-      target_jmax=80
-      target_cpa='32-64'
+      target_jc=2; target_jmin=30; target_jmax=80; target_cpa='32-64'
+      ;;
+    ntp)
+      target_port="$(_pick_port_or_alt 123 20000 59999)"
+      target_i1="$(cps_i1_ntp)"
+      target_jc=2; target_jmin=24; target_jmax=64; target_cpa='16-48'
+      ;;
+    sip)
+      target_port="$(_pick_port_or_alt 5060 20000 59999)"
+      target_i1="$(cps_i1_sip)"
+      target_jc=3; target_jmin=30; target_jmax=90; target_cpa='24-96'
       ;;
     steam)
-      target_port=27015
-      if [ -n "$(ss -Hlnu "sport = :27015" 2>/dev/null)" ] && [ "$(conf_get ListenPort "$conf")" != "27015" ]; then
+      if [ "$cur_port" != "27015" ] && [ -n "$(ss -Hlnu "sport = :27015" 2>/dev/null || true)" ]; then
         target_port=3074
+      else
+        target_port=27015
       fi
       target_i1="$(cps_i1_steam)"
-      target_jc=4
-      target_jmin=40
-      target_jmax=90
-      target_cpa='16-64'
+      target_jc=4; target_jmin=40; target_jmax=90; target_cpa='16-64'
+      ;;
+    minecraft)
+      target_port="$(_pick_port_or_alt 19132 20000 59999)"
+      target_i1="$(cps_i1_minecraft)"
+      target_jc=3; target_jmin=30; target_jmax=85; target_cpa='20-80'
+      ;;
+    discord)
+      target_port="$(_pick_port_or_alt 50001 50000 50999)"
+      target_i1="$(cps_i1_discord)"
+      target_jc=4; target_jmin=30; target_jmax=90; target_cpa='24-96'
+      ;;
+    dht)
+      target_port="$(_pick_port_or_alt 6881 20000 59999)"
+      target_i1="$(cps_i1_dht)"
+      target_jc=3; target_jmin=35; target_jmax=95; target_cpa='24-88'
       ;;
     custom)
       target_port="${custom_p:-$(rand_range 20000 59999)}"
       target_i1="${custom_i1:-$(cps_i1_quic)}"
-      target_jc=4
-      target_jmin=40
-      target_jmax=100
-      target_cpa='32-128'
+      target_jc=4; target_jmin=40; target_jmax=100; target_cpa='32-128'
       ;;
     *)
-      die "Неизвестный профиль '$p_name'. Допустимы: quic, stun, stun-alt, dns, steam, custom"
+      die "Неизвестный профиль '$p_name'. Допустимы: quic, quic-alt, stun, stun-alt, dtls, dns, ntp, sip, steam, minecraft, discord, dht, custom"
       ;;
   esac
 
@@ -2453,6 +3084,8 @@ apply_tunnel_preset() {
 
 do_preset() {
   local p_arg="${1:-}"
+  local custom_p="${2:-}"
+  local custom_i1="${3:-}"
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   [ -f "$conf" ] || die "туннель не установлен"
 
@@ -2464,31 +3097,48 @@ do_preset() {
     cur_p="$(get_current_preset)"
     printf 'Текущий активный профиль сервера: %b%s%b\n\n' "$C_GREEN$C_BOLD" "$(preset_title "$cur_p" "$(conf_get ListenPort "$conf")")" "$C_RESET"
     printf 'Выберите профиль маскировки трафика:\n'
-    printf '  1) HTTP/3 (QUIC)      — 443/udp   (маскировка под YouTube / HTTPS) [По умолчанию]\n'
-    printf '  2) WebRTC / STUN      — 3478/udp  (маскировка под Telegram / WhatsApp звонки)\n'
-    printf '  3) WebRTC (Alt Port)  — 20000-50000/udp со STUN Magic Cookie\n'
-    printf '  4) DNS (EDNS0)        — 53/udp    (маскировка под DNS-запросы ya.ru)\n'
-    printf '  5) Игровой (Steam)    — 27015/udp (маскировка под опрос серверов CS2/Steam)\n'
-    printf '  6) Пользовательский   — ручной ввод порта и произвольный I1\n'
-    printf '  0) Назад\n\n'
+    printf '   1) HTTP/3 (QUIC)            — 443/udp        (YouTube / HTTPS) [По умолчанию]\n'
+    printf '   2) HTTP/3 (QUIC Alt)        — 20000-59999/udp (QUIC на высоком порту)\n'
+    printf '   3) WebRTC / STUN            — 3478/udp       (Telegram / WhatsApp звонки)\n'
+    printf '   4) WebRTC (Alt Port)        — 20000-50000/udp со STUN Magic Cookie\n'
+    printf '   5) DTLS 1.2 (Zoom / VoIP)   — 8801/udp       (RFC 6347 ClientHello)\n'
+    printf '   6) DNS (EDNS0)              — 53/udp         (DNS-запросы ya.ru)\n'
+    printf '   7) NTP v4 (Время)           — 123/udp        (RFC 5905)\n'
+    printf '   8) SIP (VoIP / Телефония)   — 5060/udp       (RFC 3261 OPTIONS)\n'
+    printf '   9) Игровой (Steam A2S)      — 27015/udp      (Source Engine Query)\n'
+    printf '  10) Игровой (Minecraft)      — 19132/udp      (RakNet Unconnected Ping)\n'
+    printf '  11) Discord Voice (UDP)      — 50001/udp      (IP Discovery)\n'
+    printf '  12) BitTorrent DHT (BEP-5)   — 6881/udp       (DHT Ping)\n'
+    printf '  13) Пользовательский         — ручной ввод порта и I1\n'
+    printf '   0) Назад\n\n'
     local choice=""
-    read -r -p "Выберите профиль (1-6, 0 для отмены): " choice || { release_lock; return 0; }
+    read -r -p "Выберите профиль (1-13, 0 для отмены): " choice || { release_lock; return 0; }
     case "$choice" in
       1) p_arg="quic" ;;
-      2) p_arg="stun" ;;
-      3) p_arg="stun-alt" ;;
-      4) p_arg="dns" ;;
-      5) p_arg="steam" ;;
-      6) p_arg="custom" ;;
+      2) p_arg="quic-alt" ;;
+      3) p_arg="stun" ;;
+      4) p_arg="stun-alt" ;;
+      5) p_arg="dtls" ;;
+      6) p_arg="dns" ;;
+      7) p_arg="ntp" ;;
+      8) p_arg="sip" ;;
+      9) p_arg="steam" ;;
+      10) p_arg="minecraft" ;;
+      11) p_arg="discord" ;;
+      12) p_arg="dht" ;;
+      13) p_arg="custom" ;;
       0|q|quit|exit) release_lock; return 0 ;;
       *) release_lock; die "Неверный выбор '$choice'" ;;
     esac
   fi
 
-  local custom_p="" custom_i1=""
   if [ "$p_arg" = "custom" ]; then
-    read -r -p "Введите UDP-порт сервера (1-65535): " custom_p || { release_lock; die "ввод прерван"; }
-    read -r -p "Введите строку I1 (байткод AmneziaWG): " custom_i1 || { release_lock; die "ввод прерван"; }
+    if [ -z "$custom_p" ] && [ "$IS_TTY" = 1 ]; then
+      read -r -p "Введите UDP-порт сервера (1-65535): " custom_p || { release_lock; die "ввод прерван"; }
+    fi
+    if [ -z "$custom_i1" ] && [ "$IS_TTY" = 1 ]; then
+      read -r -p "Введите строку I1 (байткод AmneziaWG): " custom_i1 || { release_lock; die "ввод прерван"; }
+    fi
   fi
 
   step "Применение профиля маскировки: $(preset_title "$p_arg")"
@@ -2510,56 +3160,89 @@ do_rotate() {
   local old_port new_port="" try_p
   old_port="$(conf_get ListenPort "$conf")"
 
-  if [ "$p_arg" = "quic" ]; then
-    new_port=443
-    if [ "$old_port" = "443" ] || [ -n "$(ss -Hlnu "sport = :443" 2>/dev/null)" ]; then
-      for _ in $(seq 1 40); do
-        try_p="$(rand_range 20000 59999)"
-        if [ "$try_p" != "$old_port" ] && [ -z "$(ss -Hlnu "sport = :${try_p}" 2>/dev/null)" ]; then
-          new_port="$try_p"
-          break
-        fi
-      done
+  _pick_rotated_port() {
+    local base_port="${1:-}"
+    if [ -n "$base_port" ] && [ "$old_port" != "$base_port" ] && [ -z "$(ss -Hlnu "sport = :${base_port}" 2>/dev/null || true)" ]; then
+      printf '%s' "$base_port"
+      return
     fi
-  elif [ "$p_arg" = "stun" ]; then
-    new_port=3478
-  elif [ "$p_arg" = "dns" ]; then
-    new_port=53
-  elif [ "$p_arg" = "steam" ]; then
-    new_port=27015
-  else
     for _ in $(seq 1 40); do
       try_p="$(rand_range 20000 59999)"
-      if [ "$try_p" != "$old_port" ] && [ -z "$(ss -Hlnu "sport = :${try_p}" 2>/dev/null)" ]; then
-        new_port="$try_p"
-        break
+      if [ "$try_p" != "$old_port" ] && [ -z "$(ss -Hlnu "sport = :${try_p}" 2>/dev/null || true)" ]; then
+        printf '%s' "$try_p"
+        return
       fi
     done
-  fi
-
-  [ -n "$new_port" ] || new_port="$(rand_range 20000 59999)"
+    rand_range 20000 59999
+  }
 
   local target_i1 target_jc target_jmin target_jmax target_cpa
   case "$p_arg" in
-    stun|stun-alt)
+    quic)
+      new_port="$(_pick_rotated_port 443)"
+      target_i1="$(cps_i1_quic)"
+      target_jc="$(rand_range 3 5)"; target_jmin="$(rand_range 40 70)"; target_jmax=$((target_jmin + $(rand_range 50 120))); target_cpa='32-128'
+      ;;
+    quic-alt)
+      new_port="$(_pick_rotated_port "")"
+      target_i1="$(cps_i1_quic)"
+      target_jc="$(rand_range 3 5)"; target_jmin="$(rand_range 40 70)"; target_jmax=$((target_jmin + $(rand_range 50 120))); target_cpa='32-128'
+      ;;
+    stun)
+      new_port="$(_pick_rotated_port 3478)"
       target_i1="$(cps_i1_stun)"
       target_jc=3; target_jmin=20; target_jmax=60; target_cpa='20-80'
       ;;
+    stun-alt)
+      new_port="$(_pick_rotated_port "")"
+      target_i1="$(cps_i1_stun)"
+      target_jc=3; target_jmin=20; target_jmax=60; target_cpa='20-80'
+      ;;
+    dtls)
+      new_port="$(_pick_rotated_port 8801)"
+      target_i1="$(cps_i1_dtls)"
+      target_jc=4; target_jmin=40; target_jmax=110; target_cpa='32-128'
+      ;;
     dns)
+      new_port="$(_pick_rotated_port 53)"
       target_i1="$(cps_i1_dns)"
       target_jc=2; target_jmin=30; target_jmax=80; target_cpa='32-64'
       ;;
+    ntp)
+      new_port="$(_pick_rotated_port 123)"
+      target_i1="$(cps_i1_ntp)"
+      target_jc=2; target_jmin=24; target_jmax=64; target_cpa='16-48'
+      ;;
+    sip)
+      new_port="$(_pick_rotated_port 5060)"
+      target_i1="$(cps_i1_sip)"
+      target_jc=3; target_jmin=30; target_jmax=90; target_cpa='24-96'
+      ;;
     steam)
+      new_port="$(_pick_rotated_port 27015)"
       target_i1="$(cps_i1_steam)"
       target_jc=4; target_jmin=40; target_jmax=90; target_cpa='16-64'
       ;;
+    minecraft)
+      new_port="$(_pick_rotated_port 19132)"
+      target_i1="$(cps_i1_minecraft)"
+      target_jc=3; target_jmin=30; target_jmax=85; target_cpa='20-80'
+      ;;
+    discord)
+      new_port="$(_pick_rotated_port 50001)"
+      target_i1="$(cps_i1_discord)"
+      target_jc=4; target_jmin=30; target_jmax=90; target_cpa='24-96'
+      ;;
+    dht)
+      new_port="$(_pick_rotated_port 6881)"
+      target_i1="$(cps_i1_dht)"
+      target_jc=3; target_jmin=35; target_jmax=95; target_cpa='24-88'
+      ;;
     *)
       p_arg="quic"
+      new_port="$(_pick_rotated_port 443)"
       target_i1="$(cps_i1_quic)"
-      target_jc="$(rand_range 3 5)"
-      target_jmin="$(rand_range 40 70)"
-      target_jmax=$((target_jmin + $(rand_range 50 120)))
-      target_cpa='32-128'
+      target_jc="$(rand_range 3 5)"; target_jmin="$(rand_range 40 70)"; target_jmax=$((target_jmin + $(rand_range 50 120))); target_cpa='32-128'
       ;;
   esac
 
@@ -2816,6 +3499,7 @@ show_menu() {
     "Добавить нового клиента"
     "Удалить клиента"
     "Токен и ссылка подписки для клиента"
+    "Admin-токен API (для управления с роутера)"
     "Сменить профиль маскировки (Stealth Presets)"
     "Сменить внешний Endpoint (IPv4 / IPv6)"
     "Ротация сервера сейчас (смена порта, ключей и обфускации)"
@@ -2832,6 +3516,7 @@ show_menu() {
     "Выход"
   )
   local num_items=${#items[@]}
+  local exit_idx=$((num_items - 1))
   local selected=0
 
   # Восстановление курсора при выходе или сигнале
@@ -2889,16 +3574,16 @@ show_menu() {
       for ((i=0; i<num_items; i++)); do
         if [ "$i" -eq 0 ]; then
           printf '  %bУПРАВЛЕНИЕ КЛИЕНТАМИ И ПОДПИСКАМИ:%b\n' "$C_BOLD" "$C_RESET"
-        elif [ "$i" -eq 4 ]; then
+        elif [ "$i" -eq 5 ]; then
           printf '  %bСЕРВЕР, МАСКИРОВКА И РОТАЦИЯ:%b\n' "$C_BOLD" "$C_RESET"
-        elif [ "$i" -eq 10 ]; then
+        elif [ "$i" -eq 11 ]; then
           printf '  %bДИАГНОСТИКА И ОБСЛУЖИВАНИЕ:%b\n' "$C_BOLD" "$C_RESET"
-        elif [ "$i" -eq 16 ]; then
+        elif [ "$i" -eq "$exit_idx" ]; then
           printf '%b------------------------------------------------------------%b\n' "$C_BLUE" "$C_RESET"
         fi
 
         local num_str=""
-        if [ "$i" -eq 16 ]; then
+        if [ "$i" -eq "$exit_idx" ]; then
           num_str=" 0"
         else
           printf -v num_str "%2d" "$((i+1))"
@@ -2927,10 +3612,10 @@ show_menu() {
           break
           ;;
         0)
-          selected=16
+          selected="$exit_idx"
           ;;
         [1-9])
-          if [ "$key" -le "$num_items" ]; then
+          if [ "$key" -le "$exit_idx" ]; then
             selected=$((key - 1))
           fi
           ;;
@@ -2942,47 +3627,24 @@ show_menu() {
       esac
     else
       # Неинтерактивный режим (скрипт или plain pipe)
-      printf '  1) %s\n' "${items[0]}"
-      printf '  2) %s\n' "${items[1]}"
-      printf '  3) %s\n' "${items[2]}"
-      printf '  4) %s\n' "${items[3]}"
-      printf '  5) %s\n' "${items[4]}"
-      printf '  6) %s\n' "${items[5]}"
-      printf '  7) %s\n' "${items[6]}"
-      printf '  8) %s\n' "${items[7]}"
-      printf '  9) %s\n' "${items[8]}"
-      printf ' 10) %s\n' "${items[9]}"
-      printf ' 11) %s\n' "${items[10]}"
-      printf ' 12) %s\n' "${items[11]}"
-      printf ' 13) %s\n' "${items[12]}"
-      printf ' 14) %s\n' "${items[13]}"
-      printf ' 15) %s\n' "${items[14]}"
-      printf ' 16) %s\n' "${items[15]}"
-      printf ' 17) %s\n' "${items[16]}"
-      printf '  0) %s\n' "${items[17]}"
+      local pi
+      for ((pi=0; pi<exit_idx; pi++)); do
+        printf ' %2d) %s\n' "$((pi+1))" "${items[pi]}"
+      done
+      printf '  0) %s\n' "${items[exit_idx]}"
       printf '%b============================================================%b\n' "$C_BLUE" "$C_RESET"
       local choice=""
-      read -r -p "Выберите пункт (1-17, 0 для выхода): " choice || break
+      read -r -p "Выберите пункт (1-${exit_idx}, 0 для выхода): " choice || break
       case "$choice" in
-        1) selected=0 ;;
-        2) selected=1 ;;
-        3) selected=2 ;;
-        4) selected=3 ;;
-        5) selected=4 ;;
-        6) selected=5 ;;
-        7) selected=6 ;;
-        8) selected=7 ;;
-        9) selected=8 ;;
-        10) selected=9 ;;
-        11) selected=10 ;;
-        12) selected=11 ;;
-        13) selected=12 ;;
-        14) selected=13 ;;
-        15) selected=14 ;;
-        16) selected=15 ;;
-        17) selected=16 ;;
         0|q|quit|exit) break ;;
-        *) printf 'Неизвестный пункт: %s\n' "$choice"; continue ;;
+        *)
+          if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$exit_idx" ]; then
+            selected=$((choice - 1))
+          else
+            printf 'Неизвестный пункт: %s\n' "$choice"
+            continue
+          fi
+          ;;
       esac
     fi
 
@@ -3022,15 +3684,16 @@ show_menu() {
       1) do_add_client "" ;;
       2) do_remove_client "" ;;
       3) do_token "" ;;
-      4) do_preset "" ;;
-      5) do_switch_endpoint "" ;;
-      6)
+      4) do_admin_token "show" ;;
+      5) do_preset "" ;;
+      6) do_switch_endpoint "" ;;
+      7)
         if confirm_yes "Выполнить полную ротацию серверного туннеля прямо сейчас (смена порта, ключей сервера и параметров обфускации)?"; then
           do_rotate ""
         fi
         ;;
-      7) do_schedule "" ;;
-      8)
+      8) do_schedule "" ;;
+      9)
         printf '\n%bНастройка Telegram-бота:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Настроить токен и запустить бота\n'
         printf '  2) Статус бота\n'
@@ -3044,12 +3707,12 @@ show_menu() {
           3) do_bot_restart ;;
         esac
         ;;
-      9) do_status ;;
-      10) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
-      11) do_diagnose ;;
-      12) diag_live_capture ;;
-      13) do_update ;;
-      14)
+      10) do_status ;;
+      11) systemctl restart "awg-quick@${AWG_IFACE}" && step "Туннель перезапущен" ;;
+      12) do_diagnose ;;
+      13) diag_live_capture ;;
+      14) do_update ;;
+      15)
         printf '\n%bРезервная копия и восстановление:%b\n' "$C_BOLD" "$C_RESET"
         printf '  1) Создать бэкап сейчас\n'
         printf '  2) Восстановить из файла архива\n'
@@ -3063,17 +3726,17 @@ show_menu() {
           do_restore "$bkp"
         fi
         ;;
-      15)
+      16)
         if confirm_yes "Переустановить AmneziaWG начисто (текущие конфиги сохранятся в бэкап, ключи обновятся)?"; then
           do_reinstall
         fi
         ;;
-      16)
+      17)
         if confirm_yes "Полностью удалить AmneziaWG с сервера?"; then
           do_uninstall
         fi
         ;;
-      17)
+      18)
         break
         ;;
     esac
@@ -3120,10 +3783,12 @@ case "$ACTION" in
   rotate) do_rotate "${2:-}" ;;
   schedule) do_schedule "${2:-}" ;;
   token) do_token "${2:-}" ;;
-  endpoint|ip-mode) do_switch_endpoint "${2:-}" ;;
+  admin-token) do_admin_token "${2:-show}" ;;
+  endpoint|ip-mode) do_switch_endpoint "${2:-}" "${3:-}" ;;
   api-status) do_api_status ;;
   api-restart) do_api_restart ;;
-  add-client) do_add_client "${2:-}" ;;
+  add-client) shift; do_add_client "$@" ;;
+  edit-client) shift; do_edit_client "$@" ;;
   remove-client) do_remove_client "${2:-}" ;;
   list-clients|clients) do_list_clients ;;
   bot) do_bot_setup ;;
@@ -3145,14 +3810,17 @@ case "$ACTION" in
   update        Обновить awg-manager и API подписок до последней версии
   install       Установка или идемпотентная проверка сервера
   reinstall     Полная переустановка ключей и туннеля (с бэкапом)
-  preset        Сменить профиль маскировки туннеля (quic|stun|stun-alt|dns|steam|custom)
+  preset        Сменить профиль маскировки (quic|quic-alt|stun|stun-alt|dtls|dns|ntp|sip|steam|minecraft|discord|dht|custom)
+  endpoint      Сменить внешний Endpoint (ipv4|ipv6|<домен_или_IP>) [--all]
   rotate        Полная ротация туннеля сервера (смена порта, ключей и обфускации)
   schedule      Настройка авто-ротации по расписанию (3days|weekly|daily|off|status)
   token         Показать токен и ссылку подписки для клиента
-  api-status    Статус API-сервиса подписок клиентов
-  api-restart   Перезапуск API-сервиса подписок клиентов
+  admin-token   Показать или перевыпустить (rotate) Admin-токен API для контейнера роутера
+  api-status    Статус API-сервиса подписок и управления
+  api-restart   Перезапуск API-сервиса подписок и управления
   clients       Список клиентов, статус онлайн и трафик
-  add-client    Добавить нового клиента
+  add-client    Добавить нового клиента [--dns ... --mtu ... --allowed-ips ... --endpoint ...]
+  edit-client   Изменить клиента [--rename ... --dns ... --mtu ... --allowed-ips ... --endpoint ... --rekey --rotate-token]
   remove-client Удалить клиента (по имени или pubkey)
   bot           Настройка Telegram-бота для управления клиентами
   bot-status    Статус Telegram-бота
