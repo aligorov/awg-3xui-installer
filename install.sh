@@ -24,11 +24,13 @@ set -Eeuo pipefail
 #--- конфигурация --------------------------------------------------------------
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
-AWG_DNS="${AWG_DNS:-1.1.1.1, 9.9.9.9}"
+AWG_DNS="${AWG_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
 AWG_MTU="${AWG_MTU:-1280}"
 AWG_PORT="${AWG_PORT:-}"            # пусто -> 443/udp (или случайный 20000-59999 если занят)
 AWG_SUBNET="${AWG_SUBNET:-}"        # пусто -> случайный 10.x.y.0/24
-AWG_ENDPOINT="${AWG_ENDPOINT:-}"    # пусто -> автоопределение внешнего IPv4
+AWG_IPV6_PREFIX="${AWG_IPV6_PREFIX:-fd42:42:42::}"
+AWG_IPV6_SUBNET="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
+AWG_ENDPOINT="${AWG_ENDPOINT:-}"    # пусто -> автоопределение внешнего IPv4/IPv6
 AWG_API_PORT="${AWG_API_PORT:-8443}"  # порт HTTP API подписок для контейнеров MikroTik
 CRED_FILE="/root/awg-credentials.txt"
 BACKUP_DIR="/root/awg-backups"
@@ -194,6 +196,43 @@ get_subnet_prefix() { # извлекает префикс 'A.B.C.' из awg0.con
     srv_addr="$(conf_get Address "$conf")"
     printf '%s' "$srv_addr" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.'
   fi
+}
+
+detect_wan6_iface() {
+  local iface
+  iface="$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [ -z "$iface" ]; then
+    iface="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  fi
+  printf '%s' "$iface"
+}
+
+detect_public_ipv6() {
+  local ip="" url
+  for url in https://api64.ipify.org https://icanhazip.com https://ifconfig.me; do
+    ip="$(curl -6 -fsS --max-time 4 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$ip" =~ : ]]; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+get_ipv6_prefix() { # извлекает IPv6 префикс (например fd42:42:42::) из awg0.conf
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  if [ -f "$conf" ]; then
+    local srv_addr
+    srv_addr="$(conf_get Address "$conf")"
+    local ip6
+    ip6="$(printf '%s' "$srv_addr" | tr ',' '\n' | grep -i ':' | head -n1 | tr -d '[:space:]')"
+    if [ -n "$ip6" ]; then
+      ip6="${ip6%%/*}"
+      printf '%s' "${ip6%1}"
+      return 0
+    fi
+  fi
+  printf '%s' "${AWG_IPV6_PREFIX:-fd42:42:42::}"
 }
 
 confirm_yes() { # $1=вопрос; код 0 = подтверждено
@@ -423,6 +462,8 @@ upgrade_awg_packages() { # обновление старых пакетов из
 apply_sysctl_hardening() {
   cat > /etc/sysctl.d/99-awg-hardening.conf <<'EOF'
 net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.default.forwarding = 1
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 net.ipv4.conf.all.accept_redirects = 0
@@ -540,6 +581,84 @@ except Exception:
 PY
 }
 
+notify_rotation_tg() {
+  local p_name="$1"
+  local new_port="$2"
+  local old_port="${3:-}"
+  local p_title
+  p_title="$(preset_title "$p_name")"
+
+  [ -r "$BOT_ENV" ] || return 0
+
+  python3 - "$BOT_ENV" "$p_title" "$new_port" "$old_port" <<'PY'
+import os, sys, urllib.request, json, html
+
+env_file = sys.argv[1]
+p_title = sys.argv[2]
+new_port = sys.argv[3]
+old_port = sys.argv[4] if len(sys.argv) > 4 else ""
+
+env = {}
+try:
+    with open(env_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+except Exception:
+    sys.exit(0)
+
+token = env.get("BOT_TOKEN")
+if not token:
+    sys.exit(0)
+
+recipients = []
+admin_ids = [x.strip() for x in env.get("ADMIN_ID", "").split(",") if x.strip()]
+recipients.extend(admin_ids)
+group_id = env.get("GROUP_ID", "").strip()
+topic_id = env.get("TOPIC_ID", "").strip()
+topic_id_int = int(topic_id) if topic_id.isdigit() else None
+
+if group_id and group_id not in recipients:
+    recipients.append(group_id)
+
+if not recipients:
+    sys.exit(0)
+
+port_diff = f"<code>{new_port}/udp</code>" + (f" (был <code>{old_port}/udp</code>)" if old_port and old_port != new_port else "")
+msg = (
+    "🔄 <b>Ротация серверного туннеля AmneziaWG 3.1!</b>\n\n"
+    f"• Профиль: <b>{html.escape(p_title)}</b>\n"
+    f"• Слушающий порт: {port_diff}\n"
+    "• Сеть: <b>Dual-Stack (IPv4 + IPv6)</b>\n"
+    "• Обфускация: новые I1, S1–S4, HeaderProtectionKey, CPA\n"
+    "• Роутеры MikroTik с токенами подписки подтянут новые параметры автоматически без разрыва связи."
+)
+
+for target in recipients:
+    payload = {
+        "chat_id": target,
+        "text": msg,
+        "parse_mode": "HTML"
+    }
+    if target == group_id and topic_id_int:
+        payload["message_thread_id"] = topic_id_int
+
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=8):
+            pass
+    except Exception:
+        pass
+PY
+}
+
 fetch_api_script() {
   local api_src="" tmp_api
   mkdir -p "$API_DIR"
@@ -613,6 +732,84 @@ do_api_restart() {
   systemctl restart awg-api && step "API-сервис подписок перезапущен"
 }
 
+ensure_dualstack_support() {
+  local conf="$AWG_DIR/$AWG_IFACE.conf"
+  [ -f "$conf" ] || return 0
+
+  local srv_addr
+  srv_addr="$(conf_get Address "$conf")"
+  [ -n "$srv_addr" ] || return 0
+
+  local ip6_pfx="${AWG_IPV6_PREFIX:-fd42:42:42::}"
+  local ip6_subnet="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
+
+  apply_sysctl_hardening || true
+
+  # 1. Если на сервере в Address нет IPv6
+  if ! printf '%s' "$srv_addr" | grep -q ':'; then
+    step "Авто-активация Dual-Stack IPv4 + IPv6 для серверного туннеля..."
+    local new_srv_addr="${srv_addr}, ${ip6_pfx}1/64"
+    sed -i -E "s|^Address[[:space:]]*=.*$|Address = ${new_srv_addr}|" "$conf"
+
+    if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
+      ip -6 addr add "${ip6_pfx}1/64" dev "$AWG_IFACE" 2>/dev/null || true
+    fi
+
+    local wan_iface wan6_iface
+    wan_iface="$(detect_wan_iface)"
+    wan6_iface="$(detect_wan6_iface)"
+    wan6_iface="${wan6_iface:-$wan_iface}"
+
+    if ! grep -q 'ip6tables' "$conf"; then
+      local postup postdown
+      postup="$(conf_get PostUp "$conf")"
+      postdown="$(conf_get PostDown "$conf")"
+      if [ -n "$postup" ]; then
+        local ip6_postup="; ip6tables -w -t nat -C POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+        sed -i -E "s|^PostUp[[:space:]]*=.*$|PostUp = ${postup}${ip6_postup}|" "$conf"
+      fi
+      if [ -n "$postdown" ]; then
+        local ip6_postdown="; ip6tables -w -t nat -D POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+        sed -i -E "s|^PostDown[[:space:]]*=.*$|PostDown = ${postdown}${ip6_postdown}|" "$conf"
+      fi
+    fi
+  fi
+
+  # 2. Обновляем конфиги клиентов
+  local cf
+  for cf in "$AWG_DIR"/*.conf; do
+    [ -f "$cf" ] || continue
+    [ "$cf" != "$AWG_DIR/$AWG_IFACE.conf" ] || continue
+    local c_addr
+    c_addr="$(conf_get Address "$cf" || true)"
+    [ -n "$c_addr" ] || continue
+
+    if ! printf '%s' "$c_addr" | grep -q ':'; then
+      local last_oct
+      last_oct="$(printf '%s' "$c_addr" | grep -oE '[0-9]+(/[0-9]+)?$' | tr -d '/32' || true)"
+      last_oct="${last_oct:-2}"
+      local cli_ip6="${ip6_pfx}${last_oct}/128"
+      local new_c_addr="${c_addr}, ${cli_ip6}"
+
+      sed -i -E "s|^Address[[:space:]]*=.*$|Address = ${new_c_addr}|" "$cf"
+      sed -i -E "s|^AllowedIPs[[:space:]]*=.*$|AllowedIPs = 0.0.0.0/0, ::/0|" "$cf"
+      sed -i -E "s|^DNS[[:space:]]*=.*$|DNS = ${AWG_DNS}|" "$cf"
+
+      local c_priv c_pub
+      c_priv="$(conf_get PrivateKey "$cf" 2>/dev/null || true)"
+      if [ -n "$c_priv" ]; then
+        c_pub="$(printf '%s\n' "$c_priv" | awg pubkey 2>/dev/null || true)"
+        if [ -n "$c_pub" ]; then
+          sed -i -E "s|^AllowedIPs[[:space:]]*=[[:space:]]*${c_addr}([[:space:]]*)$|AllowedIPs = ${new_c_addr}\1|" "$conf"
+          if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
+            awg set "$AWG_IFACE" peer "$c_pub" allowed-ips "${new_c_addr}" 2>/dev/null || true
+          fi
+        fi
+      fi
+    fi
+  done
+}
+
 do_update() {
   step "Проверка и обновление awg-manager до последней версии"
   acquire_lock
@@ -681,6 +878,9 @@ do_update() {
 
   # Авто-исправление возможных дубликатов портов в конфигах клиентов
   sanitize_existing_client_endpoints || true
+
+  # Авто-миграция туннеля и клиентов на Dual-Stack IPv4+IPv6
+  ensure_dualstack_support || true
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw allow "${AWG_API_PORT:-8443}/tcp" comment 'AmneziaWG Subscription API' >/dev/null 2>&1 || true
@@ -874,7 +1074,7 @@ do_install() {
       cat > "$AWG_DIR/$AWG_IFACE.conf" <<EOF
 [Interface]
 PrivateKey = ${srv_priv}
-Address = ${AWG_SRV_IP}/24
+Address = ${AWG_SRV_IP}/24, ${AWG_IPV6_PREFIX}1/64
 ListenPort = ${AWG_PORT}
 MTU = ${AWG_MTU}
 Jc = ${jc}
@@ -891,19 +1091,19 @@ H4 = ${h4}
 I1 = ${i1}
 HeaderProtectionKey = ${hpk}
 ContentPaddingAddition = ${cpa}
-${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-PostDown = iptables -w -t nat -D POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; ip6tables -w -t nat -C POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+PostDown = iptables -w -t nat -D POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
 [Peer]
 # client1
 PublicKey = ${cli_pub}
-AllowedIPs = ${AWG_CLI_IP}/32
+AllowedIPs = ${AWG_CLI_IP}/32, ${AWG_IPV6_PREFIX}2/128
 EOF
 
       cat > "$AWG_DIR/client1.conf" <<EOF
 [Interface]
 PrivateKey = ${cli_priv}
-Address = ${AWG_CLI_IP}/32
+Address = ${AWG_CLI_IP}/32, ${AWG_IPV6_PREFIX}2/128
 DNS = ${AWG_DNS}
 MTU = ${AWG_MTU}
 Jc = ${jc}
@@ -924,7 +1124,7 @@ ContentPaddingAddition = ${cpa}
 [Peer]
 PublicKey = ${srv_pub}
 Endpoint = ${PUBLIC_IP}:${AWG_PORT}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
       chmod 600 "$AWG_DIR/$AWG_IFACE.conf" "$AWG_DIR/client1.conf"
@@ -1065,7 +1265,12 @@ do_add_client() {
     priv="$(awg genkey)"
     pubk="$(printf '%s\n' "$priv" | awg pubkey)"
 
-    awg set "$AWG_IFACE" peer "$pubk" allowed-ips "$ip/32" \
+    local ip6_pfx ip6_addr client_full_addr
+    ip6_pfx="$(get_ipv6_prefix)"
+    ip6_addr="${ip6_pfx}${i}/128"
+    client_full_addr="${ip}/32, ${ip6_addr}"
+
+    awg set "$AWG_IFACE" peer "$pubk" allowed-ips "$client_full_addr" \
       || die "ядро не приняло peer (awg set)"
 
     if ! cat >> "$conf" <<EOF
@@ -1073,7 +1278,7 @@ do_add_client() {
 [Peer]
 # ${name}
 PublicKey = ${pubk}
-AllowedIPs = ${ip}/32
+AllowedIPs = ${client_full_addr}
 EOF
     then
       awg set "$AWG_IFACE" peer "$pubk" remove 2>/dev/null || true
@@ -1083,7 +1288,7 @@ EOF
     cat > "$AWG_DIR/$name.conf" <<EOF
 [Interface]
 PrivateKey = ${priv}
-Address = ${ip}/32
+Address = ${client_full_addr}
 DNS = ${AWG_DNS}
 MTU = ${P[MTU]}
 Jc = ${P[Jc]}
@@ -1104,7 +1309,7 @@ ContentPaddingAddition = ${P[ContentPaddingAddition]}
 [Peer]
 PublicKey = ${srv_pub}
 Endpoint = ${endpoint}:${P[ListenPort]}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
     chmod 600 "$AWG_DIR/$name.conf" "$conf"
@@ -1541,9 +1746,11 @@ do_diagnose() {
   fi
 
   step "4/8 Форвардинг, rp_filter и NAT"
-  local fwd rpf
+  local fwd rpf fwd6
   fwd="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
   if [ "$fwd" = "1" ]; then d_ok "net.ipv4.ip_forward = 1"; else d_fail "ip_forward=${fwd:-?}, нужно 1: sudo sysctl -w net.ipv4.ip_forward=1"; fi
+  fwd6="$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)"
+  if [ "$fwd6" = "1" ]; then d_ok "net.ipv6.conf.all.forwarding = 1 (Dual-Stack)"; else d_warn "net.ipv6.conf.all.forwarding = ${fwd6:-0}"; fi
   rpf="$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || true)"
   if [ "$rpf" = "1" ]; then
     d_warn "net.ipv4.conf.all.rp_filter = 1 (строгий режим может резать асимметричный трафик; рекомендуется 2)"
@@ -1555,6 +1762,10 @@ do_diagnose() {
       d_ok "NAT MASQUERADE ${subnet} -> ${wan}"
     else
       d_fail "Нет MASQUERADE ${subnet} -> ${wan}. Перезапустите туннель"
+    fi
+    local ip6_subnet="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
+    if ip6tables -w -t nat -C POSTROUTING -s "$ip6_subnet" -o "$wan" -j MASQUERADE 2>/dev/null; then
+      d_ok "IPv6 NAT MASQUERADE ${ip6_subnet} -> ${wan}"
     fi
     if iptables -w -C FORWARD -i "$AWG_IFACE" -o "$wan" -j ACCEPT 2>/dev/null; then
       d_ok "FORWARD ${AWG_IFACE} -> ${wan} разрешён"
@@ -1692,8 +1903,10 @@ do_token() {
 
   sanitize_existing_client_endpoints || true
 
-  local pub_ip
-  if [ -f "$AWG_DIR/client1.conf" ]; then
+  local pub_ip=""
+  if [ -f "$AWG_DIR/${name}.conf" ]; then
+    pub_ip="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/${name}.conf")")"
+  elif [ -f "$AWG_DIR/client1.conf" ]; then
     pub_ip="$(extract_host_from_endpoint "$(conf_get Endpoint "$AWG_DIR/client1.conf")")"
   fi
   pub_ip="${pub_ip:-$(detect_public_ip || true)}"
@@ -1784,6 +1997,16 @@ apply_tunnel_rotation() {
 
     local subnet
     subnet="$(get_subnet_prefix)0/24"
+    local wan6_iface
+    wan6_iface="$(detect_wan6_iface)"
+    wan6_iface="${wan6_iface:-$wan_iface}"
+    local ip6_subnet="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
+    local ip6_pfx
+    ip6_pfx="$(get_ipv6_prefix)"
+
+    if ! printf '%s' "$srv_addr" | grep -q ':'; then
+      srv_addr="${srv_addr}, ${ip6_pfx}1/64"
+    fi
 
     local tmp_conf
     tmp_conf="$(mktemp)"
@@ -1809,14 +2032,22 @@ H4 = ${h4}
 I1 = ${i1}
 HeaderProtectionKey = ${hpk}
 ContentPaddingAddition = ${cpa}
-${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${wan_iface} -j ACCEPT; iptables -w -C FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-PostDown = iptables -w -t nat -D POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${wan_iface} -j ACCEPT; iptables -w -C FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; ip6tables -w -t nat -C POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+PostDown = iptables -w -t nat -D POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 EOF
 
     local c_name c_ip cli_priv cli_pub c_count=0
     while IFS='|' read -r c_name c_ip; do
       [ -n "$c_name" ] && [ -n "$c_ip" ] || continue
       is_valid_client_name "$c_name" || continue
+
+      local c_full_addr="$c_ip"
+      if ! printf '%s' "$c_ip" | grep -q ':'; then
+        local last_oct
+        last_oct="$(printf '%s' "$c_ip" | grep -oE '[0-9]+(/[0-9]+)?$' | tr -d '/32' || true)"
+        last_oct="${last_oct:-2}"
+        c_full_addr="${c_ip}, ${ip6_pfx}${last_oct}/128"
+      fi
 
       if [ -f "$AWG_DIR/${c_name}.conf" ]; then
         cli_priv="$(conf_get PrivateKey "$AWG_DIR/${c_name}.conf" 2>/dev/null || true)"
@@ -1833,13 +2064,13 @@ EOF
 [Peer]
 # ${c_name}
 PublicKey = ${cli_pub}
-AllowedIPs = ${c_ip}
+AllowedIPs = ${c_full_addr}
 EOF
 
       cat > "$AWG_DIR/${c_name}.conf" <<EOF
 [Interface]
 PrivateKey = ${cli_priv}
-Address = ${c_ip}
+Address = ${c_full_addr}
 DNS = ${AWG_DNS}
 MTU = ${mtu}
 Jc = ${jc}
@@ -1860,7 +2091,7 @@ ContentPaddingAddition = ${cpa}
 [Peer]
 PublicKey = ${srv_pub}
 Endpoint = ${public_ip}:${new_port}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
       chmod 600 "$AWG_DIR/${c_name}.conf"
@@ -1891,30 +2122,7 @@ EOF
     systemctl restart awg-api 2>/dev/null || true
   fi
 
-  if [ -r "$BOT_ENV" ] && systemctl is-active --quiet awg-bot 2>/dev/null; then
-    python3 -c "
-import html, urllib.request, json, os, sys
-try:
-    sys.path.insert(0, '$BOT_DIR')
-    from bot import load_env, ADMIN_IDS, send_message
-    env = load_env()
-    title = '$(preset_title "$p_name")'
-    for uid in ADMIN_IDS:
-        try:
-            send_message(
-                uid,
-                '🎭 <b>Обновление серверного туннеля AmneziaWG 3.1!</b>\n\n'
-                f'• Профиль: <b>{html.escape(title)}</b>\n'
-                f'• Слушающий порт: <code>${new_port}/udp</code>\n'
-                '• Обфускация: новые I1, S1–S4, HPK, Jc, Jmin/max\n'
-                '• Клиенты с токенами (MikroTik контейнеры) обновятся автоматически.\n'
-            )
-        except Exception:
-            pass
-except Exception:
-    pass
-" 2>/dev/null || true
-  fi
+  notify_rotation_tg "$p_name" "$new_port" "$old_port" || true
 
   printf '\n%b============================================================%b\n' "$C_GREEN" "$C_RESET"
   printf '  %bСерверный туннель AmneziaWG успешно обновлен!%b\n' "$C_BOLD" "$C_RESET"
