@@ -95,11 +95,18 @@ def find_client_by_token(token):
     return None
 
 
-def sanitize_config_endpoint(conf_str):
-    """Очищает Endpoint в конфиге клиента от возможных дублированных портов: 64.118.150.81:48389:45968 -> 64.118.150.81:45968"""
+def sanitize_client_config(conf_str):
+    """
+    1. Очищает Endpoint от дублированных портов.
+    2. Гарантирует наличие IPv6 (Dual-Stack) в AllowedIPs (0.0.0.0/0, ::/0) и Address (fd42:42:42::<oct>/128).
+    3. Добавляет IPv6 DNS, если его не было.
+    """
     lines = []
     for line in conf_str.splitlines():
-        if line.strip().startswith("Endpoint") and "=" in line:
+        trimmed = line.strip()
+
+        # 1. Endpoint fix
+        if trimmed.startswith("Endpoint") and "=" in line:
             prefix, val = line.split("=", 1)
             raw = val.strip()
             clean_host = raw.replace("http://", "").replace("https://", "").split("/")[0]
@@ -114,7 +121,39 @@ def sanitize_config_endpoint(conf_str):
                 last_port = "443"
             lines.append(f"{prefix.strip()} = {h}:{last_port}")
             continue
+
+        # 2. AllowedIPs fix: ensure dual-stack 0.0.0.0/0, ::/0
+        if trimmed.startswith("AllowedIPs") and "=" in line:
+            prefix, val = line.split("=", 1)
+            if "::/0" not in val:
+                lines.append(f"{prefix.strip()} = 0.0.0.0/0, ::/0")
+            else:
+                lines.append(line)
+            continue
+
+        # 3. DNS fix: ensure Cloudflare IPv6 DNS
+        if trimmed.startswith("DNS") and "=" in line:
+            prefix, val = line.split("=", 1)
+            if ":" not in val:
+                lines.append(f"{prefix.strip()} = {val.strip()}, 2606:4700:4700::1111, 2606:4700:4700::1001")
+            else:
+                lines.append(line)
+            continue
+
+        # 4. Address check: ensure IPv6 address
+        if trimmed.startswith("Address") and "=" in line:
+            prefix, val = line.split("=", 1)
+            raw_addr = val.strip()
+            if ":" in raw_addr:
+                lines.append(line)
+            else:
+                ip_clean = raw_addr.split("/")[0].strip()
+                last_oct = ip_clean.rsplit(".", 1)[-1] if "." in ip_clean else "2"
+                lines.append(f"{prefix.strip()} = {raw_addr}, fd42:42:42::{last_oct}/128")
+            continue
+
         lines.append(line)
+
     return "\n".join(lines)
 
 
@@ -297,7 +336,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
         try:
             raw_bytes = conf_path.read_bytes()
             conf_str = raw_bytes.decode("utf-8")
-            conf_str = sanitize_config_endpoint(conf_str)
+            conf_str = sanitize_client_config(conf_str)
             raw_bytes = conf_str.encode("utf-8")
         except Exception as e:
             self.send_json(500, {"error": "Internal Error", "message": str(e)})

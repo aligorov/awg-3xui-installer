@@ -744,6 +744,13 @@ ensure_dualstack_support() {
   local ip6_subnet="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
 
   apply_sysctl_hardening || true
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null 2>&1 || true
+
+  local wan_iface wan6_iface
+  wan_iface="$(detect_wan_iface)"
+  wan6_iface="$(detect_wan6_iface)"
+  wan6_iface="${wan6_iface:-$wan_iface}"
 
   # 1. Если на сервере в Address нет IPv6
   if ! printf '%s' "$srv_addr" | grep -q ':'; then
@@ -754,11 +761,6 @@ ensure_dualstack_support() {
     if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
       ip -6 addr add "${ip6_pfx}1/64" dev "$AWG_IFACE" 2>/dev/null || true
     fi
-
-    local wan_iface wan6_iface
-    wan_iface="$(detect_wan_iface)"
-    wan6_iface="$(detect_wan6_iface)"
-    wan6_iface="${wan6_iface:-$wan_iface}"
 
     if ! grep -q 'ip6tables' "$conf"; then
       local postup postdown
@@ -775,6 +777,13 @@ ensure_dualstack_support() {
     fi
   fi
 
+  # Активируем правила ip6tables в ядре немедленно
+  if [ -n "$wan6_iface" ]; then
+    ip6tables -w -t nat -C POSTROUTING -s "${ip6_subnet}" -o "${wan6_iface}" -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s "${ip6_subnet}" -o "${wan6_iface}" -j MASQUERADE 2>/dev/null || true
+    ip6tables -w -C FORWARD -i "$AWG_IFACE" -o "${wan6_iface}" -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i "$AWG_IFACE" -o "${wan6_iface}" -j ACCEPT 2>/dev/null || true
+    ip6tables -w -C FORWARD -i "${wan6_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i "${wan6_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  fi
+
   # 2. Обновляем конфиги клиентов
   local cf
   for cf in "$AWG_DIR"/*.conf; do
@@ -784,29 +793,60 @@ ensure_dualstack_support() {
     c_addr="$(conf_get Address "$cf" || true)"
     [ -n "$c_addr" ] || continue
 
+    # Гарантируем AllowedIPs и DNS в клиентском конфиге
+    sed -i -E "s|^AllowedIPs[[:space:]]*=.*$|AllowedIPs = 0.0.0.0/0, ::/0|" "$cf"
+    sed -i -E "s|^DNS[[:space:]]*=.*$|DNS = ${AWG_DNS}|" "$cf"
+
+    local c_priv c_pub
+    c_priv="$(conf_get PrivateKey "$cf" 2>/dev/null || true)"
+    [ -n "$c_priv" ] || continue
+    c_pub="$(printf '%s\n' "$c_priv" | awg pubkey 2>/dev/null || true)"
+    [ -n "$c_pub" ] || continue
+
+    local target_allowed=""
     if ! printf '%s' "$c_addr" | grep -q ':'; then
-      local last_oct
-      last_oct="$(printf '%s' "$c_addr" | grep -oE '[0-9]+(/[0-9]+)?$' | tr -d '/32' || true)"
+      local ip_only="${c_addr%%/*}"
+      local last_oct="${ip_only##*.}"
       last_oct="${last_oct:-2}"
       local cli_ip6="${ip6_pfx}${last_oct}/128"
-      local new_c_addr="${c_addr}, ${cli_ip6}"
-
-      sed -i -E "s|^Address[[:space:]]*=.*$|Address = ${new_c_addr}|" "$cf"
-      sed -i -E "s|^AllowedIPs[[:space:]]*=.*$|AllowedIPs = 0.0.0.0/0, ::/0|" "$cf"
-      sed -i -E "s|^DNS[[:space:]]*=.*$|DNS = ${AWG_DNS}|" "$cf"
-
-      local c_priv c_pub
-      c_priv="$(conf_get PrivateKey "$cf" 2>/dev/null || true)"
-      if [ -n "$c_priv" ]; then
-        c_pub="$(printf '%s\n' "$c_priv" | awg pubkey 2>/dev/null || true)"
-        if [ -n "$c_pub" ]; then
-          sed -i -E "s|^AllowedIPs[[:space:]]*=[[:space:]]*${c_addr}([[:space:]]*)$|AllowedIPs = ${new_c_addr}\1|" "$conf"
-          if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
-            awg set "$AWG_IFACE" peer "$c_pub" allowed-ips "${new_c_addr}" 2>/dev/null || true
-          fi
-        fi
-      fi
+      target_allowed="${c_addr}, ${cli_ip6}"
+      sed -i -E "s|^Address[[:space:]]*=.*$|Address = ${target_allowed}|" "$cf"
+    else
+      target_allowed="$c_addr"
     fi
+
+    # Обновляем AllowedIPs для этого пира в awg0.conf
+    python3 -c "
+import sys
+conf = sys.argv[1]
+pub = sys.argv[2]
+new_allowed = sys.argv[3]
+try:
+    with open(conf, 'r') as f:
+        lines = f.readlines()
+    out = []
+    in_target = False
+    for line in lines:
+        if line.strip().startswith('[Peer]'):
+            in_target = False
+        if line.strip().startswith('PublicKey') and pub in line:
+            in_target = True
+        if in_target and line.strip().startswith('AllowedIPs'):
+            out.append(f'AllowedIPs = {new_allowed}\n')
+            in_target = False
+            continue
+        out.append(line)
+    with open(conf, 'w') as f:
+        f.writelines(out)
+except Exception:
+    pass
+" "$conf" "$c_pub" "$target_allowed" 2>/dev/null || true
+
+    if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
+      awg set "$AWG_IFACE" peer "$c_pub" allowed-ips "${target_allowed}" 2>/dev/null || true
+    fi
+
+    touch "$cf"
   done
 }
 
@@ -2043,8 +2083,8 @@ EOF
 
       local c_full_addr="$c_ip"
       if ! printf '%s' "$c_ip" | grep -q ':'; then
-        local last_oct
-        last_oct="$(printf '%s' "$c_ip" | grep -oE '[0-9]+(/[0-9]+)?$' | tr -d '/32' || true)"
+        local ip_only="${c_ip%%/*}"
+        local last_oct="${ip_only##*.}"
         last_oct="${last_oct:-2}"
         c_full_addr="${c_ip}, ${ip6_pfx}${last_oct}/128"
       fi
