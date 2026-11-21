@@ -45,8 +45,9 @@ ENDPOINT_MODE_FILE="/etc/amnezia/amneziawg/endpoint_mode.conf"
 BOT_DIR="/opt/awg-bot"
 API_DIR="/opt/awg-api"
 BOT_ENV="/etc/amnezia/amneziawg/bot.env"
-RAW_BASE_URL="https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main"
+RAW_BASE_URL="${RAW_BASE_URL:-https://raw.githubusercontent.com/aligorov/awg-3xui-installer/main}"
 TMP_DIR=""
+TEE_PID=""
 IS_TTY=0
 
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
@@ -873,13 +874,15 @@ do_admin_token() {
   ensure_api_tls_cert || true
 
   local pub_ip api_host fp
-  pub_ip="$(get_public_endpoint_host)"
-  pub_ip="${pub_ip:-$(detect_public_ip || true)}"
-  api_host="$pub_ip"
+  pub_ip="$(get_public_endpoint_host || true)"
+  if [ -z "$pub_ip" ]; then
+    pub_ip="$(detect_public_ip || true)"
+  fi
+  api_host="${pub_ip:-<IP_сервера>}"
   if [[ "$api_host" =~ : ]] && [[ ! "$api_host" =~ ^\[ ]]; then
     api_host="[${api_host}]"
   fi
-  fp="$(get_api_tls_fingerprint)"
+  fp="$(get_api_tls_fingerprint || true)"
 
   printf '\n%b=== Admin API токен управления клиентами (для контейнера MikroTik) ===%b\n' "$C_BOLD" "$C_RESET"
   printf '  Admin-токен:         %b%s%b\n' "$C_CYAN" "$tok" "$C_RESET"
@@ -1266,6 +1269,11 @@ do_update() {
 cleanup() {
   if [ -n "${TMP_DIR:-}" ]; then rm -rf "$TMP_DIR"; fi
   release_lock
+  if [ -n "${TEE_PID:-}" ]; then
+    exec 1>&- 2>&- || true
+    wait "$TEE_PID" 2>/dev/null || true
+    TEE_PID=""
+  fi
 }
 trap cleanup EXIT
 trap 'die "сбой на строке ${LINENO} (код $?)"' ERR
@@ -3771,9 +3779,21 @@ fi
 
 ( umask 077 && touch "$LOG_FILE" "$DBG_FILE" )
 chmod 600 "$LOG_FILE" "$DBG_FILE" 2>/dev/null || true
-if [ "${AWGM_PLAIN:-0}" != "1" ]; then
-  exec > >(tee -a "$LOG_FILE") 2>&1
-fi
+case "$ACTION" in
+  menu|admin-token|token|clients|list-clients|status|api-status|bot-status|help|-h|--help)
+    ;;
+  *)
+    if [ "${AWGM_PLAIN:-0}" != "1" ]; then
+      LOG_FIFO="$(mktemp -u /tmp/awg-log-fifo.XXXXXX)"
+      if mkfifo "$LOG_FIFO" 2>/dev/null; then
+        tee -a "$LOG_FILE" < "$LOG_FIFO" &
+        TEE_PID=$!
+        exec > "$LOG_FIFO" 2>&1
+        rm -f "$LOG_FIFO"
+      fi
+    fi
+    ;;
+esac
 
 case "$ACTION" in
   menu) show_menu ;;
