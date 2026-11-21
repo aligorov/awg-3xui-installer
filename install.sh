@@ -87,11 +87,16 @@ extract_host_from_endpoint() {
   raw="${raw%%/*}"
   if [[ "$raw" =~ ^\[([a-fA-F0-9:]+)\] ]]; then
     printf '%s' "${BASH_REMATCH[1]}"
-    return
+    return 0
   fi
   if [[ "$raw" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
     printf '%s' "${BASH_REMATCH[1]}"
-    return
+    return 0
+  fi
+  local colons="${raw//[^:]/}"
+  if [ "${#colons}" -ge 2 ]; then
+    printf '%s' "$raw"
+    return 0
   fi
   printf '%s' "${raw%%:*}"
 }
@@ -228,23 +233,48 @@ detect_wan6_iface() {
 }
 
 detect_public_ipv6() {
-  local ip="" url has_global6=""
-  # Быстрая проверка локального маршрута IPv6 (<2 мс, без ожидания таймаутов curl)
-  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-  if [[ "$ip" =~ : ]] && [[ ! "${ip,,}" =~ ^(fe80|fc|fd|::1$) ]]; then
-    printf '%s' "$ip"
+  local ip="" url dst cand
+
+  # 1. Если явно задан AWG_IPV6_ENDPOINT
+  if [ -n "${AWG_IPV6_ENDPOINT:-}" ]; then
+    extract_host_from_endpoint "$AWG_IPV6_ENDPOINT"
     return 0
   fi
-  has_global6="$(ip -6 -o addr show scope global 2>/dev/null | awk '!/temporary/ {print $4}' | head -n1 || true)"
-  [ -n "$has_global6" ] || return 1
 
-  for url in https://api64.ipify.org https://icanhazip.com https://ifconfig.me; do
-    ip="$(curl -6 -fsS --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ "$ip" =~ : ]]; then
-      printf '%s' "$ip"
+  # 2. Определение через curl -6 к надёжным внешним сервисам (быстрый таймаут 2с)
+  for url in https://api6.ipify.org https://ipv6.icanhazip.com https://v6.ident.me https://ifconfig.co; do
+    ip="$(curl -6 -fsS --connect-timeout 2 --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$ip" =~ : ]] && [[ ! "${ip,,}" =~ ^(fe80|fc|fd|::1$) ]] && [[ "$ip" =~ ^[23][0-9a-fA-F]{1,3}: ]]; then
+      printf '%s\n' "$ip"
       return 0
     fi
   done
+
+  # 3. Маршрутизация ядра (ip -6 route get к внешнему адресу)
+  for dst in 2606:4700:4700::1111 2001:4860:4860::8888; do
+    ip="$(ip -6 route get "$dst" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    if [[ "$ip" =~ : ]] && [[ ! "${ip,,}" =~ ^(fe80|fc|fd|::1$) ]] && [[ "$ip" =~ ^[23][0-9a-fA-F]{1,3}: ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+
+  # 4. Поиск публичного IPv6 (2000::/3) непосредственно на физических/WAN интерфейсах
+  # (исключая awg0, wg*, docker, br-, veth, lo и ULA fd... / link-local fe80...)
+  cand="$(ip -6 -o addr show scope global 2>/dev/null | awk '
+    $2 !~ /^(lo|awg|wg|warp|docker|br-|veth|tun|tap|virbr|tailscale)/ && !/temporary/ && !/deprecated/ {
+      gsub(/\/.*/, "", $4)
+      if ($4 ~ /^[23][0-9a-fA-F]{1,3}:/ && $4 !~ /^(fe80|fc|fd)/) {
+        print $4
+        exit
+      }
+    }
+  ' || true)"
+  if [ -n "$cand" ]; then
+    printf '%s\n' "$cand"
+    return 0
+  fi
+
   return 1
 }
 

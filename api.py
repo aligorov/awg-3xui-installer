@@ -81,7 +81,104 @@ STEALTH_PRESETS = [
 ]
 VALID_PRESET_IDS = {p["id"] for p in STEALTH_PRESETS}
 
-_PUB_IP_CACHE = {"ts": 0.0, "ipv4": "", "ipv6": ""}
+_PUB_IP_CACHE = {
+    "ts": 0.0,
+    "ipv4": "",
+    "ipv6": "",
+    "ipv6_diag": "",
+    "ipv6_local": [],
+}
+_PUB_IP_CACHE_TTL_SEC = 15.0
+
+_IGNORED_V6_IFACE_RE = re.compile(
+    r"^(?:lo|awg\d*|wg\d*|warp\d*|tun\d*|tap\d*|docker\d*|br-[0-9a-f]+|"
+    r"veth.*|virbr.*|cni.*|flannel.*|podman.*|tailscale\d*|zt.*)$",
+    re.IGNORECASE,
+)
+_GLOBAL_UNICAST_V6_NET = ipaddress.IPv6Network("2000::/3")
+_NON_PUBLIC_V6_NETS = (
+    ipaddress.IPv6Network("2001::/32"),       # Teredo
+    ipaddress.IPv6Network("2001:2::/48"),     # BMWG
+    ipaddress.IPv6Network("2001:10::/28"),    # ORCHID
+    ipaddress.IPv6Network("2001:20::/28"),    # ORCHIDv2
+    ipaddress.IPv6Network("2001:db8::/32"),   # Documentation
+    ipaddress.IPv6Network("2001:4:112::/48"), # AS112
+    ipaddress.IPv6Network("2002::/16"),       # 6to4
+    ipaddress.IPv6Network("3fff::/20"),       # Documentation (RFC 9637)
+)
+
+
+def normalize_public_ipv6(ip_str):
+    """Возвращает канонический публичный IPv6 (2000::/3, не ULA/link-local/special) или ''."""
+    if not ip_str or not isinstance(ip_str, str):
+        return ""
+    clean = ip_str.strip().strip("[]").split("%")[0].split("/")[0]
+    if not clean or ":" not in clean:
+        return ""
+    try:
+        addr = ipaddress.IPv6Address(clean)
+    except Exception:
+        return ""
+    if (
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_unspecified
+        or addr.is_reserved
+        or addr.is_site_local
+        or addr.ipv4_mapped is not None
+        or addr not in _GLOBAL_UNICAST_V6_NET
+    ):
+        return ""
+    for bad_net in _NON_PUBLIC_V6_NETS:
+        if addr in bad_net:
+            return ""
+    return str(addr)
+
+
+def split_endpoint_host_port(raw, default_port="443"):
+    """Извлекает (host, port) из Endpoint/URL, корректно сохраняя голый или [скобочный] IPv6."""
+    s = (raw or "").strip()
+    if s.startswith("http://"):
+        s = s[7:]
+    elif s.startswith("https://"):
+        s = s[8:]
+    if "/" in s:
+        s = s.split("/", 1)[0]
+    if s.startswith("[") and "]" in s:
+        idx = s.index("]")
+        h = s[1:idx]
+        rest = s[idx + 1:]
+        last_port = rest.rsplit(":", 1)[-1] if ":" in rest else ""
+        return h, (last_port if last_port.isdigit() else default_port)
+    m4 = re.match(r"^([0-9]{1,3}(?:\.[0-9]{1,3}){3})(.*)$", s)
+    if m4:
+        h, rest = m4.group(1), m4.group(2)
+        last_port = rest.rsplit(":", 1)[-1] if ":" in rest else ""
+        return h, (last_port if last_port.isdigit() else default_port)
+    try:
+        ip6 = ipaddress.IPv6Address(s)
+        return str(ip6), default_port
+    except Exception:
+        pass
+    if ":" in s:
+        h, _ = s.split(":", 1)
+        last_port = s.rsplit(":", 1)[-1]
+        return h, (last_port if last_port.isdigit() else default_port)
+    return s, default_port
+
+
+def _normalize_peer_ip(ip_str):
+    """Убирает префикс IPv4-mapped IPv6 (::ffff:1.2.3.4 -> 1.2.3.4) и zone ID."""
+    raw = (ip_str or "").split("%")[0].strip()
+    try:
+        addr = ipaddress.ip_address(raw)
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(addr)
+    except Exception:
+        return raw
 
 
 def _check_rate_limit(store, client_ip, max_attempts, window_sec):
@@ -121,7 +218,7 @@ def record_admin_failed(client_ip):
 
 def is_private_client_ip(ip_str):
     try:
-        addr = ipaddress.ip_address(ip_str.split("%")[0])
+        addr = ipaddress.ip_address(_normalize_peer_ip(ip_str))
         return addr.is_loopback or addr.is_private or addr.is_link_local
     except Exception:
         return False
@@ -205,18 +302,8 @@ def sanitize_client_config(conf_str):
         # 1. Endpoint fix
         if sec == "peer" and trimmed.startswith("Endpoint") and "=" in line:
             prefix, val = line.split("=", 1)
-            raw = val.strip()
-            clean_host = raw.replace("http://", "").replace("https://", "").split("/")[0]
-            if clean_host.startswith("[") and "]" in clean_host:
-                h = clean_host[1:clean_host.index("]")]
-            elif re.match(r"^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", clean_host):
-                h = re.match(r"^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", clean_host).group(1)
-            else:
-                h = clean_host.split(":")[0]
-            last_port = raw.rsplit(":", 1)[-1]
-            if not last_port.isdigit():
-                last_port = "443"
-            if ":" in h:
+            h, last_port = split_endpoint_host_port(val, default_port="443")
+            if ":" in h and not h.startswith("["):
                 lines.append(f"{prefix.strip()} = [{h}]:{last_port}")
             else:
                 lines.append(f"{prefix.strip()} = {h}:{last_port}")
@@ -269,10 +356,9 @@ def conf_to_vpn_url(conf_text, client_name="client"):
         elif line.startswith("DNS") and "=" in line:
             dns = line.split("=", 1)[1].strip()
 
-    if endpoint.startswith("[") and "]" in endpoint:
-        host = endpoint[1:endpoint.index("]")]
-    else:
-        host = endpoint.split(":")[0] if endpoint else "awg-server"
+    host, _ = split_endpoint_host_port(endpoint, default_port="443")
+    if not host:
+        host = "awg-server"
     amnezia_payload = {
         "containers": [
             {
@@ -305,12 +391,9 @@ def conf_to_mikrotik_rsc(conf_text, client_name):
             params[f"{section}.{k.strip()}"] = v.strip()
 
     srv_endpoint = params.get("peer.Endpoint", "")
-    if srv_endpoint.startswith("[") and "]" in srv_endpoint:
-        ep_host = srv_endpoint[1:srv_endpoint.index("]")]
-        ep_port = srv_endpoint.rsplit(":", 1)[-1]
-    else:
-        ep_host = srv_endpoint.split(":")[0] if srv_endpoint else "0.0.0.0"
-        ep_port = srv_endpoint.split(":")[1] if ":" in srv_endpoint else "443"
+    ep_host, ep_port = split_endpoint_host_port(srv_endpoint, default_port="443")
+    if not ep_host:
+        ep_host = "0.0.0.0"
 
     rsc = [
         f"# MikroTik RouterOS Configuration for client: {client_name}",
@@ -428,13 +511,261 @@ def get_awg_live_dump():
     return stats
 
 
-def detect_public_ips_cached():
+def _invalidate_pub_ip_cache():
+    _PUB_IP_CACHE["ts"] = 0.0
+
+
+def _collect_local_public_ipv6():
+    """Собирает публичные (2000::/3) глобальные IPv6 с не-виртуальных интерфейсов."""
+    recs = []
+    try:
+        out = subprocess.check_output(
+            ["ip", "-6", "-j", "addr", "show"],
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        ).decode("utf-8", errors="replace")
+        data = json.loads(out)
+        if isinstance(data, list):
+            for iface_obj in data:
+                if not isinstance(iface_obj, dict):
+                    continue
+                ifname = str(iface_obj.get("ifname", "") or "")
+                if not ifname or _IGNORED_V6_IFACE_RE.match(ifname):
+                    continue
+                for a in iface_obj.get("addr_info", []) or []:
+                    if not isinstance(a, dict):
+                        continue
+                    if a.get("family") != "inet6" or a.get("scope") != "global":
+                        continue
+                    if a.get("deprecated") or a.get("tentative") or a.get("dadfailed"):
+                        continue
+                    plt = a.get("preferred_life_time")
+                    if plt is not None and int(plt) == 0:
+                        continue
+                    ip_norm = normalize_public_ipv6(str(a.get("local", "") or ""))
+                    if not ip_norm:
+                        continue
+                    recs.append({
+                        "ifname": ifname,
+                        "ip": ip_norm,
+                        "prefixlen": int(a.get("prefixlen", 64) or 64),
+                        "temporary": bool(a.get("temporary")),
+                        "secondary": bool(a.get("secondary")),
+                        "dynamic": bool(a.get("dynamic")),
+                        "mngtmpaddr": bool(a.get("mngtmpaddr")),
+                    })
+            return recs
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.check_output(
+            ["ip", "-6", "-o", "addr", "show", "scope", "global"],
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        ).decode("utf-8", errors="replace")
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split("@")[0]
+            if not ifname or _IGNORED_V6_IFACE_RE.match(ifname):
+                continue
+            if "deprecated" in parts or "tentative" in parts or "dadfailed" in parts:
+                continue
+            cidr = parts[3]
+            ip_norm = normalize_public_ipv6(cidr)
+            if not ip_norm:
+                continue
+            plen = 64
+            if "/" in cidr:
+                try:
+                    plen = int(cidr.split("/", 1)[1])
+                except ValueError:
+                    plen = 64
+            recs.append({
+                "ifname": ifname,
+                "ip": ip_norm,
+                "prefixlen": plen,
+                "temporary": ("temporary" in parts),
+                "secondary": ("secondary" in parts),
+                "dynamic": ("dynamic" in parts),
+                "mngtmpaddr": ("mngtmpaddr" in parts),
+            })
+    except Exception:
+        pass
+    return recs
+
+
+def _detect_default_devs(family_flag="-6"):
+    devs = []
+    for cmd in (
+        ["ip", family_flag, "-o", "route", "show", "table", "all"],
+        ["ip", family_flag, "-o", "route", "show", "default"],
+    ):
+        try:
+            out = subprocess.check_output(
+                cmd, stderr=subprocess.DEVNULL, timeout=3
+            ).decode("utf-8", errors="replace")
+            for ln in out.splitlines():
+                toks = ln.split()
+                if not toks or toks[0] != "default":
+                    continue
+                for i in range(len(toks) - 1):
+                    if toks[i] == "dev":
+                        d = toks[i + 1].split("@")[0]
+                        if d and not _IGNORED_V6_IFACE_RE.match(d) and d not in devs:
+                            devs.append(d)
+            if cmd[-1] == "all":
+                break
+        except Exception:
+            continue
+    return devs
+
+
+def _route_get_v6(dst, from_ip=""):
+    cmd = ["ip", "-6", "-o", "route", "get", dst]
+    if from_ip:
+        cmd.extend(["from", from_ip])
+    try:
+        out = subprocess.check_output(
+            cmd, stderr=subprocess.DEVNULL, timeout=3
+        ).decode("utf-8", errors="replace")
+    except Exception:
+        return "", ""
+    m_dev = re.search(r"\bdev\s+([^\s]+)", out)
+    m_src = re.search(r"\bsrc\s+([^\s]+)", out)
+    dev = m_dev.group(1).split("@")[0] if m_dev else ""
+    src = m_src.group(1) if m_src else ""
+    if dev and _IGNORED_V6_IFACE_RE.match(dev):
+        return "", ""
+    return dev, src
+
+
+def _upgrade_temporary_v6(ifname, ip_norm, recs):
+    """Предпочитает постоянный IPv6 на том же интерфейсе/префиксе, если ядро выбрало SLAAC temporary."""
+    match = [r for r in recs if r["ifname"] == ifname and r["ip"] == ip_norm]
+    if not match or not match[0]["temporary"]:
+        return ip_norm
+    perms = [r for r in recs if r["ifname"] == ifname and not r["temporary"]]
+    if not perms:
+        return ip_norm
+    try:
+        target_p64 = ipaddress.IPv6Address(ip_norm).packed[:8]
+    except Exception:
+        target_p64 = None
+    perms.sort(key=lambda r: (
+        0 if (target_p64 is not None and ipaddress.IPv6Address(r["ip"]).packed[:8] == target_p64) else 1,
+        1 if r["secondary"] else 0,
+        1 if (r["dynamic"] and not r["mngtmpaddr"]) else 0,
+    ))
+    return perms[0]["ip"]
+
+
+def _probe_external_ipv6(iface_or_ip="", max_urls=4):
+    urls = (
+        "https://api6.ipify.org",
+        "https://ipv6.icanhazip.com",
+        "https://v6.ident.me",
+        "https://api64.ipify.org",
+    )[:max_urls]
+    for url in urls:
+        cmd = ["curl", "-6", "-fsS", "--connect-timeout", "2", "--max-time", "3"]
+        if iface_or_ip:
+            cmd.extend(["--interface", iface_or_ip])
+        cmd.append(url)
+        try:
+            resp = subprocess.check_output(
+                cmd, stderr=subprocess.DEVNULL, timeout=4
+            ).decode("utf-8", errors="replace").strip()
+            v6 = normalize_public_ipv6(resp)
+            if v6:
+                return v6
+        except Exception:
+            continue
+    return ""
+
+
+def _detect_public_ipv6_with_diag():
+    """
+    Определяет внешний IPv6 VPS для Endpoint клиентов:
+    1) Учитывает AWG_IPV6_ENDPOINT при явном переопределении.
+    2) Проверяет маршрутизацию ядра (`ip -6 route get`), игнорируя awg/wg/warp/docker/veth.
+    3) Заменяет SLAAC `temporary` на постоянный адрес того же интерфейса/префикса.
+    4) Проверяет policy-routing (`from <cand>`) и `default` маршруты.
+    5) Использует HTTPS IPv6-echo только если в ОС действительно есть IPv6 uplink (NAT66/policy).
+    Возвращает (public_ipv6, local_public_addrs, diag_code).
+    """
+    env_override = normalize_public_ipv6(os.environ.get("AWG_IPV6_ENDPOINT", ""))
+    if env_override:
+        return env_override, [env_override], "ok"
+
+    recs = _collect_local_public_ipv6()
+    local_ips = []
+    for r in recs:
+        if r["ip"] not in local_ips:
+            local_ips.append(r["ip"])
+
+    default_devs = _detect_default_devs("-6")
+    wan4_devs = _detect_default_devs("-4")
+
+    saw_wan_route = False
+    for probe_dst in ("2606:4700:4700::1111", "2001:4860:4860::8888"):
+        rdev, rsrc = _route_get_v6(probe_dst)
+        if not rdev:
+            continue
+        saw_wan_route = True
+        v6 = normalize_public_ipv6(rsrc)
+        if v6:
+            v6 = _upgrade_temporary_v6(rdev, v6, recs)
+            return v6, local_ips, "ok"
+
+    if recs:
+        ranked = sorted(
+            recs,
+            key=lambda r: (
+                1 if r["temporary"] else 0,
+                1 if r["secondary"] else 0,
+                0 if r["ifname"] in default_devs else (1 if r["ifname"] in wan4_devs else 2),
+                1 if (r["dynamic"] and not r["mngtmpaddr"]) else 0,
+            ),
+        )
+        for rec in ranked[:4]:
+            for probe_dst in ("2606:4700:4700::1111", "2001:4860:4860::8888"):
+                rdev, _ = _route_get_v6(probe_dst, from_ip=rec["ip"])
+                if rdev:
+                    cand = _upgrade_temporary_v6(rdev, rec["ip"], recs)
+                    return cand, local_ips, "ok"
+        if default_devs:
+            for rec in ranked:
+                if rec["ifname"] in default_devs:
+                    cand = _upgrade_temporary_v6(rec["ifname"], rec["ip"], recs)
+                    return cand, local_ips, "ok"
+        ext_cand = _probe_external_ipv6(ranked[0]["ip"], max_urls=1)
+        if ext_cand:
+            return ext_cand, local_ips, "ok"
+        return "", local_ips, "no_default_route"
+
+    if default_devs or saw_wan_route:
+        ext_v6 = _probe_external_ipv6()
+        if ext_v6:
+            return ext_v6, local_ips, "ok"
+        return "", local_ips, "no_egress"
+
+    return "", [], "no_interface_ipv6"
+
+
+def detect_public_ips_with_diag():
     now = time.time()
-    if now - _PUB_IP_CACHE["ts"] < 60:
-        return _PUB_IP_CACHE["ipv4"], _PUB_IP_CACHE["ipv6"]
+    if now - _PUB_IP_CACHE["ts"] < _PUB_IP_CACHE_TTL_SEC:
+        return (
+            _PUB_IP_CACHE["ipv4"],
+            _PUB_IP_CACHE["ipv6"],
+            _PUB_IP_CACHE["ipv6_diag"],
+            list(_PUB_IP_CACHE["ipv6_local"]),
+        )
 
     pub4 = ""
-    pub6 = ""
     try:
         out4 = subprocess.check_output(
             ["ip", "-4", "route", "get", "1.1.1.1"],
@@ -449,23 +780,18 @@ def detect_public_ips_cached():
     except Exception:
         pass
 
-    try:
-        out6 = subprocess.check_output(
-            ["ip", "-6", "route", "get", "2606:4700:4700::1111"],
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-        ).decode("utf-8", errors="replace")
-        m = re.search(r"\bsrc\s+([0-9a-fA-F:]+)", out6)
-        if m:
-            cand = m.group(1)
-            if not is_private_client_ip(cand):
-                pub6 = cand
-    except Exception:
-        pass
+    pub6, local_ips6, diag6 = _detect_public_ipv6_with_diag()
 
     _PUB_IP_CACHE["ts"] = now
     _PUB_IP_CACHE["ipv4"] = pub4
     _PUB_IP_CACHE["ipv6"] = pub6
+    _PUB_IP_CACHE["ipv6_diag"] = diag6
+    _PUB_IP_CACHE["ipv6_local"] = list(local_ips6)
+    return pub4, pub6, diag6, list(local_ips6)
+
+
+def detect_public_ips_cached():
+    pub4, pub6, _, _ = detect_public_ips_with_diag()
     return pub4, pub6
 
 
@@ -617,7 +943,7 @@ def build_state_snapshot(include_configs=False, target_client=None, tls_enabled=
 
     preset_id = detect_preset_id(iface)
     ep_mode = read_endpoint_mode()
-    pub4, pub6 = detect_public_ips_cached()
+    pub4, pub6, diag6, local_ips6 = detect_public_ips_with_diag()
 
     sample_ep = ""
     for c in clients:
@@ -628,7 +954,7 @@ def build_state_snapshot(include_configs=False, target_client=None, tls_enabled=
         sample_ep = clients[0].get("endpoint", "")
 
     if not pub4 and sample_ep:
-        h = sample_ep.split(":")[0]
+        h, _ = split_endpoint_host_port(sample_ep)
         if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", h):
             pub4 = h
 
@@ -638,6 +964,9 @@ def build_state_snapshot(include_configs=False, target_client=None, tls_enabled=
             "preset": preset_id,
             "ep_mode": ep_mode,
             "ep": sample_ep,
+            "pub4": pub4,
+            "pub6": pub6,
+            "ipv6_diag": diag6,
             "i1": iface.get("I1", ""),
             "s": [iface.get(k, "") for k in ("S1", "S2", "S3", "S4", "HeaderProtectionKey")],
             "clients": [(c["name"], c["etag"], c["token"]) for c in clients],
@@ -653,6 +982,8 @@ def build_state_snapshot(include_configs=False, target_client=None, tls_enabled=
         "endpoint": sample_ep,
         "public_ipv4": pub4,
         "public_ipv6": pub6,
+        "ipv6_diag": diag6,
+        "ipv6_local_addrs": local_ips6,
         "api_port": API_PORT,
         "tls_enabled": tls_enabled,
         "client_count": len(clients),
@@ -691,8 +1022,11 @@ def run_manager(args, skip_api_restart=False):
 class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
     server_version = "AWG-API-Server/2.0"
 
+    def _client_ip(self):
+        return _normalize_peer_ip(self.client_address[0]) if self.client_address else "unknown"
+
     def log_message(self, format, *args):
-        client_ip = self.client_address[0] if self.client_address else "unknown"
+        client_ip = self._client_ip()
         msg = format % args
         masked_msg = ANY_SECRET_RE.sub("awg_***", msg)
         print(f"[{self.log_date_time_string()}] {client_ip} - {masked_msg}")
@@ -735,7 +1069,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             return None, "Некорректный JSON"
 
     def _check_admin_auth(self):
-        client_ip = self.client_address[0] if self.client_address else "unknown"
+        client_ip = self._client_ip()
         if is_admin_rate_limited(client_ip):
             self.send_json(429, {"error": "Too Many Requests", "message": "Слишком много неудачных попыток авторизации."})
             return False
@@ -871,6 +1205,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Create Failed", "message": out[-600:] or "Ошибка создания клиента"})
                 return
 
+            _invalidate_pub_ip_cache()
             server, _, item = build_state_snapshot(include_configs=False, target_client=name, tls_enabled=self._tls_configured())
             self.send_json(201, {"ok": True, "server": server, "client": item, "output": out[-500:]})
             return
@@ -888,7 +1223,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             if not ok:
                 self.send_json(400, {"error": "Endpoint Switch Failed", "message": out[-600:] or "Ошибка смены Endpoint"})
                 return
-            _PUB_IP_CACHE["ts"] = 0.0
+            _invalidate_pub_ip_cache()
             server, clients, _ = build_state_snapshot(include_configs=False, tls_enabled=self._tls_configured())
             self.send_json(200, {"ok": True, "server": server, "clients": clients, "output": out[-500:]})
             return
@@ -919,6 +1254,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             if not ok:
                 self.send_json(400, {"error": "Preset Failed", "message": out[-600:] or "Ошибка смены маскировки"})
                 return
+            _invalidate_pub_ip_cache()
             server, clients, _ = build_state_snapshot(include_configs=False, tls_enabled=self._tls_configured())
             self.send_json(200, {"ok": True, "server": server, "clients": clients, "output": out[-500:]})
             return
@@ -936,6 +1272,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             if not ok:
                 self.send_json(400, {"error": "Rotate Failed", "message": out[-600:] or "Ошибка ротации сервера"})
                 return
+            _invalidate_pub_ip_cache()
             server, clients, _ = build_state_snapshot(include_configs=False, tls_enabled=self._tls_configured())
             self.send_json(200, {"ok": True, "server": server, "clients": clients, "output": out[-500:]})
             return
@@ -1000,6 +1337,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "Update Failed", "message": out[-600:] or "Ошибка изменения клиента"})
             return
 
+        _invalidate_pub_ip_cache()
         server, _, item = build_state_snapshot(include_configs=False, target_client=final_name, tls_enabled=self._tls_configured())
         self.send_json(200, {"ok": True, "server": server, "client": item, "output": out[-500:]})
 
@@ -1021,6 +1359,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "Delete Failed", "message": out[-600:] or "Ошибка удаления клиента"})
             return
 
+        _invalidate_pub_ip_cache()
         server, clients, _ = build_state_snapshot(include_configs=False, tls_enabled=self._tls_configured())
         self.send_json(200, {"ok": True, "deleted": cname, "server": server, "clients": clients, "output": out[-500:]})
 
@@ -1063,7 +1402,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
         return token, req_format
 
     def handle_get_or_head(self, is_head=False):
-        client_ip = self.client_address[0] if self.client_address else "unknown"
+        client_ip = self._client_ip()
 
         if is_rate_limited(client_ip):
             self.send_json(429, {"error": "Too Many Requests", "message": "Слишком много запросов. Попробуйте через минуту."})
@@ -1195,6 +1534,17 @@ class DualModeThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPSe
             self.shutdown_request(request)
 
 
+class DualModeThreadedHTTPServerV6(DualModeThreadedHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError:
+            pass
+        super().server_bind()
+
+
 def build_ssl_context():
     if not (os.path.isfile(API_TLS_CERT) and os.path.isfile(API_TLS_KEY)):
         return None
@@ -1208,17 +1558,30 @@ def build_ssl_context():
         return None
 
 
+def _bind_api_server(ssl_ctx):
+    bind_host = (API_HOST or "").strip()
+    if ":" in bind_host or (bind_host in ("", "0.0.0.0") and getattr(socket, "has_dualstack_ipv6", lambda: False)()):
+        v6_host = "::" if bind_host in ("", "0.0.0.0", "::") else bind_host.strip("[]")
+        try:
+            httpd = DualModeThreadedHTTPServerV6((v6_host, API_PORT), SubscriptionHandler, ssl_context=ssl_ctx)
+            return httpd, f"[{v6_host}]:{API_PORT}" + (" (dual-stack IPv4+IPv6)" if v6_host == "::" else " (IPv6)")
+        except OSError:
+            if ":" in bind_host and bind_host != "::":
+                raise
+    httpd = DualModeThreadedHTTPServer((bind_host or "0.0.0.0", API_PORT), SubscriptionHandler, ssl_context=ssl_ctx)
+    return httpd, f"{bind_host or '0.0.0.0'}:{API_PORT}"
+
+
 def run_server():
     ssl_ctx = build_ssl_context()
-    server_address = (API_HOST, API_PORT)
     try:
-        httpd = DualModeThreadedHTTPServer(server_address, SubscriptionHandler, ssl_context=ssl_ctx)
+        httpd, listen_desc = _bind_api_server(ssl_ctx)
     except OSError as e:
         print(f"ОШИБКА: Не удалось занять порт {API_HOST}:{API_PORT}: {e}", file=sys.stderr)
         sys.exit(1)
 
     proto = "HTTP+HTTPS (dual-mode)" if ssl_ctx else "HTTP"
-    print(f"AmneziaWG API v2 слушает на {API_HOST}:{API_PORT} [{proto}]")
+    print(f"AmneziaWG API v2 слушает на {listen_desc} [{proto}]")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -1228,4 +1591,13 @@ def run_server():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--detect-ip":
+        pub4, pub6, diag6, local6 = detect_public_ips_with_diag()
+        print(json.dumps({
+            "ipv4": pub4,
+            "ipv6": pub6,
+            "ipv6_diag": diag6,
+            "ipv6_local_addrs": local6,
+        }, ensure_ascii=False))
+        sys.exit(0)
     run_server()
