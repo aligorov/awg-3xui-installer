@@ -14,7 +14,7 @@ AmneziaWG Client Subscription & Management API Server (v2).
 3. Dual-mode HTTP + HTTPS на одном порту (по умолчанию 8443/tcp):
    - Существующие http://<vps>:8443/sub/<token> продолжают работать без изменений
    - Admin API (/api/v1/...) работает по HTTPS (самоподписанный TLS сертификат)
-     или из доверенной приватной/локальной сети (WG-туннель / loopback).
+     или из доверенной локальной/туннельной сети (loopback / подсеть awg0).
 Не требует внешних библиотек (чистый Python 3 стандартной библиотеки).
 """
 
@@ -32,12 +32,13 @@ import socketserver
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-API_VERSION = "3.2.6"
+API_VERSION = "3.2.7"
 AWG_DIR = os.environ.get("AWG_DIR", "/etc/amnezia/amneziawg")
 AWG_IFACE = os.environ.get("AWG_IFACE", "awg0")
 TOKENS_FILE = os.path.join(AWG_DIR, "tokens.json")
@@ -51,6 +52,7 @@ MANAGER_BIN = os.environ.get("AWG_MANAGER_BIN", "/usr/local/bin/awg-manager")
 API_HOST = os.environ.get("AWG_API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("AWG_API_PORT", "8443"))
 ALLOW_INSECURE_ADMIN = os.environ.get("AWG_API_ALLOW_INSECURE_ADMIN", "0") == "1"
+MAX_CONCURRENT_REQUESTS = 64
 
 CLIENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 RESERVED_NAMES = {"awg0", "warp0", "server", "default"}
@@ -58,11 +60,19 @@ TOKEN_RE = re.compile(r"^awg_tok_[a-f0-9]{32,64}$")
 ADMIN_TOKEN_RE = re.compile(r"^awg_adm_[a-f0-9]{32,128}$")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 ANY_SECRET_RE = re.compile(r"awg_(?:tok|adm)_[a-f0-9]{16,128}")
+HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+CPS_I1_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_<>\s\x21-\x7e]{1,512}$")
 
-# Защита от брутфорса: {ip: [count, timestamp]}
+_STATE_LOCK = threading.Lock()
+
+# Защита от брутфорса: {bucket: [count, timestamp]}
 FAILED_ATTEMPTS = {}
 MAX_FAILED_ATTEMPTS = 20
 BAN_WINDOW_SEC = 60
+MAX_TRACKED_IPS = 4096
 
 ADMIN_FAILED_ATTEMPTS = {}
 ADMIN_MAX_FAILED_ATTEMPTS = 10
@@ -110,9 +120,81 @@ _NON_PUBLIC_V6_NETS = (
     ipaddress.IPv6Network("2002::/16"),       # 6to4
     ipaddress.IPv6Network("3fff::/20"),       # Documentation (RFC 9637)
 )
+# Известные публичные DNS-резолверы, которые не могут быть собственным IP интерфейса VPS
+_PUBLIC_DNS_V6_NETS = (
+    ipaddress.IPv6Network("2001:4860:4860::/48"),  # Google Public DNS
+    ipaddress.IPv6Network("2606:4700:4700::/48"),  # Cloudflare DNS
+    ipaddress.IPv6Network("2620:fe::/48"),         # Quad9
+    ipaddress.IPv6Network("2620:119:35::/48"),     # OpenDNS
+    ipaddress.IPv6Network("2620:119:53::/48"),     # OpenDNS
+    ipaddress.IPv6Network("2a10:50c0::/32"),       # AdGuard DNS
+    ipaddress.IPv6Network("2a0d:2a00::/32"),       # CleanBrowsing
+    ipaddress.IPv6Network("2001:67c:28a0::/48"),   # Yandex DNS
+)
 
 
-def normalize_public_ipv6(ip_str):
+def has_unsafe_chars(val):
+    """Отклоняет любые управляющие символы, CR/LF и Unicode line-separators (\x85, \u2028, \u2029)."""
+    if not isinstance(val, str):
+        return True
+    for ch in val:
+        code = ord(ch)
+        if code < 32 or code == 127 or ch in ("\x85", "\u2028", "\u2029"):
+            return True
+    if len(val.splitlines()) > 1:
+        return True
+    return False
+
+
+def validate_dns_value(raw):
+    """Проверяет список DNS-адресов (IPv4/IPv6 через запятую)."""
+    if has_unsafe_chars(raw) or len(raw) > 256:
+        return False
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts or len(parts) > 8:
+        return False
+    for p in parts:
+        try:
+            ipaddress.ip_address(p)
+        except ValueError:
+            if not HOSTNAME_RE.fullmatch(p):
+                return False
+    return True
+
+
+def validate_allowed_ips_value(raw):
+    """Проверяет список CIDR-подсетей AllowedIPs."""
+    if has_unsafe_chars(raw) or len(raw) > 1024:
+        return False
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts or len(parts) > 64:
+        return False
+    for p in parts:
+        try:
+            ipaddress.ip_network(p, strict=False)
+        except ValueError:
+            return False
+    return True
+
+
+def validate_endpoint_value(raw):
+    """Проверяет допустимое значение поля endpoint (режим или host[:port])."""
+    if has_unsafe_chars(raw) or len(raw) > 255:
+        return False
+    s = raw.strip()
+    if s.lower() in ("", "server", "default", "ipv4", "4", "ipv6", "6"):
+        return True
+    host, port = split_endpoint_host_port(s, default_port="443")
+    if not host or not port.isdigit() or not (1 <= int(port) <= 65535):
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return bool(HOSTNAME_RE.fullmatch(host))
+
+
+def normalize_public_ipv6(ip_str, reject_public_dns=False):
     """Возвращает канонический публичный IPv6 (2000::/3, не ULA/link-local/special) или ''."""
     if not ip_str or not isinstance(ip_str, str):
         return ""
@@ -138,6 +220,10 @@ def normalize_public_ipv6(ip_str):
     for bad_net in _NON_PUBLIC_V6_NETS:
         if addr in bad_net:
             return ""
+    if reject_public_dns:
+        for dns_net in _PUBLIC_DNS_V6_NETS:
+            if addr in dns_net:
+                return ""
     return str(addr)
 
 
@@ -167,6 +253,14 @@ def split_endpoint_host_port(raw, default_port="443"):
     except Exception:
         pass
     if ":" in s:
+        # Возможен IPv6 с портом без скобок или hostname:port
+        head, tail = s.rsplit(":", 1)
+        if tail.isdigit():
+            try:
+                ip6 = ipaddress.IPv6Address(head)
+                return str(ip6), tail
+            except Exception:
+                pass
         h, _ = s.split(":", 1)
         last_port = s.rsplit(":", 1)[-1]
         return h, (last_port if last_port.isdigit() else default_port)
@@ -185,23 +279,47 @@ def _normalize_peer_ip(ip_str):
         return raw
 
 
+def _rate_limit_bucket(ip_str):
+    """Для IPv6 группирует адреса по /64 префиксу, чтобы ротация внутри /64 не обходила лимит."""
+    norm = _normalize_peer_ip(ip_str)
+    try:
+        addr = ipaddress.ip_address(norm)
+        if isinstance(addr, ipaddress.IPv6Address) and not addr.is_loopback:
+            net = ipaddress.IPv6Network(f"{addr}/64", strict=False)
+            return str(net)
+        return str(addr)
+    except Exception:
+        return norm
+
+
 def _check_rate_limit(store, client_ip, max_attempts, window_sec):
+    bucket = _rate_limit_bucket(client_ip)
     now = time.time()
-    stale = [ip for ip, (_, ts) in list(store.items()) if now - ts > window_sec]
-    for ip in stale:
-        store.pop(ip, None)
-    entry = store.get(client_ip)
-    return bool(entry and entry[0] >= max_attempts)
+    with _STATE_LOCK:
+        stale = [k for k, (_, ts) in store.items() if now - ts > window_sec]
+        for k in stale:
+            store.pop(k, None)
+        entry = store.get(bucket)
+        return bool(entry and entry[0] >= max_attempts)
 
 
-def _record_failed(store, client_ip):
+def _record_failed(store, client_ip, window_sec):
+    bucket = _rate_limit_bucket(client_ip)
     now = time.time()
-    entry = store.get(client_ip)
-    if entry:
-        entry[0] += 1
-        entry[1] = now
-    else:
-        store[client_ip] = [1, now]
+    with _STATE_LOCK:
+        if len(store) >= MAX_TRACKED_IPS and bucket not in store:
+            stale = [k for k, (_, ts) in store.items() if now - ts > window_sec]
+            for k in stale:
+                store.pop(k, None)
+            if len(store) >= MAX_TRACKED_IPS:
+                oldest_key = min(store.items(), key=lambda kv: kv[1][1])[0]
+                store.pop(oldest_key, None)
+        entry = store.get(bucket)
+        if entry:
+            entry[0] += 1
+            entry[1] = now
+        else:
+            store[bucket] = [1, now]
 
 
 def is_rate_limited(client_ip):
@@ -209,7 +327,7 @@ def is_rate_limited(client_ip):
 
 
 def record_failed_attempt(client_ip):
-    _record_failed(FAILED_ATTEMPTS, client_ip)
+    _record_failed(FAILED_ATTEMPTS, client_ip, BAN_WINDOW_SEC)
 
 
 def is_admin_rate_limited(client_ip):
@@ -217,7 +335,7 @@ def is_admin_rate_limited(client_ip):
 
 
 def record_admin_failed(client_ip):
-    _record_failed(ADMIN_FAILED_ATTEMPTS, client_ip)
+    _record_failed(ADMIN_FAILED_ATTEMPTS, client_ip, ADMIN_BAN_WINDOW_SEC)
 
 
 def is_private_client_ip(ip_str):
@@ -226,6 +344,32 @@ def is_private_client_ip(ip_str):
         return addr.is_loopback or addr.is_private or addr.is_link_local
     except Exception:
         return False
+
+
+def is_trusted_local_or_tunnel_ip(ip_str):
+    """
+    Разрешает доступ без TLS только с loopback (127.0.0.0/8, ::1) или из самой
+    подсети интерфейса awg0 (а не с произвольных соседей по VPC/VLAN датацентра).
+    """
+    try:
+        addr = ipaddress.ip_address(_normalize_peer_ip(ip_str))
+    except Exception:
+        return False
+    if addr.is_loopback:
+        return True
+    iface, _ = parse_server_conf()
+    addr_field = iface.get("Address", "")
+    for part in addr_field.split(","):
+        cidr = part.strip()
+        if not cidr:
+            continue
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+            if addr.version == net.version and addr in net:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def is_valid_client_name(name):
@@ -241,13 +385,17 @@ def is_valid_client_name(name):
 def load_tokens():
     if not os.path.exists(TOKENS_FILE):
         return {}
-    try:
-        with open(TOKENS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception as e:
-        print(f"Ошибка чтения {TOKENS_FILE}: {e}", file=sys.stderr)
+    for attempt in range(2):
+        try:
+            with open(TOKENS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(0.02)
+                continue
+            print(f"Ошибка чтения {TOKENS_FILE}: {e}", file=sys.stderr)
     return {}
 
 
@@ -271,6 +419,7 @@ def find_client_by_token(token):
         return None
 
     tokens_data = load_tokens()
+    matched = None
     for client_name, cdata in tokens_data.items():
         if isinstance(cdata, dict):
             c_token = cdata.get("token", "")
@@ -279,33 +428,48 @@ def find_client_by_token(token):
         else:
             continue
 
-        if secrets.compare_digest(c_token, token):
+        if isinstance(c_token, str) and secrets.compare_digest(c_token, token):
             if is_valid_client_name(client_name):
-                return client_name
-    return None
+                matched = client_name
+    return matched
+
+
+def read_manual_ipv6():
+    """Читает manual_ipv6.conf (поддерживает '<ip>' или '<ip>|<plen>|<gw>')."""
+    if not os.path.isfile(MANUAL_IPV6_FILE):
+        return ""
+    try:
+        raw = Path(MANUAL_IPV6_FILE).read_text(encoding="utf-8").strip()
+        if not raw:
+            return ""
+        first = raw.splitlines()[0].split("|", 1)[0].strip()
+        return normalize_public_ipv6(first)
+    except Exception:
+        return ""
 
 
 def sanitize_client_config(conf_str):
     """
-    1. Очищает Endpoint от дублированных портов.
-    2. Для legacy IPv4-only полного туннеля (AllowedIPs = 0.0.0.0/0) достраивает ::/0,
-       не затирая явно заданные кастомные подсети.
-    3. Для стандартного DNS (1.1.1.1 / 1.0.0.1 / 9.9.9.9) достраивает IPv6 DNS,
-       не затирая явно заданный кастомный DNS.
-    4. Гарантирует Dual-Stack Address (fd42:42:42::<oct>/128).
-    5. Гарантирует MTU >= 1280 при наличии IPv6 (RFC 8200 / Linux IPV6_MIN_MTU).
+    Безопасная нормализация клиентского конфига без искажения намеренных настроек:
+    1. Очищает Endpoint от дублированных портов и гарантирует [скобки] для IPv6.
+    2. НЕ перезаписывает AllowedIPs и DNS (сохраняет как кастомные CIDR/DNS, так и
+       намеренный IPv4-only режим 0.0.0.0/0 на VPS без исходящего IPv6).
+    3. Гарантирует MTU >= 1280 при наличии IPv6 в Address или AllowedIPs (RFC 8200 / Linux IPV6_MIN_MTU).
     """
+    cleaned = conf_str.replace("\r\n", "\n").replace("\r", "\n")
+    for bad_sep in ("\x85", "\u2028", "\u2029", "\x0b", "\x0c"):
+        cleaned = cleaned.replace(bad_sep, " ")
+
     lines = []
     sec = ""
     has_ipv6 = False
-    for line in conf_str.splitlines():
+    for line in cleaned.split("\n"):
         trimmed = line.strip()
         if trimmed.startswith("[") and trimmed.endswith("]"):
             sec = trimmed[1:-1].lower()
             lines.append(line)
             continue
 
-        # 1. Endpoint fix
         if sec == "peer" and trimmed.startswith("Endpoint") and "=" in line:
             prefix, val = line.split("=", 1)
             h, last_port = split_endpoint_host_port(val, default_port="443")
@@ -315,44 +479,22 @@ def sanitize_client_config(conf_str):
                 lines.append(f"{prefix.strip()} = {h}:{last_port}")
             continue
 
-        # 2. AllowedIPs fix: upgrade legacy exact "0.0.0.0/0" to dual-stack, keep custom CIDRs intact
         if sec == "peer" and trimmed.startswith("AllowedIPs") and "=" in line:
-            prefix, val = line.split("=", 1)
-            if val.strip() == "0.0.0.0/0":
-                lines.append(f"{prefix.strip()} = 0.0.0.0/0, ::/0")
+            _, val = line.split("=", 1)
+            if ":" in val:
                 has_ipv6 = True
-            else:
-                if ":" in val:
-                    has_ipv6 = True
-                lines.append(line)
+            lines.append(line)
             continue
 
-        # 3. DNS fix: upgrade default Cloudflare/Quad9 IPv4-only DNS to dual-stack, keep custom DNS intact
-        if sec == "interface" and trimmed.startswith("DNS") and "=" in line:
-            prefix, val = line.split("=", 1)
-            vclean = val.strip()
-            if ":" not in vclean and vclean in ("1.1.1.1, 1.0.0.1", "1.1.1.1, 9.9.9.9", "1.1.1.1"):
-                lines.append(f"{prefix.strip()} = {vclean}, 2606:4700:4700::1111, 2606:4700:4700::1001")
-            else:
-                lines.append(line)
-            continue
-
-        # 4. Address check: ensure IPv6 address
         if sec == "interface" and trimmed.startswith("Address") and "=" in line:
-            prefix, val = line.split("=", 1)
-            raw_addr = val.strip()
-            has_ipv6 = True
-            if ":" in raw_addr:
-                lines.append(line)
-            else:
-                ip_clean = raw_addr.split("/")[0].strip()
-                last_oct = ip_clean.rsplit(".", 1)[-1] if "." in ip_clean else "2"
-                lines.append(f"{prefix.strip()} = {raw_addr}, fd42:42:42::{last_oct}/128")
+            _, val = line.split("=", 1)
+            if ":" in val:
+                has_ipv6 = True
+            lines.append(line)
             continue
 
         lines.append(line)
 
-    # 5. Enforce RFC 8200 / Linux minimum MTU >= 1280 whenever IPv6 is present in config
     if has_ipv6:
         fixed = []
         sec = ""
@@ -409,8 +551,28 @@ def conf_to_vpn_url(conf_text, client_name="client"):
     return f"vpn://{encoded}"
 
 
+def _ros_escape(val):
+    """Экранирует строку для безопасной вставки в двойные кавычки RouterOS CLI."""
+    s = str(val or "")
+    out = []
+    for ch in s:
+        if ord(ch) < 32 or ord(ch) == 127:
+            continue
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "$":
+            out.append("\\$")
+        elif ch == "?":
+            out.append("\\?")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def conf_to_mikrotik_rsc(conf_text, client_name):
-    """Генерирует RouterOS CLI скрипт для нативного WireGuard или контейнера."""
+    """Генерирует безопасный справочный RouterOS CLI скрипт с экранированием параметров."""
     params = {}
     section = None
     for line in conf_text.splitlines():
@@ -426,29 +588,32 @@ def conf_to_mikrotik_rsc(conf_text, client_name):
     ep_host, ep_port = split_endpoint_host_port(srv_endpoint, default_port="443")
     if not ep_host:
         ep_host = "0.0.0.0"
+    if not ep_port.isdigit():
+        ep_port = "443"
+    mtu_val = params.get("interface.MTU", "1280")
+    if not mtu_val.isdigit():
+        mtu_val = "1280"
+    safe_client = _ros_escape(client_name)
 
     rsc = [
-        f"# MikroTik RouterOS Configuration for client: {client_name}",
-        f"# Generated by awg-manager at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# MikroTik RouterOS Configuration for client: {safe_client}",
+        f"# Generated by awg-manager v{API_VERSION} at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "# Рекомендуемый способ для AmneziaWG 3.1: используйте контейнер amneziawg-mikrotik с URL подписки /sub/<token>",
         "",
-        "# 1. Настройка параметров WireGuard peer",
-        f'/interface wireguard set [find name="awg0"] private-key="{params.get("interface.PrivateKey", "")}" mtu={params.get("interface.MTU", "1280")}',
-        f'/interface wireguard peers set [find interface="awg0"] public-key="{params.get("peer.PublicKey", "")}" endpoint-address="{ep_host}" endpoint-port={ep_port} allowed-address=0.0.0.0/0 persistent-keepalive=25',
-        "",
-        "# 2. Настройка переменных обфускации для AmneziaWG Proxy-контейнера",
-        f'/container envs set [find name="awg_env" key="AWG_HPK"] value="{params.get("interface.HeaderProtectionKey", "")}"',
-        f'/container envs set [find name="awg_env" key="AWG_S1"] value="{params.get("interface.S1", "")}"',
-        f'/container envs set [find name="awg_env" key="AWG_S2"] value="{params.get("interface.S2", "")}"',
-        f'/container envs set [find name="awg_env" key="AWG_S3"] value="{params.get("interface.S3", "")}"',
-        f'/container envs set [find name="awg_env" key="AWG_S4"] value="{params.get("interface.S4", "")}"',
-        f'/container envs set [find name="awg_env" key="AWG_I1"] value="{params.get("interface.I1", "")}"',
-        f'/container envs set [find name="awg_env" key="AWG_JC"] value="{params.get("interface.Jc", "4")}"',
-        "",
-        "# 3. Перезапуск контейнера для применения",
-        '/container stop [find name="awg-proxy"]',
-        ':delay 2s',
-        '/container start [find name="awg-proxy"]',
-        f':log info "AmneziaWG: {client_name} tunnel configuration updated successfully"'
+        f':local awgClient "{safe_client}"',
+        f':local awgEndpoint "{_ros_escape(ep_host)}"',
+        f':local awgPort {ep_port}',
+        f':local awgMtu {mtu_val}',
+        f':local awgPrivKey "{_ros_escape(params.get("interface.PrivateKey", ""))}"',
+        f':local awgPubKey "{_ros_escape(params.get("peer.PublicKey", ""))}"',
+        f':local awgHpk "{_ros_escape(params.get("interface.HeaderProtectionKey", ""))}"',
+        f':local awgS1 "{_ros_escape(params.get("interface.S1", ""))}"',
+        f':local awgS2 "{_ros_escape(params.get("interface.S2", ""))}"',
+        f':local awgS3 "{_ros_escape(params.get("interface.S3", ""))}"',
+        f':local awgS4 "{_ros_escape(params.get("interface.S4", ""))}"',
+        f':local awgI1 "{_ros_escape(params.get("interface.I1", ""))}"',
+        f':local awgJc "{_ros_escape(params.get("interface.Jc", "4"))}"',
+        f':log info ("AmneziaWG profile loaded for " . $awgClient . " -> " . $awgEndpoint . ":" . $awgPort)',
     ]
     return "\n".join(rsc)
 
@@ -544,7 +709,8 @@ def get_awg_live_dump():
 
 
 def _invalidate_pub_ip_cache():
-    _PUB_IP_CACHE["ts"] = 0.0
+    with _STATE_LOCK:
+        _PUB_IP_CACHE["ts"] = 0.0
 
 
 def _collect_local_public_ipv6():
@@ -574,7 +740,7 @@ def _collect_local_public_ipv6():
                     plt = a.get("preferred_life_time")
                     if plt is not None and int(plt) == 0:
                         continue
-                    ip_norm = normalize_public_ipv6(str(a.get("local", "") or ""))
+                    ip_norm = normalize_public_ipv6(str(a.get("local", "") or ""), reject_public_dns=True)
                     if not ip_norm:
                         continue
                     recs.append({
@@ -606,7 +772,7 @@ def _collect_local_public_ipv6():
             if "deprecated" in parts or "tentative" in parts or "dadfailed" in parts:
                 continue
             cidr = parts[3]
-            ip_norm = normalize_public_ipv6(cidr)
+            ip_norm = normalize_public_ipv6(cidr, reject_public_dns=True)
             if not ip_norm:
                 continue
             plen = 64
@@ -694,179 +860,139 @@ def _upgrade_temporary_v6(ifname, ip_norm, recs):
     return perms[0]["ip"]
 
 
-def _solicit_router_ra(wan_dev):
-    """Шлёт Router Solicitation на WAN чтобы заставить шлюз датацентра прислать RA с префиксом IPv6."""
-    if not wan_dev:
-        return
-    try:
-        subprocess.run(
-            ["ping6", "-c", "1", "-w", "1", f"ff02::2%{wan_dev}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
-    except Exception:
-        pass
-    try:
-        subprocess.run(
-            ["rdisc6", "-m", wan_dev],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
-    except Exception:
-        pass
+def _extract_ipv6_from_json_obj(obj):
+    """Безопасно извлекает публичный IPv6 хоста из JSON метаданных, пропуская DNS/nameservers."""
+    skip_keys = ("dns", "nameserver", "resolver", "ntp")
+    cands = []
+
+    def walk(node, parent_key=""):
+        pk = parent_key.lower()
+        if any(sk in pk for sk in skip_keys):
+            return
+        if isinstance(node, dict):
+            # Прямые поля сетевых интерфейсов OpenStack / DigitalOcean / Hetzner / Vultr
+            for addr_key in ("ip_address", "address", "ipv6_address", "ip"):
+                val = node.get(addr_key)
+                if isinstance(val, str) and ":" in val:
+                    norm = normalize_public_ipv6(val, reject_public_dns=True)
+                    if norm and not norm.endswith("::1"):
+                        cands.append(norm)
+            for k, v in node.items():
+                walk(v, k)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, parent_key)
+        elif isinstance(node, str) and parent_key.lower() in ("addresses", "address", "ip_address", "ipv6"):
+            norm = normalize_public_ipv6(node, reject_public_dns=True)
+            if norm and not norm.endswith("::1"):
+                cands.append(norm)
+
+    walk(obj)
+    return cands[0] if cands else ""
 
 
-def _discover_cloud_ipv6():
-    """Ищет выделенный провайдером IPv6 в cloud-init, IMDS метаданных, netplan и конфигах сети."""
-    def check_text(txt, source_name):
-        cands = []
-        for m in re.finditer(r"\b(2[0-9a-fA-F]{3}:[0-9a-fA-F:]+)(?:/(\d+))?\b", txt):
-            raw = m.group(1).lower()
-            plen = int(m.group(2)) if m.group(2) else 64
-            try:
-                ip_obj = ipaddress.IPv6Address(raw)
-                if ip_obj.is_global and not ip_obj.is_multicast and not ip_obj.is_link_local and not ip_obj.is_private:
-                    cands.append((raw, plen))
-            except Exception:
-                pass
-        if not cands:
-            return None
-        best_ip, best_plen = cands[0]
-        for c_ip, c_plen in cands:
-            if not c_ip.endswith("::1"):
-                best_ip, best_plen = c_ip, c_plen
-                break
-        gw_m = re.search(r"(?:gateway6|via|gateway)\s*[:=]\s*[\"'\s]*([23][0-9a-fA-F:]+)", txt)
-        found_gw = ""
-        if gw_m:
-            try:
-                g = ipaddress.IPv6Address(gw_m.group(1).lower())
-                if g.is_global:
-                    found_gw = str(g)
-            except Exception:
-                pass
-        if not found_gw:
-            try:
-                net = ipaddress.IPv6Network(f"{best_ip}/{best_plen}", strict=False)
-                found_gw = str(net.network_address + 1)
-            except Exception:
-                pass
-        return best_ip, best_plen, found_gw, source_name
+def _extract_ipv6_from_netplan_text(txt):
+    """Читает секции addresses: в Netplan YAML, строго пропуская блоки nameservers:."""
+    in_nameservers = False
+    ns_indent = -1
+    in_addresses = False
+    addr_indent = -1
 
-    # 1. IMDS Cloud Metadata
-    for imds_url in [
+    for raw_line in txt.splitlines():
+        stripped = raw_line.split("#", 1)[0].rstrip()
+        if not stripped.strip():
+            continue
+        indent = len(stripped) - len(stripped.lstrip(" "))
+        s = stripped.strip()
+
+        if in_nameservers:
+            if indent <= ns_indent:
+                in_nameservers = False
+            else:
+                continue
+
+        if s.startswith("nameservers:"):
+            in_nameservers = True
+            ns_indent = indent
+            in_addresses = False
+            continue
+
+        if in_addresses and indent <= addr_indent and not s.startswith("-"):
+            in_addresses = False
+
+        if s.startswith("addresses:"):
+            in_addresses = True
+            addr_indent = indent
+            # inline list: addresses: [2001:..., ...]
+            rest = s[len("addresses:"):].strip()
+            if rest.startswith("[") and rest.endswith("]"):
+                for item in rest[1:-1].split(","):
+                    cand = normalize_public_ipv6(item.strip().strip("'\""), reject_public_dns=True)
+                    if cand and not cand.endswith("::1"):
+                        return cand
+                in_addresses = False
+            continue
+
+        if in_addresses and s.startswith("-"):
+            val = s[1:].strip().strip("'\"")
+            cand = normalize_public_ipv6(val, reject_public_dns=True)
+            if cand and not cand.endswith("::1"):
+                return cand
+    return ""
+
+
+def _discover_cloud_ipv6_readonly():
+    """
+    ТОЛЬКО ЧТЕНИЕ (без изменения eth0/netplan!): проверяет, выделен ли провайдером
+    публичный IPv6 в IMDS / cloud-init / netplan, строго отфильтровывая DNS-серверы.
+    """
+    for imds_url in (
         "http://169.254.169.254/openstack/latest/network_data.json",
         "http://169.254.169.254/metadata/v1.json",
-        "http://169.254.169.254/hetzner/v1/metadata/network",
-    ]:
+    ):
         try:
             req = urllib.request.Request(imds_url, headers={"User-Agent": "cloud-init"})
-            with urllib.request.urlopen(req, timeout=0.8) as r:
-                res = check_text(r.read().decode("utf-8", errors="replace"), imds_url)
-                if res:
-                    return res
+            with urllib.request.urlopen(req, timeout=0.6) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace"))
+                cand = _extract_ipv6_from_json_obj(data)
+                if cand:
+                    return cand, "cloud_metadata_unconfigured"
         except Exception:
             pass
 
-    # 2. Local config files on disk
-    file_patterns = [
+    for jpat in (
         "/run/cloud-init/instance-data.json",
-        "/run/cloud-init/result.json",
         "/var/lib/cloud/instance/instance-data.json",
         "/var/lib/cloud/instances/*/network-data.json",
-        "/var/lib/cloud/instance/user-data",
-        "/etc/netplan/*.yaml",
-        "/etc/netplan/*.yml",
-        "/etc/network/interfaces",
-        "/etc/network/interfaces.d/*",
-        "/etc/systemd/network/*.network",
-        "/etc/sysconfig/network-scripts/ifcfg-*",
-    ]
-    for pat in file_patterns:
-        for fpath in glob.glob(pat):
+    ):
+        for fpath in glob.glob(jpat):
             if os.path.isfile(fpath):
                 try:
-                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                        res = check_text(f.read(), fpath)
-                        if res:
-                            return res
+                    data = json.loads(Path(fpath).read_text(encoding="utf-8", errors="replace"))
+                    cand = _extract_ipv6_from_json_obj(data)
+                    if cand:
+                        return cand, "cloud_init_unconfigured"
                 except Exception:
                     pass
 
-    return "", 0, "", "not_found"
+    for np_pat in ("/etc/netplan/*.yaml", "/etc/netplan/*.yml"):
+        for fpath in sorted(glob.glob(np_pat)):
+            if os.path.isfile(fpath):
+                try:
+                    cand = _extract_ipv6_from_netplan_text(Path(fpath).read_text(encoding="utf-8", errors="replace"))
+                    if cand:
+                        return cand, "netplan_unconfigured"
+                except Exception:
+                    pass
+
+    return "", "no_interface_ipv6"
 
 
-def _activate_discovered_ipv6(ip, plen, gw, wan_dev):
-    """Поднимает обнаруженный в облачных метаданных IPv6 на WAN интерфейсе."""
-    if not ip or not wan_dev:
-        return False
-    plen = plen or 64
-    try:
-        subprocess.run(
-            ["ip", "-6", "addr", "replace", f"{ip}/{plen}", "dev", wan_dev],
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-        )
-    except Exception:
-        try:
-            subprocess.run(
-                ["ip", "-6", "addr", "add", f"{ip}/{plen}", "dev", wan_dev],
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-            )
-        except Exception:
-            pass
-    if gw:
-        try:
-            subprocess.run(
-                ["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan_dev, "onlink"],
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-            )
-        except Exception:
-            try:
-                subprocess.run(
-                    ["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan_dev],
-                    stderr=subprocess.DEVNULL,
-                    timeout=3,
-                )
-            except Exception:
-                pass
-    if os.path.isdir("/etc/netplan"):
-        np_path = "/etc/netplan/60-awg-ipv6.yaml"
-        if not os.path.isfile(np_path):
-            routes_block = (
-                f"      routes:\n        - to: default\n          via: {gw}\n          on-link: true\n"
-                if gw
-                else ""
-            )
-            content = (
-                "network:\n"
-                "  version: 2\n"
-                "  ethernets:\n"
-                f"    {wan_dev}:\n"
-                "      addresses:\n"
-                f"        - {ip}/{plen}\n"
-                f"{routes_block}"
-            )
-            try:
-                with open(np_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                os.chmod(np_path, 0o600)
-                subprocess.run(["netplan", "apply"], stderr=subprocess.DEVNULL, timeout=5)
-            except Exception:
-                pass
-    return True
-
-
-def _probe_external_ipv6(iface_or_ip="", max_urls=4):
+def _probe_external_ipv6(iface_or_ip="", max_urls=3):
     urls = (
         "https://api6.ipify.org",
         "https://ipv6.icanhazip.com",
         "https://v6.ident.me",
-        "https://api64.ipify.org",
     )[:max_urls]
     for url in urls:
         cmd = ["curl", "-6", "-fsS", "--connect-timeout", "2", "--max-time", "3"]
@@ -877,7 +1003,7 @@ def _probe_external_ipv6(iface_or_ip="", max_urls=4):
             resp = subprocess.check_output(
                 cmd, stderr=subprocess.DEVNULL, timeout=4
             ).decode("utf-8", errors="replace").strip()
-            v6 = normalize_public_ipv6(resp)
+            v6 = normalize_public_ipv6(resp, reject_public_dns=True)
             if v6:
                 return v6
         except Exception:
@@ -887,28 +1013,20 @@ def _probe_external_ipv6(iface_or_ip="", max_urls=4):
 
 def _detect_public_ipv6_with_diag():
     """
-    Определяет внешний IPv6 VPS для Endpoint клиентов:
-    1) Учитывает AWG_IPV6_ENDPOINT при явном переопределении.
+    Чистое (read-only) определение внешнего IPv6 VPS без побочных эффектов на сетевых интерфейсах:
+    1) Учитывает AWG_IPV6_ENDPOINT и manual_ipv6.conf.
     2) Проверяет маршрутизацию ядра (`ip -6 route get`), игнорируя awg/wg/warp/docker/veth.
     3) Заменяет SLAAC `temporary` на постоянный адрес того же интерфейса/префикса.
     4) Проверяет policy-routing (`from <cand>`) и `default` маршруты.
-    5) Использует HTTPS IPv6-echo только если в ОС действительно есть IPv6 uplink (NAT66/policy).
-    Возвращает (public_ipv6, local_public_addrs, diag_code).
+    5) Проверяет неактивированный облачный IPv6 в метаданных (только для диагностики, без мутации eth0).
     """
     env_override = normalize_public_ipv6(os.environ.get("AWG_IPV6_ENDPOINT", ""))
     if env_override:
         return env_override, [env_override], "ok"
 
-    if os.path.isfile(MANUAL_IPV6_FILE):
-        try:
-            man_v6 = normalize_public_ipv6(Path(MANUAL_IPV6_FILE).read_text(encoding="utf-8").strip())
-            if man_v6:
-                wan4 = _detect_default_devs("-4")
-                wan = wan4[0] if wan4 else "eth0"
-                _activate_discovered_ipv6(man_v6, 64, "", wan)
-                return man_v6, [man_v6], "manual_ipv6_conf"
-        except Exception:
-            pass
+    man_v6 = read_manual_ipv6()
+    if man_v6:
+        return man_v6, [man_v6], "manual_ipv6_conf"
 
     recs = _collect_local_public_ipv6()
     local_ips = []
@@ -925,7 +1043,7 @@ def _detect_public_ipv6_with_diag():
         if not rdev:
             continue
         saw_wan_route = True
-        v6 = normalize_public_ipv6(rsrc)
+        v6 = normalize_public_ipv6(rsrc, reject_public_dns=True)
         if v6:
             v6 = _upgrade_temporary_v6(rdev, v6, recs)
             return v6, local_ips, "ok"
@@ -965,34 +1083,23 @@ def _detect_public_ipv6_with_diag():
             return local_ips[0], local_ips, "local_assigned"
         return "", local_ips, "no_egress"
 
-    # Автоматический поиск и подъём IPv6 для ЛЮБОГО случайного VPS (SLAAC / IMDS / cloud-init / netplan)
-    primary_wan = wan4_devs[0] if wan4_devs else ("eth0" if os.path.exists("/sys/class/net/eth0") else "")
-    if primary_wan:
-        _solicit_router_ra(primary_wan)
-        time.sleep(0.3)
-        recs_after = _collect_local_public_ipv6()
-        if recs_after:
-            ext_v6 = _probe_external_ipv6()
-            return ext_v6 or recs_after[0]["ip"], [r["ip"] for r in recs_after], "ok"
-
-        disc_ip, disc_plen, disc_gw, disc_src = _discover_cloud_ipv6()
-        if disc_ip:
-            _activate_discovered_ipv6(disc_ip, disc_plen, disc_gw, primary_wan)
-            ext_v6 = _probe_external_ipv6()
-            return ext_v6 or disc_ip, [disc_ip], "discovered_" + disc_src
+    disc_ip, disc_diag = _discover_cloud_ipv6_readonly()
+    if disc_ip:
+        return disc_ip, [], disc_diag
 
     return "", [], "no_interface_ipv6"
 
 
 def detect_public_ips_with_diag():
     now = time.time()
-    if now - _PUB_IP_CACHE["ts"] < _PUB_IP_CACHE_TTL_SEC:
-        return (
-            _PUB_IP_CACHE["ipv4"],
-            _PUB_IP_CACHE["ipv6"],
-            _PUB_IP_CACHE["ipv6_diag"],
-            list(_PUB_IP_CACHE["ipv6_local"]),
-        )
+    with _STATE_LOCK:
+        if now - _PUB_IP_CACHE["ts"] < _PUB_IP_CACHE_TTL_SEC:
+            return (
+                _PUB_IP_CACHE["ipv4"],
+                _PUB_IP_CACHE["ipv6"],
+                _PUB_IP_CACHE["ipv6_diag"],
+                list(_PUB_IP_CACHE["ipv6_local"]),
+            )
 
     pub4 = ""
     try:
@@ -1011,11 +1118,12 @@ def detect_public_ips_with_diag():
 
     pub6, local_ips6, diag6 = _detect_public_ipv6_with_diag()
 
-    _PUB_IP_CACHE["ts"] = now
-    _PUB_IP_CACHE["ipv4"] = pub4
-    _PUB_IP_CACHE["ipv6"] = pub6
-    _PUB_IP_CACHE["ipv6_diag"] = diag6
-    _PUB_IP_CACHE["ipv6_local"] = list(local_ips6)
+    with _STATE_LOCK:
+        _PUB_IP_CACHE["ts"] = time.time()
+        _PUB_IP_CACHE["ipv4"] = pub4
+        _PUB_IP_CACHE["ipv6"] = pub6
+        _PUB_IP_CACHE["ipv6_diag"] = diag6
+        _PUB_IP_CACHE["ipv6_local"] = list(local_ips6)
     return pub4, pub6, diag6, list(local_ips6)
 
 
@@ -1066,6 +1174,23 @@ def read_endpoint_mode():
         except Exception:
             pass
     return "ipv4"
+
+
+def _etag_matches(header_val, expected_hex):
+    """Проверяет совпадение If-None-Match (поддерживает "etag", W/"etag", голый etag и списки)."""
+    raw = (header_val or "").strip()
+    if not raw or not expected_hex:
+        return False
+    if raw == "*":
+        return True
+    for part in raw.split(","):
+        item = part.strip()
+        if item.startswith("W/"):
+            item = item[2:].strip()
+        item = item.strip('"')
+        if item == expected_hex:
+            return True
+    return False
 
 
 def build_client_item(name, peer_info, live_stats, tokens_data, include_config=False):
@@ -1267,7 +1392,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
     def _tls_configured(self):
         return getattr(self.server, "ssl_context", None) is not None
 
-    def send_json(self, status_code, data, extra_headers=None):
+    def send_json(self, status_code, data, extra_headers=None, is_head=False):
         body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1278,7 +1403,8 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        if not is_head:
+            self.wfile.write(body)
 
     def _read_json_body(self, max_bytes=65536):
         try:
@@ -1298,18 +1424,18 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             return None, "Некорректный JSON"
 
-    def _check_admin_auth(self):
+    def _check_admin_auth(self, is_head=False):
         client_ip = self._client_ip()
         if is_admin_rate_limited(client_ip):
-            self.send_json(429, {"error": "Too Many Requests", "message": "Слишком много неудачных попыток авторизации."})
+            self.send_json(429, {"error": "Too Many Requests", "message": "Слишком много неудачных попыток авторизации."}, is_head=is_head)
             return False
 
-        # Для публичных IP требуем TLS, если TLS настроен и не включён ALLOW_INSECURE_ADMIN
-        if self._tls_configured() and not self._is_tls() and not is_private_client_ip(client_ip) and not ALLOW_INSECURE_ADMIN:
+        # Для не-туннельных / внешних адресов требуем TLS, если TLS настроен и не включён ALLOW_INSECURE_ADMIN
+        if self._tls_configured() and not self._is_tls() and not is_trusted_local_or_tunnel_ip(client_ip) and not ALLOW_INSECURE_ADMIN:
             self.send_json(426, {
                 "error": "Upgrade Required",
                 "message": "Admin API требует HTTPS (используйте https://<host>:8443/api/v1/... или обращение через VPN-туннель)."
-            })
+            }, is_head=is_head)
             return False
 
         expected = load_admin_token()
@@ -1317,7 +1443,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(503, {
                 "error": "Admin API Disabled",
                 "message": "Admin-токен не настроен на сервере. Выполните: sudo awg-manager admin-token"
-            })
+            }, is_head=is_head)
             return False
 
         auth = self.headers.get("Authorization", "").strip()
@@ -1329,17 +1455,21 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
 
         if not provided or not ADMIN_TOKEN_RE.fullmatch(provided) or not secrets.compare_digest(provided, expected):
             record_admin_failed(client_ip)
-            self.send_json(403, {"error": "Forbidden", "message": "Недействительный Admin-токен."})
+            self.send_json(403, {"error": "Forbidden", "message": "Недействительный Admin-токен."}, is_head=is_head)
             return False
         return True
 
     def do_HEAD(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/v1/"):
+            self.handle_admin_get(parsed, is_head=True)
+            return
         self.handle_get_or_head(is_head=True)
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path.startswith("/api/v1/"):
-            self.handle_admin_get(parsed)
+            self.handle_admin_get(parsed, is_head=False)
             return
         self.handle_get_or_head(is_head=False)
 
@@ -1366,39 +1496,78 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
 
     # --- Admin API v1 handlers -----------------------------------------------
 
-    def handle_admin_get(self, parsed):
-        if not self._check_admin_auth():
+    def _validate_client_fields(self, body, allow_empty_endpoint=False):
+        """Валидирует опциональные поля клиента и возвращает (args_list, error_msg)."""
+        out_args = []
+        if "dns" in body and body["dns"] is not None:
+            val = str(body["dns"]).strip()
+            if val != "":
+                if not validate_dns_value(val):
+                    return None, "Некорректный формат DNS (укажите IPv4/IPv6 через запятую)."
+                out_args.extend(["--dns", val])
+
+        if "mtu" in body and body["mtu"] is not None:
+            val = str(body["mtu"]).strip()
+            if val != "":
+                if not val.isdigit() or not (576 <= int(val) <= 9000):
+                    return None, "Некорректный MTU (576..9000)."
+                out_args.extend(["--mtu", val])
+
+        if "allowed_ips" in body and body["allowed_ips"] is not None:
+            val = str(body["allowed_ips"]).strip()
+            if val != "":
+                if not validate_allowed_ips_value(val):
+                    return None, "Некорректный формат AllowedIPs (укажите CIDR через запятую)."
+                out_args.extend(["--allowed-ips", val])
+
+        if "keepalive" in body and body["keepalive"] is not None:
+            val = str(body["keepalive"]).strip()
+            if val != "":
+                if not val.isdigit() or not (0 <= int(val) <= 3600):
+                    return None, "Некорректный PersistentKeepalive (0..3600)."
+                out_args.extend(["--keepalive", val])
+
+        if "endpoint" in body and body["endpoint"] is not None:
+            val = str(body["endpoint"]).strip()
+            if val != "" or allow_empty_endpoint:
+                if not validate_endpoint_value(val):
+                    return None, "Некорректный Endpoint (допустимы server, ipv4, ipv6, IP или домен)."
+                out_args.extend(["--endpoint", val])
+
+        return out_args, None
+
+    def handle_admin_get(self, parsed, is_head=False):
+        if not self._check_admin_auth(is_head=is_head):
             return
         parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/") if p]
-        # /api/v1/clients
         if parts == ["api", "v1", "clients"] or parts == ["api", "v1", "server"]:
             server, clients, _ = build_state_snapshot(include_configs=False, tls_enabled=self._tls_configured())
-            etag = f'"{server["server_etag"]}"'
-            if self.headers.get("If-None-Match", "").strip() == etag:
+            etag_hex = server["server_etag"]
+            etag = f'"{etag_hex}"'
+            if _etag_matches(self.headers.get("If-None-Match", ""), etag_hex):
                 self.send_response(304)
                 self.send_header("ETag", etag)
                 self.send_header("Connection", "close")
                 self.end_headers()
                 return
-            self.send_json(200, {"server": server, "clients": clients}, extra_headers={"ETag": etag})
+            self.send_json(200, {"server": server, "clients": clients}, extra_headers={"ETag": etag}, is_head=is_head)
             return
 
-        # /api/v1/clients/<name>
         if len(parts) == 4 and parts[:3] == ["api", "v1", "clients"]:
             cname = parts[3]
             if not is_valid_client_name(cname):
-                self.send_json(400, {"error": "Bad Request", "message": "Некорректное имя клиента."})
+                self.send_json(400, {"error": "Bad Request", "message": "Некорректное имя клиента."}, is_head=is_head)
                 return
             server, _, item = build_state_snapshot(include_configs=False, target_client=cname, tls_enabled=self._tls_configured())
             if not item:
-                self.send_json(404, {"error": "Not Found", "message": f"Клиент '{cname}' не найден."})
+                self.send_json(404, {"error": "Not Found", "message": f"Клиент '{cname}' не найден."}, is_head=is_head)
                 return
             etag = f'"{item["etag"]}"' if item.get("etag") else ""
             headers = {"ETag": etag} if etag else None
-            self.send_json(200, {"server": server, "client": item}, extra_headers=headers)
+            self.send_json(200, {"server": server, "client": item}, extra_headers=headers, is_head=is_head)
             return
 
-        self.send_json(404, {"error": "Not Found"})
+        self.send_json(404, {"error": "Not Found"}, is_head=is_head)
 
     def handle_admin_post(self, parsed):
         if not self._check_admin_auth():
@@ -1415,20 +1584,11 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             if not is_valid_client_name(name):
                 self.send_json(400, {"error": "Bad Request", "message": "Некорректное имя клиента (A-Z, 0-9, _, -, 1..32)."})
                 return
-            args = ["add-client", name]
-            for field, flag in (
-                ("dns", "--dns"),
-                ("mtu", "--mtu"),
-                ("allowed_ips", "--allowed-ips"),
-                ("keepalive", "--keepalive"),
-                ("endpoint", "--endpoint"),
-            ):
-                val = str(body.get(field, "") or "").strip()
-                if val:
-                    if "\n" in val or "\r" in val:
-                        self.send_json(400, {"error": "Bad Request", "message": f"Недопустимое значение поля {field}."})
-                        return
-                    args.extend([flag, val])
+            extra_args, ferr = self._validate_client_fields(body, allow_empty_endpoint=False)
+            if ferr:
+                self.send_json(400, {"error": "Bad Request", "message": ferr})
+                return
+            args = ["add-client", name] + extra_args
 
             ok, out = run_manager(args)
             if not ok:
@@ -1443,12 +1603,16 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
         # POST /api/v1/server/endpoint — сменить внешний Endpoint сервера (ipv4|ipv6|<host>)
         if parts == ["api", "v1", "server", "endpoint"]:
             target = str(body.get("target", "") or "").strip()
-            if not target or "\n" in target or "\r" in target or len(target) > 128:
-                self.send_json(400, {"error": "Bad Request", "message": "Укажите target: ipv4, ipv6 или домен/IP."})
+            if not target or not validate_endpoint_value(target):
+                self.send_json(400, {"error": "Bad Request", "message": "Укажите корректный target: ipv4, ipv6 или домен/IP."})
                 return
             custom_ip6 = str(body.get("ipv6", "") or "").strip()
             if custom_ip6 and target.lower() in ("ipv6", "6"):
-                target = custom_ip6
+                norm6 = normalize_public_ipv6(custom_ip6)
+                if not norm6:
+                    self.send_json(400, {"error": "Bad Request", "message": "Некорректный публичный IPv6 адрес."})
+                    return
+                target = norm6
             args = ["endpoint", target]
             if body.get("all") or body.get("reset_overrides"):
                 args.append("--all")
@@ -1477,8 +1641,8 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
                         return
                     args.append(cport)
                 if ci1:
-                    if "\n" in ci1 or "\r" in ci1 or len(ci1) > 512:
-                        self.send_json(400, {"error": "Bad Request", "message": "Некорректная строка I1."})
+                    if has_unsafe_chars(ci1) or not CPS_I1_ALLOWED_RE.fullmatch(ci1) or "<" not in ci1 or ">" not in ci1:
+                        self.send_json(400, {"error": "Bad Request", "message": "Некорректная строка байткода I1 (ожидается CPS-формат <b 0x...>)."})
                         return
                     if not cport:
                         args.append("")
@@ -1493,7 +1657,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # POST /api/v1/server/rotate — ротация порта, ключей и параметров обфускации
-        if parts == ["api", "v1", "server", "rotate"]:
+        if parts == ["api", "v1", "server/rotate"] or parts == ["api", "v1", "server", "rotate"]:
             preset = str(body.get("preset", "") or "").strip().lower()
             args = ["rotate"]
             if preset:
@@ -1541,20 +1705,11 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             args.extend(["--rename", new_name])
             final_name = new_name
 
-        for field, flag in (
-            ("dns", "--dns"),
-            ("mtu", "--mtu"),
-            ("allowed_ips", "--allowed-ips"),
-            ("keepalive", "--keepalive"),
-            ("endpoint", "--endpoint"),
-        ):
-            if field in body and body[field] is not None:
-                val = str(body[field]).strip()
-                if "\n" in val or "\r" in val:
-                    self.send_json(400, {"error": "Bad Request", "message": f"Недопустимое значение поля {field}."})
-                    return
-                if val != "" or field == "endpoint":
-                    args.extend([flag, val])
+        extra_args, ferr = self._validate_client_fields(body, allow_empty_endpoint=True)
+        if ferr:
+            self.send_json(400, {"error": "Bad Request", "message": ferr})
+            return
+        args.extend(extra_args)
 
         if body.get("rekey"):
             args.append("--rekey")
@@ -1632,13 +1787,17 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             if TOKEN_RE.fullmatch(last_part):
                 token = last_part
 
+        if req_format == "mikrotik":
+            req_format = "rsc"
+        if req_format not in ("conf", "vpn", "json", "rsc"):
+            req_format = "conf"
         return token, req_format
 
     def handle_get_or_head(self, is_head=False):
         client_ip = self._client_ip()
 
         if is_rate_limited(client_ip):
-            self.send_json(429, {"error": "Too Many Requests", "message": "Слишком много запросов. Попробуйте через минуту."})
+            self.send_json(429, {"error": "Too Many Requests", "message": "Слишком много запросов. Попробуйте через минуту."}, is_head=is_head)
             return
 
         parsed_url = urllib.parse.urlparse(self.path)
@@ -1648,12 +1807,17 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": "ok",
                 "service": "awg-subscription-api",
+                "version": API_VERSION,
                 "protocol": "AmneziaWG 3.1",
                 "api_version": 2,
                 "client_management": bool(load_admin_token()),
                 "tls_enabled": self._tls_configured(),
                 "formats": ["conf", "vpn", "json", "rsc"],
-            })
+            }, is_head=is_head)
+            return
+
+        if path == "/favicon.ico":
+            self.send_json(404, {"error": "Not Found"}, is_head=is_head)
             return
 
         token, req_format = self.extract_token_and_format(parsed_url)
@@ -1662,18 +1826,18 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {
                 "error": "Bad Request",
                 "message": "Не указан токен. Формат: /sub/<token>, /vpn/<token>, или ?token=<token>"
-            })
+            }, is_head=is_head)
             return
 
         client_name = find_client_by_token(token)
         if not client_name:
             record_failed_attempt(client_ip)
-            self.send_json(403, {"error": "Forbidden", "message": "Недействительный токен клиента."})
+            self.send_json(403, {"error": "Forbidden", "message": "Недействительный токен клиента."}, is_head=is_head)
             return
 
         conf_path = Path(AWG_DIR).resolve() / f"{client_name}.conf"
         if conf_path.parent != Path(AWG_DIR).resolve() or not conf_path.is_file():
-            self.send_json(404, {"error": "Not Found", "message": f"Конфиг {client_name} не найден."})
+            self.send_json(404, {"error": "Not Found", "message": f"Конфиг {client_name} не найден."}, is_head=is_head)
             return
 
         try:
@@ -1682,12 +1846,17 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             conf_str = sanitize_client_config(conf_str)
             raw_bytes = conf_str.encode("utf-8")
         except Exception as e:
-            self.send_json(500, {"error": "Internal Error", "message": str(e)})
+            self.send_json(500, {"error": "Internal Error", "message": str(e)}, is_head=is_head)
             return
 
-        etag = f'"{hashlib.sha256(raw_bytes).hexdigest()[:16]}"'
-        client_etag = self.headers.get("If-None-Match", "").strip()
-        if client_etag and client_etag == etag:
+        base_etag_hex = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        if req_format == "conf":
+            etag_hex = base_etag_hex
+        else:
+            etag_hex = hashlib.sha256(raw_bytes + b":" + req_format.encode("ascii")).hexdigest()[:16]
+        etag = f'"{etag_hex}"'
+
+        if _etag_matches(self.headers.get("If-None-Match", ""), etag_hex):
             self.send_response(304)
             self.send_header("ETag", etag)
             self.send_header("Connection", "close")
@@ -1701,7 +1870,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
         elif req_format == "json":
             json_data = {
                 "client": client_name,
-                "etag": etag.strip('"'),
+                "etag": base_etag_hex,
                 "config": conf_str,
                 "vpn_url": conf_to_vpn_url(conf_str, client_name),
                 "updated_at": int(conf_path.stat().st_mtime)
@@ -1709,7 +1878,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             out_bytes = json.dumps(json_data, ensure_ascii=False, indent=2).encode("utf-8")
             content_type = "application/json; charset=utf-8"
             filename = f"{client_name}.json"
-        elif req_format in ("rsc", "mikrotik"):
+        elif req_format == "rsc":
             out_bytes = conf_to_mikrotik_rsc(conf_str, client_name).encode("utf-8")
             content_type = "text/plain; charset=utf-8"
             filename = f"{client_name}.rsc"
@@ -1723,7 +1892,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(out_bytes)))
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("ETag", etag)
-        self.send_header("X-Config-Version", etag.strip('"'))
+        self.send_header("X-Config-Version", base_etag_hex)
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.send_header("Connection", "close")
@@ -1736,10 +1905,22 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
 class DualModeThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = MAX_CONCURRENT_REQUESTS
 
     def __init__(self, server_address, RequestHandlerClass, ssl_context=None):
         self.ssl_context = ssl_context
+        self._conn_sem = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
         super().__init__(server_address, RequestHandlerClass)
+
+    def process_request(self, request, client_address):
+        if not self._conn_sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_sem.release()
+            self.shutdown_request(request)
 
     def process_request_thread(self, request, client_address):
         try:
@@ -1765,6 +1946,7 @@ class DualModeThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPSe
             self.handle_error(request, client_address)
         finally:
             self.shutdown_request(request)
+            self._conn_sem.release()
 
 
 class DualModeThreadedHTTPServerV6(DualModeThreadedHTTPServer):
@@ -1782,19 +1964,42 @@ def build_ssl_context():
     if not (os.path.isfile(API_TLS_CERT) and os.path.isfile(API_TLS_KEY)):
         try:
             os.makedirs(os.path.dirname(API_TLS_CERT), mode=0o700, exist_ok=True)
-            subprocess.run(
+            pub4, pub6 = detect_public_ips_cached()
+            san_items = ["DNS:localhost", "IP:127.0.0.1", "IP:::1"]
+            if pub4:
+                san_items.append(f"IP:{pub4}")
+            if pub6:
+                san_items.append(f"IP:{pub6}")
+            san_ext = ",".join(san_items)
+            rc = subprocess.run(
                 [
-                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "openssl", "req", "-x509", "-newkey", "ec",
+                    "-pkeyopt", "ec_paramgen_curve:prime256v1",
                     "-keyout", API_TLS_KEY, "-out", API_TLS_CERT,
                     "-days", "3650", "-nodes",
                     "-subj", "/CN=awg-api",
+                    "-addext", f"subjectAltName={san_ext}",
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
-            )
-            os.chmod(API_TLS_CERT, 0o600)
-            os.chmod(API_TLS_KEY, 0o600)
+            ).returncode
+            if rc != 0:
+                subprocess.run(
+                    [
+                        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                        "-keyout", API_TLS_KEY, "-out", API_TLS_CERT,
+                        "-days", "3650", "-nodes",
+                        "-subj", "/CN=awg-api",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            if os.path.isfile(API_TLS_CERT):
+                os.chmod(API_TLS_CERT, 0o600)
+            if os.path.isfile(API_TLS_KEY):
+                os.chmod(API_TLS_KEY, 0o600)
         except Exception:
             pass
     if not (os.path.isfile(API_TLS_CERT) and os.path.isfile(API_TLS_KEY)):
@@ -1832,7 +2037,7 @@ def run_server():
         sys.exit(1)
 
     proto = "HTTP+HTTPS (dual-mode)" if ssl_ctx else "HTTP"
-    print(f"AmneziaWG API v2 слушает на {listen_desc} [{proto}]")
+    print(f"AmneziaWG API v2 ({API_VERSION}) слушает на {listen_desc} [{proto}]")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -22,7 +22,7 @@ fi
 set -Eeuo pipefail
 
 #--- конфигурация --------------------------------------------------------------
-AWG_MANAGER_VERSION="3.2.6"
+AWG_MANAGER_VERSION="3.2.7"
 AWG_IFACE="awg0"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_DNS="${AWG_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
@@ -38,6 +38,7 @@ BACKUP_DIR="/root/awg-backups"
 LOG_FILE="/var/log/awg-install.log"
 DBG_FILE="/var/log/awg-install.debug.log"
 LOCK_FILE="/run/lock/awg-manager.lock"
+LOCK_HELD=0
 TOKENS_FILE="/etc/amnezia/amneziawg/tokens.json"
 ADMIN_TOKEN_FILE="/etc/amnezia/amneziawg/admin_token"
 API_TLS_CERT="/etc/amnezia/amneziawg/api_tls.crt"
@@ -114,6 +115,99 @@ format_endpoint() {
   fi
 }
 
+is_valid_host_or_ip() {
+  local raw="${1:-}"
+  [ -n "$raw" ] || return 1
+  python3 - "$raw" <<'PY'
+import sys, ipaddress, re
+s = sys.argv[1].strip().strip("[]")
+if not s or len(s) > 253:
+    sys.exit(1)
+for ch in s:
+    if ord(ch) < 33 or ord(ch) == 127 or ch in ("\x85", "\u2028", "\u2029", "|", "&", "\\", ";", '"', "'"):
+        sys.exit(1)
+try:
+    ipaddress.ip_address(s)
+    sys.exit(0)
+except ValueError:
+    pass
+host_re = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+sys.exit(0 if host_re.fullmatch(s) else 1)
+PY
+}
+
+validate_conf_fields_py() {
+  # $1=dns (или пусто), $2=allowed_ips (или пусто)
+  python3 - "${1:-}" "${2:-}" <<'PY'
+import sys, ipaddress, re
+dns_raw, alw_raw = sys.argv[1], sys.argv[2]
+host_re = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+
+def bad_chars(v):
+    for ch in v:
+        if ord(ch) < 32 or ord(ch) == 127 or ch in ("\x85", "\u2028", "\u2029"):
+            return True
+    return len(v.splitlines()) > 1
+
+if dns_raw:
+    if bad_chars(dns_raw) or len(dns_raw) > 256:
+        sys.exit(1)
+    parts = [p.strip() for p in dns_raw.split(",") if p.strip()]
+    if not parts or len(parts) > 8:
+        sys.exit(1)
+    for p in parts:
+        try:
+            ipaddress.ip_address(p)
+        except ValueError:
+            if not host_re.fullmatch(p):
+                sys.exit(1)
+
+if alw_raw:
+    if bad_chars(alw_raw) or len(alw_raw) > 1024:
+        sys.exit(2)
+    parts = [p.strip() for p in alw_raw.split(",") if p.strip()]
+    if not parts or len(parts) > 64:
+        sys.exit(2)
+    for p in parts:
+        try:
+            ipaddress.ip_network(p, strict=False)
+        except ValueError:
+            sys.exit(2)
+sys.exit(0)
+PY
+}
+
+set_conf_endpoint_safe() {
+  # Безопасная атомарная замена Endpoint в <client>.conf без sed-инъекций
+  local cf="$1" ep_val="$2"
+  python3 - "$cf" "$ep_val" <<'PY'
+import sys, os
+cf, ep_val = sys.argv[1], sys.argv[2]
+lines = open(cf, "r", encoding="utf-8", errors="replace").read().splitlines()
+out = []
+sec = ""
+replaced = False
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("[") and s.endswith("]"):
+        sec = s[1:-1].lower()
+        out.append(ln)
+        continue
+    if sec == "peer" and s.startswith("Endpoint") and "=" in ln:
+        out.append(f"Endpoint = {ep_val}")
+        replaced = True
+        continue
+    out.append(ln)
+if not replaced and sec == "peer":
+    out.append(f"Endpoint = {ep_val}")
+tmp = cf + ".ep.tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, cf)
+PY
+}
+
 sanitize_existing_client_endpoints() {
   local lport
   lport="$(conf_get ListenPort "$AWG_DIR/$AWG_IFACE.conf" || true)"
@@ -128,23 +222,30 @@ sanitize_existing_client_endpoints() {
     if [ -n "$cur_ep" ]; then
       local clean_h
       clean_h="$(extract_host_from_endpoint "$cur_ep")"
-      if [ -n "$clean_h" ]; then
+      if [ -n "$clean_h" ] && is_valid_host_or_ip "$clean_h"; then
         local ep_str
         ep_str="$(format_endpoint "$clean_h" "$lport")"
-        sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${ep_str}|" "$cf"
+        if [ "$cur_ep" != "$ep_str" ]; then
+          set_conf_endpoint_safe "$cf" "$ep_str"
+        fi
       fi
     fi
   done
 }
 
 acquire_lock() {
+  if [ "${LOCK_HELD:-0}" -eq 1 ]; then
+    return 0
+  fi
   mkdir -p /run/lock
   exec 9>"$LOCK_FILE"
   flock -w 30 9 || die "не удалось получить блокировку $LOCK_FILE (выполняется другой процесс)"
+  LOCK_HELD=1
 }
 
 release_lock() {
   exec 9>&- 2>/dev/null || true
+  LOCK_HELD=0
 }
 
 is_script_file() {
@@ -236,6 +337,7 @@ detect_wan6_iface() {
 }
 
 detect_public_ipv6() {
+  # ЧИСТОЕ ЧТЕНИЕ (read-only): определяет активный публичный IPv6 сервера без мутации eth0/netplan!
   local ip="" url dst cand
 
   # 1. Если явно задан AWG_IPV6_ENDPOINT
@@ -244,44 +346,44 @@ detect_public_ipv6() {
     return 0
   fi
 
-  # 1.5. Если задан IPv6 вручную через manual_ipv6.conf
+  # 1.5. Если задан IPv6 вручную через manual_ipv6.conf ('<ip>' или '<ip>|<plen>|<gw>')
   if [ -s "$MANUAL_IPV6_FILE" ]; then
-    local man_ip
-    man_ip="$(cat "$MANUAL_IPV6_FILE" 2>/dev/null | tr -d '[:space:]')"
-    if [ -n "$man_ip" ]; then
-      local w_dev; w_dev="$(detect_wan_iface || true)"; w_dev="${w_dev:-eth0}"
-      if [ -n "$w_dev" ]; then
-        ip -6 addr replace "${man_ip}/64" dev "$w_dev" 2>/dev/null || true
-      fi
+    local man_raw man_ip
+    man_raw="$(head -n1 "$MANUAL_IPV6_FILE" 2>/dev/null | tr -d '[:space:]')"
+    man_ip="${man_raw%%|*}"
+    if [ -n "$man_ip" ] && is_valid_host_or_ip "$man_ip"; then
       printf '%s\n' "$man_ip"
       return 0
     fi
   fi
 
-  # 2. Определение через curl -6 к надёжным внешним сервисам (быстрый таймаут 2с)
-  for url in https://api6.ipify.org https://ipv6.icanhazip.com https://v6.ident.me https://ifconfig.co; do
-    ip="$(curl -6 -fsS --connect-timeout 2 --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ "$ip" =~ : ]] && [[ ! "${ip,,}" =~ ^(fe80|fc|fd|::1$) ]] && [[ "$ip" =~ ^[23][0-9a-fA-F]{1,3}: ]]; then
-      printf '%s\n' "$ip"
-      return 0
-    fi
-  done
-
-  # 3. Маршрутизация ядра (ip -6 route get к внешнему адресу)
+  # 2. Маршрутизация ядра (ip -6 route get к внешнему адресу, исключая туннельные интерфейсы)
   for dst in 2606:4700:4700::1111 2001:4860:4860::8888; do
-    ip="$(ip -6 route get "$dst" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-    if [[ "$ip" =~ : ]] && [[ ! "${ip,,}" =~ ^(fe80|fc|fd|::1$) ]] && [[ "$ip" =~ ^[23][0-9a-fA-F]{1,3}: ]]; then
+    ip="$(ip -6 route get "$dst" 2>/dev/null | awk '
+      {
+        dev=""; src=""
+        for(i=1;i<=NF;i++) {
+          if($i=="dev") dev=$(i+1)
+          if($i=="src") src=$(i+1)
+        }
+        if (dev !~ /^(lo|awg|wg|warp|docker|br-|veth|tun|tap|virbr|tailscale)/ && src != "") {
+          print src; exit
+        }
+      }
+    ' || true)"
+    if [[ "$ip" =~ : ]] && [[ ! "${ip,,}" =~ ^(fe80|fc|fd|::1$) ]] && [[ "$ip" =~ ^[23][0-9a-fA-F]{1,3}: ]] \
+      && [[ ! "${ip,,}" =~ ^(2001:4860:4860:|2606:4700:4700:|2620:fe:|2001:db8:) ]]; then
       printf '%s\n' "$ip"
       return 0
     fi
   done
 
-  # 4. Поиск публичного IPv6 (2000::/3) непосредственно на физических/WAN интерфейсах
-  # (исключая awg0, wg*, docker, br-, veth, lo и ULA fd... / link-local fe80...)
+  # 3. Поиск публичного IPv6 (2000::/3) на физических/WAN интерфейсах (не DNS, не ULA, не temporary)
   cand="$(ip -6 -o addr show scope global 2>/dev/null | awk '
-    $2 !~ /^(lo|awg|wg|warp|docker|br-|veth|tun|tap|virbr|tailscale)/ && !/temporary/ && !/deprecated/ {
+    $2 !~ /^(lo|awg|wg|warp|docker|br-|veth|tun|tap|virbr|tailscale)/ && !/temporary/ && !/deprecated/ && !/tentative/ && !/dadfailed/ {
       gsub(/\/.*/, "", $4)
-      if ($4 ~ /^[23][0-9a-fA-F]{1,3}:/ && $4 !~ /^(fe80|fc|fd)/) {
+      low = tolower($4)
+      if (low ~ /^[23][0-9a-f]{1,3}:/ && low !~ /^(fe80|fc|fd|2001:4860:4860:|2606:4700:4700:|2620:fe:|2001:db8:)/) {
         print $4
         exit
       }
@@ -292,165 +394,171 @@ detect_public_ipv6() {
     return 0
   fi
 
-  # 5. Авто-поиск и подъём IPv6 для ЛЮБОГО случайного VPS (SLAAC RS / IMDS / cloud-init / netplan)
+  # 4. Внешний эхо-сервис (только если в ОС реально есть IPv6 default route)
+  if [ -n "$(detect_wan6_iface || true)" ]; then
+    for url in https://api6.ipify.org https://ipv6.icanhazip.com https://v6.ident.me; do
+      ip="$(curl -6 -fsS --connect-timeout 2 --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ "$ip" =~ : ]] && [[ ! "${ip,,}" =~ ^(fe80|fc|fd|::1$|2001:4860:4860:|2606:4700:4700:|2620:fe:|2001:db8:) ]] && [[ "$ip" =~ ^[23][0-9a-fA-F]{1,3}: ]]; then
+        printf '%s\n' "$ip"
+        return 0
+      fi
+    done
+  fi
+
+  return 1
+}
+
+provision_cloud_ipv6_explicit() {
+  # Вызывается ТОЛЬКО при явном переключении на IPv6 Endpoint (endpoint ipv6):
+  # отправляет SLAAC RS и безопасно проверяет структурированные метаданные IMDS/cloud-init/netplan
+  # со строгой фильтрацией DNS-резолверов (исключая 2001:4860:4860::8888, 2606:4700:4700::1111 и секции nameservers).
+  local existing
+  existing="$(detect_public_ipv6 || true)"
+  if [ -n "$existing" ]; then
+    printf '%s\n' "$existing"
+    return 0
+  fi
+
   local wan_dev
   wan_dev="$(detect_wan_iface || true)"
   wan_dev="${wan_dev:-eth0}"
 
-  # Включение приёма SLAAC RA на WAN интерфейсе
   if [ -n "$wan_dev" ] && [ -d "/proc/sys/net/ipv6/conf/$wan_dev" ]; then
     sysctl -w "net.ipv6.conf.$wan_dev.accept_ra=2" >/dev/null 2>&1 || true
     sysctl -w "net.ipv6.conf.$wan_dev.autoconf=1" >/dev/null 2>&1 || true
     ping6 -c 1 -w 1 "ff02::2%$wan_dev" >/dev/null 2>&1 || true
     command -v rdisc6 >/dev/null 2>&1 && rdisc6 -m "$wan_dev" >/dev/null 2>&1 || true
+    sleep 0.4
+  fi
+
+  existing="$(detect_public_ipv6 || true)"
+  if [ -n "$existing" ]; then
+    printf '%s\n' "$existing"
+    return 0
   fi
 
   if [ -n "$wan_dev" ] && command -v python3 >/dev/null 2>&1; then
     local py_cand
     py_cand="$(python3 - "$wan_dev" <<'PY'
-import glob, ipaddress, json, os, re, subprocess, sys, urllib.request
+import glob, ipaddress, json, os, subprocess, sys, urllib.request
 
 wan = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else "eth0"
+GLOBAL_V6 = ipaddress.IPv6Network("2000::/3")
+BAD_NETS = (
+    ipaddress.IPv6Network("2001::/32"),
+    ipaddress.IPv6Network("2001:db8::/32"),
+    ipaddress.IPv6Network("2002::/16"),
+    ipaddress.IPv6Network("3fff::/20"),
+    ipaddress.IPv6Network("2001:4860:4860::/48"),
+    ipaddress.IPv6Network("2606:4700:4700::/48"),
+    ipaddress.IPv6Network("2620:fe::/48"),
+    ipaddress.IPv6Network("2620:119:35::/48"),
+    ipaddress.IPv6Network("2620:119:53::/48"),
+    ipaddress.IPv6Network("2a10:50c0::/32"),
+    ipaddress.IPv6Network("2a0d:2a00::/32"),
+    ipaddress.IPv6Network("2001:67c:28a0::/48"),
+)
 
-# 1. Проверка адресов на интерфейсе после RS
-try:
-    out = subprocess.check_output(["ip", "-6", "-o", "addr", "show", "scope", "global"], stderr=subprocess.DEVNULL).decode("utf-8", errors="replace")
-    for line in out.splitlines():
-        parts = line.strip().split()
-        if len(parts) >= 4:
-            dev = parts[1]
-            if not re.match(r"^(lo|awg|wg|warp|docker|br-|veth|tun|tap)", dev):
-                ip = parts[3].split("/")[0]
-                try:
-                    obj = ipaddress.IPv6Address(ip)
-                    if obj.is_global and not ip.endswith("::1"):
-                        print(ip)
-                        sys.exit(0)
-                except Exception:
-                    pass
-except Exception:
-    pass
+def parse_host_v6(raw):
+    if not raw or not isinstance(raw, str):
+        return None, 64
+    s = raw.strip().strip("'\"").strip("[]").split("%")[0]
+    plen = 64
+    if "/" in s:
+        s, p = s.split("/", 1)
+        if p.isdigit():
+            plen = int(p)
+    if ":" not in s:
+        return None, 64
+    try:
+        addr = ipaddress.IPv6Address(s)
+    except ValueError:
+        return None, 64
+    if not addr.is_global or addr.is_private or addr.is_link_local or addr.is_multicast or addr not in GLOBAL_V6:
+        return None, 64
+    if any(addr in n for n in BAD_NETS) or str(addr).endswith("::1"):
+        return None, 64
+    return str(addr), plen
 
-# 2. Поиск в метаданных и конфигах облачного провайдера
-def check_text(txt):
-    cands = []
-    for m in re.finditer(r"\b(2[0-9a-fA-F]{3}:[0-9a-fA-F:]+)(?:/(\d+))?\b", txt):
-        raw = m.group(1).lower()
-        plen = int(m.group(2)) if m.group(2) else 64
-        try:
-            ip_obj = ipaddress.IPv6Address(raw)
-            if ip_obj.is_global and not ip_obj.is_multicast and not ip_obj.is_link_local and not ip_obj.is_private:
-                cands.append((raw, plen))
-        except Exception:
-            pass
-    if not cands:
-        return None
-    best_ip, best_plen = cands[0]
-    for c_ip, c_plen in cands:
-        if not c_ip.endswith("::1"):
-            best_ip, best_plen = c_ip, c_plen
-            break
-    gw_m = re.search(r"(?:gateway6|via|gateway)\s*[:=]\s*[\"'\s]*([23][0-9a-fA-F:]+)", txt)
-    found_gw = ""
-    if gw_m:
-        try:
-            g = ipaddress.IPv6Address(gw_m.group(1).lower())
-            if g.is_global:
-                found_gw = str(g)
-        except Exception:
-            pass
-    if not found_gw:
-        try:
-            net = ipaddress.IPv6Network(f"{best_ip}/{best_plen}", strict=False)
-            found_gw = str(net.network_address + 1)
-        except Exception:
-            pass
-    return best_ip, best_plen, found_gw
+def from_json(obj):
+    found = []
+    gw = ""
+    skip = ("dns", "nameserver", "resolver", "ntp")
+    def walk(node, pk=""):
+        nonlocal gw
+        if any(k in pk.lower() for k in skip):
+            return
+        if isinstance(node, dict):
+            for ak in ("ip_address", "address", "ipv6_address"):
+                v = node.get(ak)
+                if isinstance(v, str) and ":" in v:
+                    ip_s, pl = parse_host_v6(v)
+                    if ip_s:
+                        nm = node.get("netmask") or node.get("prefix")
+                        if isinstance(nm, int) and 1 <= nm <= 128:
+                            pl = nm
+                        elif isinstance(nm, str) and nm.isdigit():
+                            pl = int(nm)
+                        found.append((ip_s, pl))
+            for gk in ("gateway", "gateway6", "nexthop"):
+                gv = node.get(gk)
+                if isinstance(gv, str) and ":" in gv and not gw:
+                    try:
+                        ga = ipaddress.IPv6Address(gv.strip())
+                        if ga.is_global or ga.is_link_local:
+                            gw = str(ga)
+                    except ValueError:
+                        pass
+            for k, v in node.items():
+                walk(v, k)
+        elif isinstance(node, list):
+            for it in node:
+                walk(it, pk)
+    walk(obj)
+    if found:
+        ip_s, pl = found[0]
+        if not gw:
+            net = ipaddress.IPv6Network(f"{ip_s}/{pl}", strict=False)
+            gw = str(net.network_address + 1)
+        return ip_s, pl, gw
+    return None
 
-found = None
-# IMDS
-for imds_url in [
+res = None
+for imds_url in (
     "http://169.254.169.254/openstack/latest/network_data.json",
     "http://169.254.169.254/metadata/v1.json",
-    "http://169.254.169.254/hetzner/v1/metadata/network"
-]:
+):
     try:
         req = urllib.request.Request(imds_url, headers={"User-Agent": "cloud-init"})
         with urllib.request.urlopen(req, timeout=0.8) as r:
-            found = check_text(r.read().decode("utf-8", errors="replace"))
-            if found:
+            res = from_json(json.loads(r.read().decode("utf-8", errors="replace")))
+            if res:
                 break
     except Exception:
         pass
 
-# Файлы на диске
-if not found:
-    file_patterns = [
-        "/run/cloud-init/instance-data.json",
-        "/run/cloud-init/result.json",
-        "/var/lib/cloud/instance/instance-data.json",
-        "/var/lib/cloud/instances/*/network-data.json",
-        "/var/lib/cloud/instance/user-data",
-        "/etc/netplan/*.yaml",
-        "/etc/netplan/*.yml",
-        "/etc/network/interfaces",
-        "/etc/network/interfaces.d/*",
-        "/etc/systemd/network/*.network",
-        "/etc/sysconfig/network-scripts/ifcfg-*"
-    ]
-    for pat in file_patterns:
-        for fpath in glob.glob(pat):
-            if os.path.isfile(fpath):
+if not res:
+    for jpat in ("/run/cloud-init/instance-data.json", "/var/lib/cloud/instance/instance-data.json", "/var/lib/cloud/instances/*/network-data.json"):
+        for fp in glob.glob(jpat):
+            if os.path.isfile(fp):
                 try:
-                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                        found = check_text(f.read())
-                        if found:
-                            break
+                    res = from_json(json.loads(open(fp, "r", encoding="utf-8", errors="replace").read()))
+                    if res:
+                        break
                 except Exception:
                     pass
-        if found:
+        if res:
             break
 
-if found:
-    ip, plen, gw = found
-    try:
-        subprocess.run(["ip", "-6", "addr", "replace", f"{ip}/{plen}", "dev", wan], stderr=subprocess.DEVNULL, timeout=2)
-    except Exception:
-        try:
-            subprocess.run(["ip", "-6", "addr", "add", f"{ip}/{plen}", "dev", wan], stderr=subprocess.DEVNULL, timeout=2)
-        except Exception:
-            pass
+if res:
+    ip, plen, gw = res
+    subprocess.run(["ip", "-6", "addr", "replace", f"{ip}/{plen}", "dev", wan], stderr=subprocess.DEVNULL, timeout=3)
     if gw:
-        try:
-            subprocess.run(["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan, "onlink"], stderr=subprocess.DEVNULL, timeout=2)
-        except Exception:
-            try:
-                subprocess.run(["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan], stderr=subprocess.DEVNULL, timeout=2)
-            except Exception:
-                pass
-    if os.path.isdir("/etc/netplan"):
-        np_file = "/etc/netplan/60-awg-ipv6.yaml"
-        if not os.path.isfile(np_file):
-            routes_part = f"      routes:\n        - to: default\n          via: {gw}\n          on-link: true\n" if gw else ""
-            cfg = (
-                "network:\n"
-                "  version: 2\n"
-                "  ethernets:\n"
-                f"    {wan}:\n"
-                "      addresses:\n"
-                f"        - {ip}/{plen}\n"
-                f"{routes_part}"
-            )
-            try:
-                with open(np_file, "w", encoding="utf-8") as f:
-                    f.write(cfg)
-                os.chmod(np_file, 0o600)
-                subprocess.run(["netplan", "apply"], stderr=subprocess.DEVNULL, timeout=5)
-            except Exception:
-                pass
+        rc = subprocess.run(["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan, "onlink"], stderr=subprocess.DEVNULL, timeout=3).returncode
+        if rc != 0:
+            subprocess.run(["ip", "-6", "route", "replace", "default", "via", gw, "dev", wan], stderr=subprocess.DEVNULL, timeout=3)
     print(ip)
     sys.exit(0)
-
 sys.exit(1)
 PY
 )" 2>/dev/null || true
@@ -460,6 +568,21 @@ PY
     fi
   fi
 
+  return 1
+}
+
+has_working_ipv6_egress() {
+  # Проверяет, есть ли у сервера реальный исходящий маршрут в глобальный IPv6 интернет
+  local rdev
+  rdev="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+  if [ -z "$rdev" ] || [[ "$rdev" =~ ^(lo|awg|wg|warp|tun|tap) ]]; then
+    return 1
+  fi
+  if ping6 -c 1 -W 2 2606:4700:4700::1111 >/dev/null 2>&1 \
+    || ping6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1 \
+    || curl -6 -fsS --connect-timeout 2 --max-time 3 https://api6.ipify.org >/dev/null 2>&1; then
+    return 0
+  fi
   return 1
 }
 
@@ -540,16 +663,33 @@ confirm_yes() { # $1=вопрос; код 0 = подтверждено
   case "$a" in y|Y|yes|YES|да|Да|ДА) return 0 ;; *) return 1 ;; esac
 }
 
+is_udp_port_busy() { # $1 = порт; 0 если занят любым сокетом (включая 127.0.0.53:53)
+  local p="$1"
+  [ -n "$(ss -Hlnu "sport = :${p}" 2>/dev/null || true)" ]
+}
+
+pick_free_udp_port_range() { # $1=lo $2=hi [$3=exclude_port]
+  local lo="${1:-20000}" hi="${2:-59999}" excl="${3:-}" p
+  for _ in $(seq 1 80); do
+    p="$(rand_range "$lo" "$hi")"
+    if [ "$p" != "$excl" ] && ! is_udp_port_busy "$p"; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
 free_port() { # $1 = udp|tcp; криптостойкий свободный порт 20000-59999
   local proto="$1" flag p
   case "$proto" in
-    udp) flag="-u" ;;
+    udp) pick_free_udp_port_range 20000 59999; return $? ;;
     tcp) flag="-t" ;;
     *) return 1 ;;
   esac
   for _ in $(seq 1 60); do
     p="$(rand_range 20000 59999)"
-    if [ -z "$(ss -Hln "$flag" "sport = :${p}")" ]; then
+    if [ -z "$(ss -Hln "$flag" "sport = :${p}" 2>/dev/null || true)" ]; then
       printf '%s' "$p"
       return 0
     fi
@@ -565,7 +705,7 @@ choose_awg_port() {
     return 0
   fi
   # Для максимальной маскировки под HTTP/3 (QUIC) по умолчанию пробуем 443/udp
-  if [ -z "$(ss -Hlnu "sport = :443" 2>/dev/null)" ]; then
+  if ! is_udp_port_busy 443; then
     printf '443'
     return 0
   fi
@@ -880,7 +1020,10 @@ ensure_client_token() {
   local name="$1"
   [ -n "$name" ] || return 1
   install -d -m 700 "$AWG_DIR"
-  [ -f "$TOKENS_FILE" ] || { echo "{}" > "$TOKENS_FILE"; chmod 600 "$TOKENS_FILE"; }
+  if [ ! -f "$TOKENS_FILE" ]; then
+    ( umask 077 && printf '{}\n' > "$TOKENS_FILE" )
+    chmod 600 "$TOKENS_FILE"
+  fi
 
   python3 - "$name" "$TOKENS_FILE" <<'PY'
 import sys, json, os, secrets, time
@@ -907,9 +1050,11 @@ elif isinstance(entry, str) and entry.startswith("awg_tok_"):
 if not tok:
     tok = f"awg_tok_{secrets.token_hex(16)}"
     data[name] = {"token": tok, "created_at": int(time.time())}
-    with open(tfile, "w", encoding="utf-8") as f:
+    tmp = tfile + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    os.chmod(tfile, 0o600)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, tfile)
 
 print(tok)
 PY
@@ -941,7 +1086,7 @@ remove_client_token() {
   local name="$1"
   [ -f "$TOKENS_FILE" ] || return 0
   python3 - "$name" "$TOKENS_FILE" <<'PY'
-import sys, json
+import sys, json, os
 name = sys.argv[1]
 tfile = sys.argv[2]
 try:
@@ -949,10 +1094,46 @@ try:
         data = json.load(f)
     if isinstance(data, dict) and name in data:
         del data[name]
-        with open(tfile, "w", encoding="utf-8") as f:
+        tmp = tfile + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, tfile)
 except Exception:
     pass
+PY
+}
+
+set_client_custom_flags() {
+  # Фиксирует в tokens.json флаги явно заданных пользователем DNS / AllowedIPs
+  local name="$1" has_custom_dns="$2" has_custom_alw="$3"
+  ensure_client_token "$name" >/dev/null
+  python3 - "$name" "$has_custom_dns" "$has_custom_alw" "$TOKENS_FILE" <<'PY'
+import sys, json, os
+name, cdns, calw, tfile = sys.argv[1:5]
+data = {}
+try:
+    with open(tfile, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+entry = data.get(name)
+if isinstance(entry, str):
+    entry = {"token": entry}
+elif not isinstance(entry, dict):
+    entry = {}
+if cdns == "1":
+    entry["custom_dns"] = True
+if calw == "1":
+    entry["custom_allowed_ips"] = True
+data[name] = entry
+tmp = tfile + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, tfile)
 PY
 }
 
@@ -966,19 +1147,23 @@ ensure_admin_token() {
       return 0
     fi
   fi
-  local tok
+  local tok tmp_adm
   tok="$(python3 -c 'import secrets; print("awg_adm_" + secrets.token_hex(32))')"
-  ( umask 077 && printf '%s\n' "$tok" > "$ADMIN_TOKEN_FILE" )
-  chmod 600 "$ADMIN_TOKEN_FILE"
+  tmp_adm="${ADMIN_TOKEN_FILE}.tmp.$$"
+  ( umask 077 && printf '%s\n' "$tok" > "$tmp_adm" )
+  chmod 600 "$tmp_adm"
+  mv -f "$tmp_adm" "$ADMIN_TOKEN_FILE"
   printf '%s\n' "$tok"
 }
 
 rotate_admin_token() {
   install -d -m 700 "$AWG_DIR"
-  local tok
+  local tok tmp_adm
   tok="$(python3 -c 'import secrets; print("awg_adm_" + secrets.token_hex(32))')"
-  ( umask 077 && printf '%s\n' "$tok" > "$ADMIN_TOKEN_FILE" )
-  chmod 600 "$ADMIN_TOKEN_FILE"
+  tmp_adm="${ADMIN_TOKEN_FILE}.tmp.$$"
+  ( umask 077 && printf '%s\n' "$tok" > "$tmp_adm" )
+  chmod 600 "$tmp_adm"
+  mv -f "$tmp_adm" "$ADMIN_TOKEN_FILE"
   printf '%s\n' "$tok"
 }
 
@@ -992,7 +1177,7 @@ ensure_api_tls_cert() {
     warn "openssl не найден — TLS для Admin API отключён"
     return 1
   fi
-  local pub4 pub6 san="DNS:localhost,IP:127.0.0.1"
+  local pub4 pub6 san="DNS:localhost,IP:127.0.0.1,IP:::1"
   pub4="$(detect_public_ip || true)"
   pub6="$(detect_public_ipv6 || true)"
   [ -n "$pub4" ] && san="${san},IP:${pub4}"
@@ -1063,9 +1248,11 @@ if mode == "custom" and host:
 else:
     entry.pop("endpoint_host", None)
 data[name] = entry
-with open(tfile, "w", encoding="utf-8") as f:
+tmp = tfile + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
-os.chmod(tfile, 0o600)
+os.chmod(tmp, 0o600)
+os.replace(tmp, tfile)
 PY
 }
 
@@ -1103,6 +1290,7 @@ do_admin_token() {
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   [ -f "$conf" ] || die "туннель не установлен"
 
+  acquire_lock
   local tok
   if [ "$sub" = "rotate" ] || [ "$sub" = "--rotate" ]; then
     tok="$(rotate_admin_token)"
@@ -1111,6 +1299,7 @@ do_admin_token() {
     tok="$(ensure_admin_token)"
   fi
   ensure_api_tls_cert || true
+  release_lock
 
   local pub_ip api_host fp
   pub_ip="$(get_public_endpoint_host || true)"
@@ -1234,9 +1423,33 @@ fetch_api_script() {
   return 1
 }
 
+fetch_tui_script() {
+  local tui_src="" tmp_tui
+  mkdir -p "$API_DIR"
+  chmod 755 "$API_DIR"
+  if is_script_file; then
+    tui_src="$(dirname "$(readlink -f "$0")")/tui.py"
+  fi
+  if [ -n "$tui_src" ] && [ -f "$tui_src" ]; then
+    cp "$tui_src" "$API_DIR/tui.py"
+    chmod 755 "$API_DIR/tui.py"
+    return 0
+  fi
+  tmp_tui="$(mktemp)"
+  if curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${RAW_BASE_URL}/tui.py?_=$(date +%s)" -o "$tmp_tui" 2>/dev/null \
+    && [ -s "$tmp_tui" ] && python3 -m py_compile "$tmp_tui" 2>/dev/null; then
+    install -m 755 "$tmp_tui" "$API_DIR/tui.py"
+    rm -f "$tmp_tui"
+    return 0
+  fi
+  rm -f "$tmp_tui"
+  return 1
+}
+
 setup_api_service() {
   step "Настройка API-сервиса подписок и управления клиентами (порт ${AWG_API_PORT}/tcp)"
   fetch_api_script || warn "не удалось установить api.py"
+  fetch_tui_script || true
   ensure_admin_token >/dev/null || true
   ensure_api_tls_cert || true
 
@@ -1335,108 +1548,103 @@ ensure_dualstack_support() {
     fi
   fi
 
-  # Добавляем ip6tables и TCP MSS Clamping в awg0.conf
-  if ! grep -q 'TCPMSS' "$conf" || ! grep -q 'ip6tables' "$conf"; then
-    python3 - "$conf" "$ip6_subnet" "$wan_iface" "$wan6_iface" <<'PY'
-import sys
-conf = sys.argv[1]
-ip6_subnet = sys.argv[2]
-wan_iface = sys.argv[3]
-wan6_iface = sys.argv[4]
+  # Удаляем устаревшие глобальные правила --set-mss 1140 (от старого MTU 1200 без привязки к awg0)
+  iptables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
+  ip6tables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
 
-extra_up = ""
-if "ip6tables" not in open(conf).read():
-    extra_up += (
-        f"; ip6tables -w -t nat -C POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || true"
-        f"; ip6tables -w -C FORWARD -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || true"
-        f"; ip6tables -w -C FORWARD -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
-    )
-extra_up += (
-    f"; iptables -w -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true"
-    f"; ip6tables -w -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true"
+  # Обновляем PostUp/PostDown в awg0.conf на scoped --clamp-mss-to-pmtu и ip6tables
+  local v4_subnet
+  v4_subnet="$(get_subnet_prefix)0/24"
+  python3 - "$conf" "$v4_subnet" "$ip6_subnet" "$wan_iface" "$wan6_iface" <<'PY'
+import sys, os
+conf, v4_sub, v6_sub, wan4, wan6 = sys.argv[1:6]
+post_up = (
+    f"PostUp = iptables -w -t nat -C POSTROUTING -s {v4_sub} -o {wan4} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s {v4_sub} -o {wan4} -j MASQUERADE"
+    f"; iptables -w -C FORWARD -i %i -o {wan4} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o {wan4} -j ACCEPT"
+    f"; iptables -w -C FORWARD -i {wan4} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i {wan4} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+    f"; iptables -w -t mangle -C FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+    f"; iptables -w -t mangle -C FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+    f"; ip6tables -w -t nat -C POSTROUTING -s {v6_sub} -o {wan6} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s {v6_sub} -o {wan6} -j MASQUERADE 2>/dev/null || true"
+    f"; ip6tables -w -C FORWARD -i %i -o {wan6} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o {wan6} -j ACCEPT 2>/dev/null || true"
+    f"; ip6tables -w -C FORWARD -i {wan6} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i {wan6} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+    f"; ip6tables -w -t mangle -C FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+    f"; ip6tables -w -t mangle -C FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
 )
-
-extra_down = ""
-if "ip6tables" not in open(conf).read():
-    extra_down += (
-        f"; ip6tables -w -t nat -D POSTROUTING -s {ip6_subnet} -o {wan6_iface} -j MASQUERADE 2>/dev/null || true"
-        f"; ip6tables -w -D FORWARD -i %i -o {wan6_iface} -j ACCEPT 2>/dev/null || true"
-        f"; ip6tables -w -D FORWARD -i {wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
-    )
-extra_down += (
-    f"; iptables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true"
-    f"; ip6tables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true"
+post_down = (
+    f"PostDown = iptables -w -t nat -D POSTROUTING -s {v4_sub} -o {wan4} -j MASQUERADE 2>/dev/null || true"
+    f"; iptables -w -D FORWARD -i %i -o {wan4} -j ACCEPT 2>/dev/null || true"
+    f"; iptables -w -D FORWARD -i {wan4} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+    f"; iptables -w -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+    f"; iptables -w -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+    f"; ip6tables -w -t nat -D POSTROUTING -s {v6_sub} -o {wan6} -j MASQUERADE 2>/dev/null || true"
+    f"; ip6tables -w -D FORWARD -i %i -o {wan6} -j ACCEPT 2>/dev/null || true"
+    f"; ip6tables -w -D FORWARD -i {wan6} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+    f"; ip6tables -w -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+    f"; ip6tables -w -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
 )
-
 try:
-    with open(conf, 'r') as f:
-        lines = f.readlines()
+    lines = open(conf, "r", encoding="utf-8").readlines()
     out = []
+    changed = False
     for line in lines:
-        if line.strip().startswith('PostUp') and '=' in line and 'TCPMSS' not in line:
-            out.append(f"{line.rstrip()}{extra_up}\n")
-        elif line.strip().startswith('PostDown') and '=' in line and 'TCPMSS' not in line:
-            out.append(f"{line.rstrip()}{extra_down}\n")
+        s = line.strip()
+        if s.startswith("PostUp") and "=" in line and ("--clamp-mss-to-pmtu" not in line or "ip6tables" not in line):
+            out.append(post_up)
+            changed = True
+        elif s.startswith("PostDown") and "=" in line and ("--clamp-mss-to-pmtu" not in line or "ip6tables" not in line):
+            out.append(post_down)
+            changed = True
         else:
             out.append(line)
-    with open(conf, 'w') as f:
-        f.writelines(out)
+    if changed:
+        tmp = conf + ".up.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(out)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, conf)
 except Exception:
     pass
 PY
-  fi
 
-  # Активируем правила iptables и ip6tables в ядре немедленно
+  # Активируем правила iptables и ip6tables в ядре немедленно (только для $AWG_IFACE)
   if [ -n "$wan_iface" ]; then
-    local v4_subnet
-    v4_subnet="$(get_subnet_prefix)0/24"
     iptables -w -t nat -C POSTROUTING -s "${v4_subnet}" -o "${wan_iface}" -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s "${v4_subnet}" -o "${wan_iface}" -j MASQUERADE 2>/dev/null || true
     iptables -w -C FORWARD -i "$AWG_IFACE" -o "${wan_iface}" -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i "$AWG_IFACE" -o "${wan_iface}" -j ACCEPT 2>/dev/null || true
     iptables -w -C FORWARD -i "${wan_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i "${wan_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    iptables -w -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
+    iptables -w -t mangle -C FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    iptables -w -t mangle -C FORWARD -o "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -o "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   fi
 
   if [ -n "$wan6_iface" ]; then
     ip6tables -w -t nat -C POSTROUTING -s "${ip6_subnet}" -o "${wan6_iface}" -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s "${ip6_subnet}" -o "${wan6_iface}" -j MASQUERADE 2>/dev/null || true
     ip6tables -w -C FORWARD -i "$AWG_IFACE" -o "${wan6_iface}" -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i "$AWG_IFACE" -o "${wan6_iface}" -j ACCEPT 2>/dev/null || true
     ip6tables -w -C FORWARD -i "${wan6_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i "${wan6_iface}" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    ip6tables -w -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
+    ip6tables -w -t mangle -C FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    ip6tables -w -t mangle -C FORWARD -o "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -o "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   fi
 
-  # Проверяем реальную связность с глобальным IPv6-интернетом
+  # Проверяем реальную связность с глобальным IPv6-интернетом (ICMPv6 или HTTPS)
   local has_v6_internet=0
-  if ping6 -c 1 -W 2 2606:4700:4700::1111 >/dev/null 2>&1 || ping6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1; then
+  if has_working_ipv6_egress; then
     has_v6_internet=1
   fi
 
   local target_allowed_ips="0.0.0.0/0, ::/0"
   local target_dns="${AWG_DNS}"
   if [ "$has_v6_internet" -eq 0 ]; then
-    # Если провайдер VPS не маршрутизирует исходящий IPv6 интернет, направляем клиентский трафик через IPv4,
-    # сохраняя IPv6 в качестве внешнего Endpoint туннеля для обхода блокировок.
     target_allowed_ips="0.0.0.0/0"
     target_dns="1.1.1.1, 1.0.0.1"
   fi
 
-  # 2. Обновляем конфиги клиентов
-  local cf
+  # 2. Обновляем конфиги клиентов, СОХРАНЯЯ кастомные DNS и AllowedIPs
+  local cf cname
   for cf in "$AWG_DIR"/*.conf; do
     [ -f "$cf" ] || continue
     [ "$cf" != "$AWG_DIR/$AWG_IFACE.conf" ] || continue
+    cname="$(basename "$cf" .conf)"
     local c_addr
     c_addr="$(conf_get Address "$cf" || true)"
     [ -n "$c_addr" ] || continue
-
-    # Гарантируем AllowedIPs, DNS и безопасный MTU >= 1280 (RFC 8200 min для IPv6) в клиентском конфиге
-    sed -i -E "s|^AllowedIPs[[:space:]]*=.*$|AllowedIPs = ${target_allowed_ips}|" "$cf"
-    sed -i -E "s|^DNS[[:space:]]*=.*$|DNS = ${target_dns}|" "$cf"
-    local c_mtu
-    c_mtu="$(conf_get MTU "$cf" 2>/dev/null || true)"
-    if [ -z "$c_mtu" ]; then
-      sed -i -E "/^DNS[[:space:]]*=/a MTU = 1280" "$cf"
-    elif [[ "$c_mtu" =~ ^[0-9]+$ ]] && [ "$c_mtu" -lt 1280 ]; then
-      sed -i -E "s|^MTU[[:space:]]*=.*$|MTU = 1280|" "$cf"
-    fi
 
     local c_priv c_pub
     c_priv="$(conf_get PrivateKey "$cf" 2>/dev/null || true)"
@@ -1444,50 +1652,125 @@ PY
     c_pub="$(printf '%s\n' "$c_priv" | awg pubkey 2>/dev/null || true)"
     [ -n "$c_pub" ] || continue
 
-    local target_allowed=""
+    local target_peer_addr="$c_addr"
     if ! printf '%s' "$c_addr" | grep -q ':'; then
       local ip_only="${c_addr%%/*}"
       local last_oct="${ip_only##*.}"
       last_oct="${last_oct:-2}"
-      local cli_ip6="${ip6_pfx}${last_oct}/128"
-      target_allowed="${c_addr}, ${cli_ip6}"
-      sed -i -E "s|^Address[[:space:]]*=.*$|Address = ${target_allowed}|" "$cf"
-    else
-      target_allowed="$c_addr"
+      target_peer_addr="${c_addr}, ${ip6_pfx}${last_oct}/128"
     fi
 
-    # Обновляем AllowedIPs для этого пира в awg0.conf
-    python3 -c "
-import sys
-conf = sys.argv[1]
-pub = sys.argv[2]
-new_allowed = sys.argv[3]
+    python3 - "$cf" "$cname" "$TOKENS_FILE" "$target_peer_addr" "$target_allowed_ips" "$target_dns" "$AWG_DNS" <<'PY'
+import sys, os, json
+cf, cname, tfile, peer_addr, def_alw, def_dns, awg_dns = sys.argv[1:8]
+custom_dns = False
+custom_alw = False
 try:
-    with open(conf, 'r') as f:
-        lines = f.readlines()
+    if os.path.isfile(tfile):
+        tdata = json.load(open(tfile, "r", encoding="utf-8"))
+        ent = tdata.get(cname) if isinstance(tdata, dict) else None
+        if isinstance(ent, dict):
+            custom_dns = bool(ent.get("custom_dns"))
+            custom_alw = bool(ent.get("custom_allowed_ips"))
+except Exception:
+    pass
+
+std_alw = {"0.0.0.0/0", "0.0.0.0/0, ::/0", "0.0.0.0/0,::/0", "::/0, 0.0.0.0/0"}
+std_dns = {
+    "1.1.1.1",
+    "1.1.1.1, 1.0.0.1",
+    "1.1.1.1, 9.9.9.9",
+    "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001",
+    "1.1.1.1, 9.9.9.9, 2606:4700:4700::1111, 2606:4700:4700::1001",
+    awg_dns.strip(),
+}
+
+lines = open(cf, "r", encoding="utf-8", errors="replace").read().splitlines()
+out = []
+sec = ""
+seen_mtu = False
+changed = False
+
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("[") and s.endswith("]"):
+        if sec == "interface" and not seen_mtu:
+            out.append("MTU = 1280")
+            seen_mtu = True
+            changed = True
+        sec = s[1:-1].lower()
+        out.append(ln)
+        continue
+    if "=" in ln:
+        k, v = ln.split("=", 1)
+        ks, vs = k.strip(), v.strip()
+        if sec == "interface" and ks == "Address" and vs != peer_addr:
+            out.append(f"Address = {peer_addr}")
+            changed = True
+            continue
+        if sec == "interface" and ks == "DNS":
+            if not custom_dns and vs in std_dns and vs != def_dns:
+                out.append(f"DNS = {def_dns}")
+                changed = True
+                continue
+        if sec == "interface" and ks == "MTU":
+            seen_mtu = True
+            if vs.isdigit() and int(vs) < 1280:
+                out.append("MTU = 1280")
+                changed = True
+                continue
+        if sec == "peer" and ks == "AllowedIPs":
+            if not custom_alw and vs in std_alw and vs != def_alw:
+                out.append(f"AllowedIPs = {def_alw}")
+                changed = True
+                continue
+    out.append(ln)
+
+if changed:
+    tmp = cf + ".ds.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, cf)
+PY
+
+    # Обновляем AllowedIPs для этого пира в awg0.conf (атомарно)
+    python3 - "$conf" "$c_pub" "$target_peer_addr" <<'PY'
+import sys, os
+conf, pub, new_allowed = sys.argv[1:4]
+try:
+    lines = open(conf, "r", encoding="utf-8").readlines()
     out = []
     in_target = False
+    changed = False
     for line in lines:
-        if line.strip().startswith('[Peer]'):
+        s = line.strip()
+        if s.startswith("[Peer]"):
             in_target = False
-        if line.strip().startswith('PublicKey') and pub in line:
+        elif s.startswith("PublicKey") and "=" in line and line.split("=", 1)[1].strip() == pub:
             in_target = True
-        if in_target and line.strip().startswith('AllowedIPs'):
-            out.append(f'AllowedIPs = {new_allowed}\n')
+        elif in_target and s.startswith("AllowedIPs") and "=" in line:
+            if line.split("=", 1)[1].strip() != new_allowed:
+                out.append(f"AllowedIPs = {new_allowed}\n")
+                changed = True
+            else:
+                out.append(line)
             in_target = False
             continue
         out.append(line)
-    with open(conf, 'w') as f:
-        f.writelines(out)
+    if changed:
+        tmp = conf + ".peer.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(out)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, conf)
 except Exception:
     pass
-" "$conf" "$c_pub" "$target_allowed" 2>/dev/null || true
+PY
 
     if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
-      awg set "$AWG_IFACE" peer "$c_pub" allowed-ips "${target_allowed}" 2>/dev/null || true
+      awg set "$AWG_IFACE" peer "$c_pub" allowed-ips "${target_peer_addr}" 2>/dev/null || true
     fi
-
-    touch "$cf"
   done
 }
 
@@ -1501,15 +1784,21 @@ do_update() {
 
   step "Загрузка актуальных скриптов с GitHub..."
   local fetch_base="${RAW_BASE_URL}"
-  local target_sha
-  target_sha="$(curl -fsSL --connect-timeout 4 https://api.github.com/repos/aligorov/awg-3xui-installer/commits/main 2>/dev/null | grep -m 1 '"sha":' | cut -d '"' -f 4 || true)"
-  if [ -n "$target_sha" ] && [ "${#target_sha}" -ge 40 ]; then
-    fetch_base="https://raw.githubusercontent.com/aligorov/awg-3xui-installer/${target_sha}"
+  local q_bust=""
+  if [[ ! "$fetch_base" =~ /[0-9a-f]{40}$ ]]; then
+    local target_sha
+    target_sha="$(curl -fsSL --connect-timeout 4 https://api.github.com/repos/aligorov/awg-3xui-installer/commits/main 2>/dev/null | grep -m 1 '"sha":' | cut -d '"' -f 4 || true)"
+    if [ -n "$target_sha" ] && [ "${#target_sha}" -ge 40 ]; then
+      fetch_base="https://raw.githubusercontent.com/aligorov/awg-3xui-installer/${target_sha}"
+    else
+      q_bust="?_=$(date +%s)"
+    fi
   fi
   local dl_err=0
-  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/install.sh" -o "$tmp_upd/install.sh" || dl_err=1
-  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/api.py" -o "$tmp_upd/api.py" || dl_err=1
-  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/bot.py" -o "$tmp_upd/bot.py" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/install.sh${q_bust}" -o "$tmp_upd/install.sh" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/api.py${q_bust}" -o "$tmp_upd/api.py" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/bot.py${q_bust}" -o "$tmp_upd/bot.py" || dl_err=1
+  curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${fetch_base}/tui.py${q_bust}" -o "$tmp_upd/tui.py" || dl_err=1
 
   if [ "$dl_err" -ne 0 ] || [ ! -s "$tmp_upd/install.sh" ]; then
     release_lock
@@ -1528,12 +1817,17 @@ do_update() {
     release_lock
     die "Сбой валидации синтаксиса bot.py"
   fi
+  if ! python3 -m py_compile "$tmp_upd/tui.py" 2>/dev/null; then
+    release_lock
+    die "Сбой валидации синтаксиса tui.py"
+  fi
 
-  step "Установка обновлений CLI и сервисов..."
+  step "Установка обновлений CLI, TUI и сервисов..."
   install -m 755 "$tmp_upd/install.sh" /usr/local/bin/awg-manager
 
   mkdir -p "$API_DIR"
   install -m 755 "$tmp_upd/api.py" "$API_DIR/api.py"
+  install -m 755 "$tmp_upd/tui.py" "$API_DIR/tui.py"
   setup_api_service
 
   # Очистка устаревших временных путей если создавались ранее
@@ -1581,11 +1875,11 @@ do_update() {
   printf '  Admin API токен:    sudo awg-manager admin-token\n'
   printf '  Туннель и клиенты:  продолжают работать без перезапуска.\n\n'
 
-  # Принудительное определение и подъём IPv6 прямо во время обновления
+  # Статус активного публичного IPv6 (без модификации сетевых интерфейсов)
   local up_v6
   up_v6="$(detect_public_ipv6 || true)"
   if [ -n "$up_v6" ]; then
-    printf '  Обнаружен IPv6:     %b%s%b (активирован)\n\n' "$C_GREEN" "$up_v6" "$C_RESET"
+    printf '  Публичный IPv6:     %b%s%b\n\n' "$C_GREEN" "$up_v6" "$C_RESET"
   fi
 
   if [ "${IS_TTY:-0}" -eq 1 ] && [ "${ACTION:-}" = "menu" ]; then
@@ -1777,6 +2071,17 @@ do_install() {
         dc_line=$'DisableCookies = on\n'
       fi
 
+      local wan6_init init_allowed init_dns
+      wan6_init="$(detect_wan6_iface || true)"
+      wan6_init="${wan6_init:-$WAN_IFACE}"
+      if has_working_ipv6_egress; then
+        init_allowed="0.0.0.0/0, ::/0"
+        init_dns="${AWG_DNS}"
+      else
+        init_allowed="0.0.0.0/0"
+        init_dns="1.1.1.1, 1.0.0.1"
+      fi
+
       cat > "$AWG_DIR/$AWG_IFACE.conf" <<EOF
 [Interface]
 PrivateKey = ${srv_priv}
@@ -1797,8 +2102,8 @@ H4 = ${h4}
 I1 = ${i1}
 HeaderProtectionKey = ${hpk}
 ContentPaddingAddition = ${cpa}
-${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true; ip6tables -w -t nat -C POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
-PostDown = iptables -w -t nat -D POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
+${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${WAN_IFACE} -j ACCEPT; iptables -w -C FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t mangle -C FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -w -t mangle -C FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t nat -C POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${wan6_init} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${wan6_init} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${wan6_init} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${wan6_init} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${wan6_init} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${wan6_init} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -C FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t mangle -C FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+PostDown = iptables -w -t nat -D POSTROUTING -s ${AWG_SUBNET} -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${WAN_IFACE} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${WAN_IFACE} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -w -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${AWG_IPV6_SUBNET} -o ${wan6_init} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_init} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_init} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 [Peer]
 # client1
@@ -1810,7 +2115,7 @@ EOF
 [Interface]
 PrivateKey = ${cli_priv}
 Address = ${AWG_CLI_IP}/32, ${AWG_IPV6_PREFIX}2/128
-DNS = ${AWG_DNS}
+DNS = ${init_dns}
 MTU = ${AWG_MTU}
 Jc = ${jc}
 Jmin = ${jmin}
@@ -1830,7 +2135,7 @@ ContentPaddingAddition = ${cpa}
 [Peer]
 PublicKey = ${srv_pub}
 Endpoint = $(format_endpoint "$PUBLIC_IP" "$AWG_PORT")
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = ${init_allowed}
 PersistentKeepalive = 25
 EOF
       chmod 600 "$AWG_DIR/$AWG_IFACE.conf" "$AWG_DIR/client1.conf"
@@ -1975,9 +2280,14 @@ do_add_client() {
     P[$k]="$(conf_get "$k" "$conf" || true)"
   done
 
-  local cli_dns="${opt_dns:-$AWG_DNS}"
+  local def_dns="$AWG_DNS" def_allowed="0.0.0.0/0, ::/0"
+  if ! has_working_ipv6_egress; then
+    def_dns="1.1.1.1, 1.0.0.1"
+    def_allowed="0.0.0.0/0"
+  fi
+  local cli_dns="${opt_dns:-$def_dns}"
   local cli_mtu="${opt_mtu:-${P[MTU]}}"
-  local cli_allowed="${opt_allowed:-0.0.0.0/0, ::/0}"
+  local cli_allowed="${opt_allowed:-$def_allowed}"
   local cli_keepalive="${opt_keepalive:-25}"
 
   [[ "$cli_mtu" =~ ^[0-9]+$ ]] && [ "$cli_mtu" -ge 576 ] && [ "$cli_mtu" -le 9000 ] || die "некорректный MTU: $cli_mtu"
@@ -1988,7 +2298,7 @@ do_add_client() {
     cli_mtu="1280"
   fi
   [[ "$cli_keepalive" =~ ^[0-9]+$ ]] && [ "$cli_keepalive" -le 3600 ] || die "некорректный Keepalive: $cli_keepalive"
-  case "$cli_dns$cli_allowed" in *$'\n'*|*$'\r'*) die "недопустимые символы переноса строки" ;; esac
+  validate_conf_fields_py "$cli_dns" "$cli_allowed" || die "некорректный формат DNS или AllowedIPs"
 
   local srv_pub endpoint priv pubk ep_mode="server" ep_custom_host=""
   srv_pub="$(conf_get PrivateKey "$conf" | awg pubkey)" || die "ошибка pubkey сервера"
@@ -2011,7 +2321,9 @@ do_add_client() {
     *)
       ep_mode="custom"
       ep_custom_host="$(extract_host_from_endpoint "$opt_endpoint")"
-      [ -n "$ep_custom_host" ] || die "некорректный endpoint: $opt_endpoint"
+      if [ -z "$ep_custom_host" ] || ! is_valid_host_or_ip "$ep_custom_host"; then
+        die "некорректный endpoint: $opt_endpoint"
+      fi
       endpoint="$ep_custom_host"
       ;;
   esac
@@ -2078,6 +2390,9 @@ EOF
   if [ "$ep_mode" != "server" ]; then
     set_client_endpoint_meta "$name" "$ep_mode" "$ep_custom_host"
   fi
+  if [ -n "$opt_dns" ] || [ -n "$opt_allowed" ]; then
+    set_client_custom_flags "$name" "$([ -n "$opt_dns" ] && echo 1 || echo 0)" "$([ -n "$opt_allowed" ] && echo 1 || echo 0)"
+  fi
   local ep_pub="${endpoint:-$(detect_public_ip || true)}"
   local api_ep_host="$ep_pub"
   if [[ "$api_ep_host" =~ : ]] && [[ ! "$api_ep_host" =~ ^\[ ]]; then
@@ -2141,7 +2456,7 @@ do_edit_client() {
   if [ "$has_keepalive" -eq 1 ]; then
     [[ "$opt_keepalive" =~ ^[0-9]+$ ]] && [ "$opt_keepalive" -le 3600 ] || die "некорректный Keepalive: $opt_keepalive"
   fi
-  case "$opt_dns$opt_allowed" in *$'\n'*|*$'\r'*) die "недопустимые символы переноса строки" ;; esac
+  validate_conf_fields_py "${opt_dns:-}" "${opt_allowed:-}" || die "некорректный формат DNS или AllowedIPs"
 
   # 1. Переименование клиента
   if [ -n "$new_name" ] && [ "$new_name" != "$name" ]; then
@@ -2185,9 +2500,11 @@ try:
     data = json.load(open(tf, "r", encoding="utf-8"))
     if isinstance(data, dict) and old_n in data:
         data[new_n] = data.pop(old_n)
-        with open(tf, "w", encoding="utf-8") as f:
+        tmp = tf + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        os.chmod(tf, 0o600)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, tf)
 except Exception:
     pass
 PY
@@ -2282,13 +2599,19 @@ PY
       *)
         ep_mode="custom"
         ep_host="$(extract_host_from_endpoint "$opt_endpoint")"
-        [ -n "$ep_host" ] || die "некорректный endpoint: $opt_endpoint"
+        if [ -z "$ep_host" ] || ! is_valid_host_or_ip "$ep_host"; then
+          die "некорректный endpoint: $opt_endpoint"
+        fi
         resolved_host="$ep_host"
         ;;
     esac
     [ -n "$resolved_host" ] || die "не удалось определить внешний адрес сервера"
     set_client_endpoint_meta "$name" "$ep_mode" "$ep_host"
     new_ep_formatted="$(format_endpoint "$resolved_host" "$lport")"
+  fi
+
+  if [ "$has_dns" -eq 1 ] || [ "$has_allowed" -eq 1 ]; then
+    set_client_custom_flags "$name" "$has_dns" "$has_allowed"
   fi
 
   # 4. Обновление DNS / MTU / AllowedIPs / Keepalive / Endpoint в <name>.conf
@@ -2382,9 +2705,11 @@ entry["token"] = f"awg_tok_{secrets.token_hex(16)}"
 entry.setdefault("created_at", int(time.time()))
 entry["rotated_at"] = int(time.time())
 data[name] = entry
-with open(tf, "w", encoding="utf-8") as f:
+tmp = tf + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
-os.chmod(tf, 0o600)
+os.chmod(tmp, 0o600)
+os.replace(tmp, tf)
 PY
   fi
 
@@ -2485,7 +2810,7 @@ conf = os.environ.get("AWG_CONF", "")
 plain = os.environ.get("AWG_PLAIN", "0") == "1"
 
 stats = {}
-for line in dump_lines:
+for line in dump_lines[1:]:
     parts = line.split("\t")
     if len(parts) >= 8:
         stats[parts[0]] = {
@@ -2907,29 +3232,43 @@ do_diagnose() {
   d_info "Облачный firewall (Hetzner/Oracle/AWS/GCP) изнутри не виден — проверьте ${port}/udp в панели провайдера"
 
   step "6/8 Внешняя связность"
-  local pub; pub="$(detect_public_ip || true)"
+  local pub pub6 expected_ep
+  pub="$(detect_public_ip || true)"
+  pub6="$(detect_public_ipv6 || true)"
+  expected_ep="$(get_public_endpoint_host || true)"
   if [ -n "$pub" ]; then
-    d_ok "Внешний IP: ${pub} (DNS и HTTPS с сервера работают)"
+    d_ok "Внешний IPv4: ${pub}"
   else
-    d_warn "Внешний IP не определён — проверьте egress/DNS сервера"
+    d_warn "Внешний IPv4 не определён — проверьте egress/DNS сервера"
+  fi
+  if [ -n "$pub6" ]; then
+    if has_working_ipv6_egress; then
+      d_ok "Внешний IPv6: ${pub6} (Dual-Stack выход в интернет активен)"
+    else
+      d_info "Внешний IPv6: ${pub6} (без исходящего IPv6-маршрута)"
+    fi
+  else
+    d_info "Публичный IPv6 на интерфейсах не настроен"
   fi
 
   step "7/8 Endpoint в конфигах клиентов"
-  if [ -n "$pub" ]; then
-    local checked=0 mism=0 f ep eip
+  if [ -n "$expected_ep" ]; then
+    local checked=0 mism=0 f cname ep eip want_ep
     for f in "$AWG_DIR"/*.conf; do
       [ -f "$f" ] || continue
       [ "$(basename "$f")" = "${AWG_IFACE}.conf" ] && continue
+      cname="$(basename "$f" .conf)"
       ep="$(conf_get Endpoint "$f")"; [ -n "$ep" ] || continue
       checked=$((checked + 1))
       eip="$(extract_host_from_endpoint "$ep")"
-      [ "$eip" = "$pub" ] || mism=$((mism + 1))
+      want_ep="$(resolve_client_endpoint_host "$cname" "$expected_ep")"
+      [ "$eip" = "$want_ep" ] || mism=$((mism + 1))
     done
     if [ "$checked" -eq 0 ]; then d_info "Клиентских конфигов с Endpoint нет"
-    elif [ "$mism" -eq 0 ]; then d_ok "Endpoint во всех ${checked} конфигах = ${pub}"
-    else d_warn "${mism}/${checked} конфигов указывают на другой IP. Если IP сервера менялся — пересоздайте клиентов"; fi
+    elif [ "$mism" -eq 0 ]; then d_ok "Endpoint во всех ${checked} конфигах актуален (${expected_ep})"
+    else d_warn "${mism}/${checked} конфигов указывают на другой адрес (ожидался ${expected_ep}). Выполните: sudo awg-manager endpoint"; fi
   else
-    d_info "Пропущено (внешний IP не определён)"
+    d_info "Пропущено (внешний адрес не определён)"
   fi
 
   step "8/8 Подключения клиентов (handshake / трафик)"
@@ -2943,7 +3282,7 @@ do_diagnose() {
   else
     local now stats n ever online totrx
     now="$(date +%s)"
-    stats="$(printf '%s\n' "$dump" | awk -v now="$now" 'NF>=8{n++; if($5>0)ever++; if($5>0 && now-$5<180)online++; rx+=$6} END{printf "%d %d %d %d", n+0, ever+0, online+0, rx+0}')"
+    stats="$(printf '%s\n' "$dump" | awk -v now="$now" 'NR>1 && NF>=8{n++; if($5>0)ever++; if($5>0 && now-$5<180)online++; rx+=$6} END{printf "%d %d %d %d", n+0, ever+0, online+0, rx+0}')"
     read -r n ever online totrx <<< "$stats"
     d_info "Пиров: ${n}, подключались хоть раз: ${ever}, онлайн (<180с): ${online}, RX всего: ${totrx} Б"
     if [ "$n" -eq 0 ]; then
@@ -3000,11 +3339,13 @@ do_token() {
   fi
   is_valid_client_name "$name" || die "некорректное имя '$name'"
 
+  acquire_lock
   local token
   token="$(ensure_client_token "$name")"
-  [ -n "$token" ] || die "не удалось получить токен для '$name'"
+  [ -n "$token" ] || { release_lock; die "не удалось получить токен для '$name'"; }
 
   sanitize_existing_client_endpoints || true
+  release_lock
 
   local pub_ip=""
   pub_ip="$(get_public_endpoint_host)"
@@ -3111,11 +3452,16 @@ PY
     ok "Конфигурация сохранена в $np_file"
   fi
 
-  # Сохраняем в manual_ipv6.conf и endpoint_mode.conf
+  # Сохраняем в manual_ipv6.conf (ip|plen|gw) и endpoint_mode.conf атомарно
   install -d -m 700 "$AWG_DIR"
-  printf '%s\n' "$ip_v6" > "$MANUAL_IPV6_FILE"
-  chmod 600 "$MANUAL_IPV6_FILE" 2>/dev/null || true
-  printf 'ipv6\n' > "$ENDPOINT_MODE_FILE"
+  ( umask 077
+    printf '%s|%s|%s\n' "$ip_v6" "$plen_v6" "$gw_v6" > "${MANUAL_IPV6_FILE}.tmp"
+    chmod 600 "${MANUAL_IPV6_FILE}.tmp"
+    mv -f "${MANUAL_IPV6_FILE}.tmp" "$MANUAL_IPV6_FILE"
+    printf 'ipv6\n' > "${ENDPOINT_MODE_FILE}.tmp"
+    chmod 600 "${ENDPOINT_MODE_FILE}.tmp"
+    mv -f "${ENDPOINT_MODE_FILE}.tmp" "$ENDPOINT_MODE_FILE"
+  )
 
   local conf="$AWG_DIR/$AWG_IFACE.conf"
   local lport="443"
@@ -3139,7 +3485,7 @@ PY
     if [ "$force_all" -eq 1 ] && [ "$cmode" != "server" ]; then
       set_client_endpoint_meta "$cname" "server" ""
     fi
-    sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${formatted_ep}|" "$cf"
+    set_conf_endpoint_safe "$cf" "$formatted_ep"
     qrencode -o "${cf%.conf}.png" -s 6 -m 2 < "$cf" 2>/dev/null || true
     chmod 600 "${cf%.conf}.png" 2>/dev/null || true
     touch "$cf"
@@ -3225,21 +3571,26 @@ do_switch_endpoint() {
     ipv4|4)
       [ -n "$pub4" ] || die "внешний IPv4 не обнаружен на сервере"
       target_host="$pub4"
-      printf 'ipv4\n' > "$ENDPOINT_MODE_FILE"
+      ( umask 077 && printf 'ipv4\n' > "${ENDPOINT_MODE_FILE}.tmp" && chmod 600 "${ENDPOINT_MODE_FILE}.tmp" && mv -f "${ENDPOINT_MODE_FILE}.tmp" "$ENDPOINT_MODE_FILE" )
       ;;
     ipv6|6)
+      if [ -z "$pub6" ]; then
+        pub6="$(provision_cloud_ipv6_explicit || true)"
+      fi
       if [ -z "$pub6" ]; then
         release_lock
         do_set_ipv6 "" "" $([ "$force_all" -eq 1 ] && echo "--all" || true)
         return $?
       fi
       target_host="$pub6"
-      printf 'ipv6\n' > "$ENDPOINT_MODE_FILE"
+      ( umask 077 && printf 'ipv6\n' > "${ENDPOINT_MODE_FILE}.tmp" && chmod 600 "${ENDPOINT_MODE_FILE}.tmp" && mv -f "${ENDPOINT_MODE_FILE}.tmp" "$ENDPOINT_MODE_FILE" )
       ;;
     *)
       target_host="$clean_target"
-      [ -n "$target_host" ] || die "некорректный адрес: $target"
-      printf '%s\n' "$target_host" > "$ENDPOINT_MODE_FILE"
+      if [ -z "$target_host" ] || ! is_valid_host_or_ip "$target_host"; then
+        die "некорректный адрес/домен: $target"
+      fi
+      ( umask 077 && printf '%s\n' "$target_host" > "${ENDPOINT_MODE_FILE}.tmp" && chmod 600 "${ENDPOINT_MODE_FILE}.tmp" && mv -f "${ENDPOINT_MODE_FILE}.tmp" "$ENDPOINT_MODE_FILE" )
       ;;
   esac
 
@@ -3261,7 +3612,7 @@ do_switch_endpoint() {
     if [ "$force_all" -eq 1 ] && [ "$cmode" != "server" ]; then
       set_client_endpoint_meta "$cname" "server" ""
     fi
-    sed -i -E "s|^Endpoint[[:space:]]*=.*$|Endpoint = ${formatted_ep}|" "$cf"
+    set_conf_endpoint_safe "$cf" "$formatted_ep"
     qrencode -o "${cf%.conf}.png" -s 6 -m 2 < "$cf" 2>/dev/null || true
     chmod 600 "${cf%.conf}.png" 2>/dev/null || true
     touch "$cf"
@@ -3278,6 +3629,45 @@ do_switch_endpoint() {
 }
 
 #--- ротация всего туннеля сервера и смена маскировки -----------------------
+validate_awg_params_probe() {
+  # Предварительно проверяет валидность I1 / S1..S4 / HPK / CPA на временном интерфейсе до трогания awg0
+  local jc="$1" jmin="$2" jmax="$3" s1="$4" s2="$5" s3="$6" s4="$7" i1="$8" hpk="$9" cpa="${10}"
+  local ifn="" cf rc=1 k
+  cf="$(umask 077 && mktemp)" || return 1
+  for k in 1 2 3; do
+    ifn="awgv$$x$k"
+    if ip link show "$ifn" >/dev/null 2>&1; then ifn=""; continue; fi
+    if timeout -k 1 5 ip link add "$ifn" type amneziawg >/dev/null 2>&1; then break; fi
+    ifn=""
+  done
+  if [ -z "$ifn" ]; then
+    rm -f "$cf"
+    return 0
+  fi
+  cat > "$cf" <<EOF
+[Interface]
+PrivateKey = $(awg genkey)
+Jc = ${jc}
+Jmin = ${jmin}
+Jmax = ${jmax}
+S1 = ${s1}
+S2 = ${s2}
+S3 = ${s3}
+S4 = ${s4}
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+I1 = ${i1}
+HeaderProtectionKey = ${hpk}
+ContentPaddingAddition = ${cpa}
+EOF
+  timeout -k 1 5 awg setconf "$ifn" "$cf" </dev/null >/dev/null 2>&1 && rc=0 || rc=$?
+  timeout -k 1 5 ip link del "$ifn" >/dev/null 2>&1 || true
+  rm -f "$cf"
+  return "$rc"
+}
+
 apply_tunnel_rotation() {
   local p_name="$1"
   local new_port="$2"
@@ -3293,6 +3683,9 @@ apply_tunnel_rotation() {
 
   local old_port
   old_port="$(conf_get ListenPort "$conf")"
+  if [ "$new_port" != "$old_port" ] && is_udp_port_busy "$new_port"; then
+    die "UDP-порт ${new_port} уже занят другим сервисом — ротация отменена без разрыва связи"
+  fi
   step "Смена порта серверного туннеля: ${old_port}/udp -> ${new_port}/udp"
 
   local srv_addr mtu wan_iface
@@ -3322,6 +3715,12 @@ apply_tunnel_rotation() {
   ' "$conf")"
 
   [ -n "$clients_raw" ] || die "в $conf не найдено клиентов"
+
+  local snap_dir
+  snap_dir="$(umask 077 && mktemp -d /tmp/awg-rot-snap.XXXXXX)"
+  cp -a "$AWG_DIR"/*.conf "$snap_dir"/ 2>/dev/null || true
+  cp -a "$AWG_DIR"/*.png "$snap_dir"/ 2>/dev/null || true
+  [ -f "$AWG_DIR/preset.conf" ] && cp -a "$AWG_DIR/preset.conf" "$snap_dir"/ 2>/dev/null || true
 
   ( umask 077
     set +x
@@ -3353,6 +3752,10 @@ apply_tunnel_rotation() {
     hpk="$(awg genkey)"
     if grep -q '^DisableCookies[[:space:]]*=[[:space:]]*on' "$conf"; then
       dc_line=$'DisableCookies = on\n'
+    fi
+
+    if ! validate_awg_params_probe "$jc" "$jmin" "$jmax" "$s1" "$s2" "$s3" "$s4" "$i1" "$hpk" "$cpa"; then
+      die "модуль ядра amneziawg отклонил параметры обфускации (проверьте синтаксис I1)"
     fi
 
     local subnet
@@ -3392,9 +3795,15 @@ H4 = ${h4}
 I1 = ${i1}
 HeaderProtectionKey = ${hpk}
 ContentPaddingAddition = ${cpa}
-${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${wan_iface} -j ACCEPT; iptables -w -C FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true; ip6tables -w -t nat -C POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
-PostDown = iptables -w -t nat -D POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
+${dc_line}PostUp = iptables -w -t nat -C POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE; iptables -w -C FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o ${wan_iface} -j ACCEPT; iptables -w -C FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t mangle -C FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -w -t mangle -C FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -w -t mangle -I FORWARD 1 -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t nat -C POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || ip6tables -w -t nat -A POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -C FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -C FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -w -I FORWARD 1 -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -C FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t mangle -C FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -w -t mangle -I FORWARD 1 -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+PostDown = iptables -w -t nat -D POSTROUTING -s ${subnet} -o ${wan_iface} -j MASQUERADE 2>/dev/null || true; iptables -w -D FORWARD -i %i -o ${wan_iface} -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i ${wan_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -w -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t nat -D POSTROUTING -s ${ip6_subnet} -o ${wan6_iface} -j MASQUERADE 2>/dev/null || true; ip6tables -w -D FORWARD -i %i -o ${wan6_iface} -j ACCEPT 2>/dev/null || true; ip6tables -w -D FORWARD -i ${wan6_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; ip6tables -w -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -w -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 EOF
+
+    local def_dns="$AWG_DNS" def_allowed="0.0.0.0/0, ::/0"
+    if ! has_working_ipv6_egress; then
+      def_dns="1.1.1.1, 1.0.0.1"
+      def_allowed="0.0.0.0/0"
+    fi
 
     local c_name c_ip cli_priv cli_pub cli_dns cli_mtu cli_allowed cli_ka cli_ep_host c_count=0
     while IFS='|' read -r c_name c_ip; do
@@ -3410,9 +3819,9 @@ EOF
       fi
 
       cli_priv=""
-      cli_dns="$AWG_DNS"
+      cli_dns="$def_dns"
       cli_mtu="$mtu"
-      cli_allowed="0.0.0.0/0, ::/0"
+      cli_allowed="$def_allowed"
       cli_ka="25"
       if [ -f "$AWG_DIR/${c_name}.conf" ]; then
         cli_priv="$(conf_get PrivateKey "$AWG_DIR/${c_name}.conf" 2>/dev/null || true)"
@@ -3481,19 +3890,35 @@ EOF
 
     mv "$tmp_conf" "$conf"
     chmod 600 "$conf"
-    printf '%s\n' "$p_name" > "$AWG_DIR/preset.conf"
-    chmod 600 "$AWG_DIR/preset.conf" 2>/dev/null || true
+    printf '%s\n' "$p_name" > "$AWG_DIR/preset.conf.tmp"
+    chmod 600 "$AWG_DIR/preset.conf.tmp" 2>/dev/null || true
+    mv -f "$AWG_DIR/preset.conf.tmp" "$AWG_DIR/preset.conf"
     step "Обновлены параметры для ${c_count} клиентов (токены, IP и индивидуальные настройки сохранены)"
-  )
+  ) || { rm -rf "$snap_dir"; exit 1; }
 
-  if [ -n "$old_port" ] && [ "$old_port" != "$new_port" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    ufw delete allow "${old_port}/udp" >/dev/null 2>&1 || true
-    ufw allow "${new_port}/udp" >/dev/null 2>&1 || true
-    step "ufw: закрыт порт ${old_port}/udp, открыт ${new_port}/udp"
+  local ufw_on=0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw_on=1
+    ufw allow "${new_port}/udp" comment 'AmneziaWG' >/dev/null 2>&1 || true
   fi
 
-  systemctl restart "awg-quick@${AWG_IFACE}" || die "не удалось перезапустить туннель"
+  if ! systemctl restart "awg-quick@${AWG_IFACE}"; then
+    warn "Не удалось поднять туннель на ${new_port}/udp — выполняю автоматический откат к рабочему конфигу (${old_port}/udp)..."
+    cp -a "$snap_dir"/* "$AWG_DIR"/ 2>/dev/null || true
+    rm -rf "$snap_dir"
+    if [ "$ufw_on" -eq 1 ] && [ "$old_port" != "$new_port" ] && ! is_udp_port_busy "$new_port"; then
+      ufw delete allow "${new_port}/udp" >/dev/null 2>&1 || true
+    fi
+    systemctl restart "awg-quick@${AWG_IFACE}" 2>/dev/null || true
+    die "ротация отменена из-за ошибки запуска awg-quick@${AWG_IFACE} (предыдущий туннель восстановлен)"
+  fi
+  rm -rf "$snap_dir"
   step "Туннель awg0 успешно перезапущен на порту ${new_port}/udp"
+
+  if [ "$ufw_on" -eq 1 ] && [ -n "$old_port" ] && [ "$old_port" != "$new_port" ] && ! is_udp_port_busy "$old_port"; then
+    ufw delete allow "${old_port}/udp" >/dev/null 2>&1 || true
+    step "ufw: закрыт освобождённый порт ${old_port}/udp, открыт ${new_port}/udp"
+  fi
 
   if [ "${AWG_SKIP_API_RESTART:-0}" != "1" ] && systemctl is-active --quiet awg-api 2>/dev/null; then
     systemctl restart awg-api 2>/dev/null || true
@@ -3521,9 +3946,9 @@ apply_tunnel_preset() {
 
   _pick_port_or_alt() {
     local want="$1" lo="${2:-20000}" hi="${3:-59999}"
-    if [ "$cur_port" != "$want" ] && [ -n "$(ss -Hlnu "sport = :${want}" 2>/dev/null || true)" ]; then
+    if [ "$cur_port" != "$want" ] && is_udp_port_busy "$want"; then
       warn "Порт ${want}/udp занят другим процессом, выбираю свободный ${lo}-${hi}/udp"
-      rand_range "$lo" "$hi"
+      pick_free_udp_port_range "$lo" "$hi" "$cur_port" || die "не найден свободный UDP-порт в диапазоне ${lo}-${hi}"
     else
       printf '%s' "$want"
     fi
@@ -3539,7 +3964,7 @@ apply_tunnel_preset() {
       target_cpa='32-128'
       ;;
     quic-alt)
-      target_port="$(rand_range 20000 59999)"
+      target_port="$(pick_free_udp_port_range 20000 59999 "$cur_port")" || die "не найден свободный UDP-порт"
       target_i1="$(cps_i1_quic)"
       target_jc="$(rand_range 3 5)"
       target_jmin="$(rand_range 40 70)"
@@ -3552,7 +3977,7 @@ apply_tunnel_preset() {
       target_jc=3; target_jmin=20; target_jmax=60; target_cpa='20-80'
       ;;
     stun-alt)
-      target_port="$(rand_range 20000 50000)"
+      target_port="$(pick_free_udp_port_range 20000 50000 "$cur_port")" || die "не найден свободный UDP-порт"
       target_i1="$(cps_i1_stun)"
       target_jc=3; target_jmin=20; target_jmax=60; target_cpa='20-80'
       ;;
@@ -3562,12 +3987,8 @@ apply_tunnel_preset() {
       target_jc=4; target_jmin=40; target_jmax=110; target_cpa='32-128'
       ;;
     dns)
-      if [ "$cur_port" != "53" ] && [ -n "$(ss -Hlnu "sport = :53" 2>/dev/null | grep '0\.0\.0\.0:53' || true)" ]; then
-        warn "Порт 53/udp занят (0.0.0.0:53), выбираю альтернативный 20000-59999"
-        target_port="$(rand_range 20000 59999)"
-      else
-        target_port=53
-      fi
+      # На Ubuntu 24.04 systemd-resolved занимает 127.0.0.53:53, что несовместимо с ядерным bind 0.0.0.0:53
+      target_port="$(_pick_port_or_alt 53 20000 59999)"
       target_i1="$(cps_i1_dns)"
       target_jc=2; target_jmin=30; target_jmax=80; target_cpa='32-64'
       ;;
@@ -3582,8 +4003,12 @@ apply_tunnel_preset() {
       target_jc=3; target_jmin=30; target_jmax=90; target_cpa='24-96'
       ;;
     steam)
-      if [ "$cur_port" != "27015" ] && [ -n "$(ss -Hlnu "sport = :27015" 2>/dev/null || true)" ]; then
-        target_port=3074
+      if [ "$cur_port" != "27015" ] && is_udp_port_busy 27015; then
+        if [ "$cur_port" = "3074" ] || ! is_udp_port_busy 3074; then
+          target_port=3074
+        else
+          target_port="$(pick_free_udp_port_range 27016 27050 "$cur_port" || pick_free_udp_port_range 20000 59999 "$cur_port")"
+        fi
       else
         target_port=27015
       fi
@@ -3606,8 +4031,18 @@ apply_tunnel_preset() {
       target_jc=3; target_jmin=35; target_jmax=95; target_cpa='24-88'
       ;;
     custom)
-      target_port="${custom_p:-$(rand_range 20000 59999)}"
+      if [ -n "$custom_p" ]; then
+        [[ "$custom_p" =~ ^[0-9]+$ ]] && [ "$custom_p" -ge 1 ] && [ "$custom_p" -le 65535 ] \
+          || die "некорректный UDP-порт '$custom_p' (1..65535)"
+        if [ "$custom_p" != "$cur_port" ] && is_udp_port_busy "$custom_p"; then
+          die "порт ${custom_p}/udp уже занят другим сервисом"
+        fi
+        target_port="$custom_p"
+      else
+        target_port="$(pick_free_udp_port_range 20000 59999 "$cur_port")" || die "не найден свободный UDP-порт"
+      fi
       target_i1="${custom_i1:-$(cps_i1_quic)}"
+      case "$target_i1" in *$'\n'*|*$'\r'*) die "строка I1 не должна содержать переводы строк" ;; esac
       target_jc=4; target_jmin=40; target_jmax=100; target_cpa='32-128'
       ;;
     *)
@@ -3698,18 +4133,11 @@ do_rotate() {
 
   _pick_rotated_port() {
     local base_port="${1:-}"
-    if [ -n "$base_port" ] && [ "$old_port" != "$base_port" ] && [ -z "$(ss -Hlnu "sport = :${base_port}" 2>/dev/null || true)" ]; then
+    if [ -n "$base_port" ] && [ "$old_port" != "$base_port" ] && ! is_udp_port_busy "$base_port"; then
       printf '%s' "$base_port"
       return
     fi
-    for _ in $(seq 1 40); do
-      try_p="$(rand_range 20000 59999)"
-      if [ "$try_p" != "$old_port" ] && [ -z "$(ss -Hlnu "sport = :${try_p}" 2>/dev/null || true)" ]; then
-        printf '%s' "$try_p"
-        return
-      fi
-    done
-    rand_range 20000 59999
+    pick_free_udp_port_range 20000 59999 "$old_port" || die "не найден свободный UDP-порт для ротации"
   }
 
   local target_i1 target_jc target_jmin target_jmax target_cpa
@@ -3907,8 +4335,14 @@ do_restore() {
   systemctl stop "awg-quick@${AWG_IFACE}" 2>/dev/null || true
   tar --no-same-owner -xzf "$file" -C /
   chmod 700 "$AWG_DIR" 2>/dev/null || true
-  chmod 600 "$AWG_DIR"/*.conf "$AWG_DIR"/*.png "$AWG_DIR/bot.env" 2>/dev/null || true
+  chmod 600 "$AWG_DIR"/*.conf "$AWG_DIR"/*.png "$AWG_DIR/bot.env" \
+    "$TOKENS_FILE" "$ADMIN_TOKEN_FILE" "$API_TLS_CERT" "$API_TLS_KEY" \
+    "$ENDPOINT_MODE_FILE" "$MANUAL_IPV6_FILE" "$AWG_DIR/preset.conf" 2>/dev/null || true
+  [ -f "$CRED_FILE" ] && chmod 600 "$CRED_FILE" 2>/dev/null || true
   systemctl start "awg-quick@${AWG_IFACE}"
+  if systemctl is-enabled --quiet awg-api 2>/dev/null || systemctl is-active --quiet awg-api 2>/dev/null; then
+    systemctl restart awg-api 2>/dev/null || true
+  fi
   if systemctl is-enabled --quiet awg-bot 2>/dev/null; then
     systemctl restart awg-bot 2>/dev/null || true
   fi
@@ -3963,11 +4397,13 @@ do_uninstall() {
   rm -f /etc/systemd/system/awg-bot.service /etc/systemd/system/awg-api.service \
     /etc/systemd/system/awg-rotate.service /etc/systemd/system/awg-rotate.timer
 
-  local port="" wan="" prefix=""
+  local port="" wan="" wan6="" prefix="" ip6_subnet="${AWG_IPV6_SUBNET:-fd42:42:42::/64}"
   if [ -f "$AWG_DIR/$AWG_IFACE.conf" ]; then
     port="$(conf_get ListenPort "$AWG_DIR/$AWG_IFACE.conf")"
   fi
   wan="$(detect_wan_iface)"
+  wan6="$(detect_wan6_iface || true)"
+  wan6="${wan6:-$wan}"
   prefix="$(get_subnet_prefix)"
 
   systemctl stop "awg-quick@${AWG_IFACE}" 2>/dev/null || true
@@ -3978,11 +4414,29 @@ do_uninstall() {
     iptables -w -D FORWARD -i "$AWG_IFACE" -o "$wan" -j ACCEPT 2>/dev/null || true
     iptables -w -D FORWARD -i "$wan" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   fi
-  if [ -n "$port" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  iptables -w -t mangle -D FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  iptables -w -t mangle -D FORWARD -o "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  iptables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
+
+  if [ -n "$wan6" ]; then
+    ip6tables -w -t nat -D POSTROUTING -s "$ip6_subnet" -o "$wan6" -j MASQUERADE 2>/dev/null || true
+    ip6tables -w -D FORWARD -i "$AWG_IFACE" -o "$wan6" -j ACCEPT 2>/dev/null || true
+    ip6tables -w -D FORWARD -i "$wan6" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  fi
+  ip6tables -w -t mangle -D FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  ip6tables -w -t mangle -D FORWARD -o "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  ip6tables -w -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1140 2>/dev/null || true
+
+  if [ -n "$port" ] && ! is_udp_port_busy "$port" && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
   fi
   if [ -n "$AWG_API_PORT" ] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw delete allow "${AWG_API_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+
+  if [ -f /etc/netplan/60-awg-ipv6.yaml ]; then
+    rm -f /etc/netplan/60-awg-ipv6.yaml
+    netplan apply >/dev/null 2>&1 || true
   fi
 
   apt-get purge "${APT[@]}" amneziawg amneziawg-dkms amneziawg-tools 2>/dev/null || true
@@ -3990,7 +4444,8 @@ do_uninstall() {
   add-apt-repository -y --remove ppa:amnezia/ppa 2>/dev/null || true
 
   rm -rf "$AWG_DIR" "$BOT_DIR" "$API_DIR" /usr/local/bin/awg-manager "$CRED_FILE" \
-    /etc/sysctl.d/99-awg-hardening.conf /etc/sysctl.d/99-awg-forward.conf
+    /etc/sysctl.d/99-awg-hardening.conf /etc/sysctl.d/99-awg-forward.conf \
+    "$LOG_FILE" "$DBG_FILE" "$LOCK_FILE"
   systemctl daemon-reload
   release_lock
   step "Удаление завершено."
@@ -4028,6 +4483,38 @@ show_menu() {
   local is_interactive=0
   if [ -t 0 ] && [ -t 1 ] && [ "${AWGM_PLAIN:-0}" != "1" ]; then
     is_interactive=1
+  fi
+
+  # Полноэкранная двухпанельная TUI-консоль (curses) при интерактивном терминале
+  if [ "$is_interactive" -eq 1 ] && [ "${AWGM_CLASSIC_MENU:-0}" != "1" ] && command -v python3 >/dev/null 2>&1; then
+    local tui_path="" self_dir=""
+    if is_script_file; then
+      self_dir="$(dirname "$(readlink -f "$0")")"
+      if [ -f "${self_dir}/tui.py" ]; then
+        tui_path="${self_dir}/tui.py"
+      fi
+    fi
+    if [ -z "$tui_path" ] && [ -f "$API_DIR/tui.py" ]; then
+      tui_path="$API_DIR/tui.py"
+    fi
+    if [ -z "$tui_path" ]; then
+      fetch_tui_script >/dev/null 2>&1 || true
+      [ -f "$API_DIR/tui.py" ] && tui_path="$API_DIR/tui.py"
+    fi
+    if [ -n "$tui_path" ]; then
+      local tui_rc=0 mgr_bin="/usr/local/bin/awg-manager"
+      if is_script_file; then
+        mgr_bin="$(readlink -f "$0")"
+      fi
+      AWG_DIR="$AWG_DIR" AWG_IFACE="$AWG_IFACE" AWG_API_PORT="$AWG_API_PORT" AWG_MANAGER_BIN="$mgr_bin" \
+        python3 "$tui_path" || tui_rc=$?
+      if [ "$tui_rc" -eq 0 ]; then
+        return 0
+      elif [ "$tui_rc" -eq 42 ]; then
+        exec /usr/local/bin/awg-manager menu
+      fi
+      # При коде 2 (TERM=dumb / узкий терминал) прозрачно переходим в текстовое меню ниже
+    fi
   fi
 
   local items=(
@@ -4152,9 +4639,18 @@ show_menu() {
           selected="$exit_idx"
           ;;
         [1-9])
-          if [ "$key" -le "$exit_idx" ]; then
-            selected=$((key - 1))
+          local key2="" num_choice="$key"
+          IFS= read -rsn1 -t 0.35 key2 2>/dev/null || true
+          if [[ "$key2" =~ ^[0-9]$ ]]; then
+            local cand="${key}${key2}"
+            if [ "$cand" -le "$exit_idx" ]; then
+              num_choice="$cand"
+            fi
           fi
+          if [ "$num_choice" -le "$exit_idx" ]; then
+            selected=$((num_choice - 1))
+          fi
+          continue
           ;;
         ENTER)
           ;;
